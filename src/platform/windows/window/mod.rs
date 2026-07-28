@@ -7,7 +7,7 @@ mod lifecycle;
 
 pub(crate) use lifecycle::{
     capture_target, center_position, cursor_work_area, execute_paste, move_panel, panel_hwnd,
-    panel_size, PanelTarget,
+    panel_size, PanelTarget, PasteExecutionError,
 };
 
 #[cfg(test)]

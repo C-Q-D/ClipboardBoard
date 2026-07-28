@@ -6,7 +6,7 @@
 
 #[cfg(windows)]
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest, ClipboardPasteRequest};
-use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
+use crate::command::{PasteFailureReason, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::AppWindow;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -18,7 +18,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use crate::platform::windows::window::{
     capture_target, center_position, cursor_work_area, execute_paste, move_panel, panel_hwnd,
-    panel_size, PanelTarget,
+    panel_size, PanelTarget, PasteExecutionError,
 };
 #[cfg(windows)]
 use slint::PhysicalPosition;
@@ -44,6 +44,8 @@ enum UiAction {
         generation: u64,
         request_token: u64,
     },
+    /// 显示固定降级提示并重新激活面板，让用户可以继续浏览或手动粘贴。
+    ShowPasteNotice(PasteFailureReason),
     #[cfg(windows)]
     /// 后台写回成功后，在 UI 线程执行最后一次目标复核、焦点恢复和 Ctrl+V。
     ExecutePaste {
@@ -69,6 +71,8 @@ struct UiState {
     panel_generation: u64,
     /// 退出请求的一次性闩锁；置位后拒绝所有后续 UI 事件。
     quitting: bool,
+    /// 当前自动粘贴降级提示；只允许固定文案，不保存剪贴板正文或窗口隐私。
+    paste_notice: Option<PasteFailureReason>,
     #[cfg(windows)]
     /// 仅在 UI 线程持有的目标身份；后续粘贴前必须重新查询并比较。
     panel_target: Option<PanelTarget>,
@@ -94,6 +98,7 @@ impl Default for UiState {
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
+            paste_notice: None,
             #[cfg(windows)]
             panel_target: None,
             #[cfg(windows)]
@@ -123,6 +128,7 @@ impl UiState {
             UiEvent::OpenPanel => {
                 if self.panel_visible {
                     self.panel_visible = false;
+                    self.paste_notice = None;
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
@@ -134,6 +140,7 @@ impl UiState {
                     // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    self.paste_notice = None;
                     #[cfg(windows)]
                     {
                         self.paste_pending = false;
@@ -149,6 +156,7 @@ impl UiState {
                 } else {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    self.paste_notice = None;
                     #[cfg(windows)]
                     {
                         self.paste_pending = false;
@@ -161,6 +169,7 @@ impl UiState {
             UiEvent::Quit => {
                 self.quitting = true;
                 self.panel_visible = false;
+                self.paste_notice = None;
                 #[cfg(windows)]
                 {
                     self.panel_target = None;
@@ -172,6 +181,7 @@ impl UiState {
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
                     self.panel_visible = false;
+                    self.paste_notice = None;
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
@@ -185,6 +195,7 @@ impl UiState {
                 }
             }
             UiEvent::ReplaceSnapshot(snapshot) => {
+                self.paste_notice = None;
                 let selected_hash = snapshot
                     .selected_index
                     .map(|index| index.min(snapshot.items.len().saturating_sub(1)))
@@ -197,6 +208,8 @@ impl UiState {
                 UiAction::None
             }
             UiEvent::ClipboardCaptured(item) => {
+                // 用户已经产生新的系统剪贴板内容，旧的自动粘贴提示不再描述当前状态。
+                self.paste_notice = None;
                 let selected_hash = self
                     .snapshot
                     .selected_index
@@ -217,6 +230,8 @@ impl UiState {
                 UiAction::ScrollSelection
             }
             UiEvent::CopySelection => {
+                // 用户主动改用 Ctrl+Enter 时清除旧的自动粘贴降级提示，避免提示描述过期动作。
+                self.paste_notice = None;
                 #[cfg(windows)]
                 {
                     // Ctrl+Enter 明确取消尚未完成的自动粘贴；即使旧 Paste 已被 worker
@@ -271,8 +286,10 @@ impl UiState {
                     let Some(target) = self.panel_target else {
                         self.paste_pending = false;
                         self.paste_executing = false;
-                        return UiAction::None;
+                        self.paste_notice = Some(PasteFailureReason::TargetChanged);
+                        return UiAction::ShowPasteNotice(PasteFailureReason::TargetChanged);
                     };
+                    self.paste_notice = None;
                     self.paste_executing = true;
                     UiAction::ExecutePaste {
                         generation,
@@ -304,6 +321,7 @@ impl UiState {
                     self.panel_target = None;
                     self.paste_pending = false;
                     self.paste_executing = false;
+                    self.paste_notice = None;
                     UiAction::Hide
                 }
                 #[cfg(not(windows))]
@@ -315,19 +333,26 @@ impl UiState {
             UiEvent::PasteFailed {
                 generation,
                 request_token,
+                reason,
             } => {
                 #[cfg(windows)]
                 {
-                    if generation == self.panel_generation
+                    // 失败只能消费仍处于当前面板活动状态的请求；成功、隐藏或先前失败后
+                    // 的同令牌迟到事件都必须被丢弃，不能重新显示错误提示。
+                    if self.panel_visible
+                        && self.paste_pending
+                        && generation == self.panel_generation
                         && request_token == self.paste_request_token
                     {
                         self.paste_pending = false;
                         self.paste_executing = false;
+                        self.paste_notice = Some(reason);
+                        return UiAction::ShowPasteNotice(reason);
                     }
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = (generation, request_token);
+                    let _ = (generation, request_token, reason);
                 }
                 UiAction::None
             }
@@ -362,6 +387,7 @@ impl UiState {
         if item.id != id || item.content_hash != content_hash {
             return UiAction::None;
         }
+        self.paste_notice = None;
         self.paste_pending = true;
         let Some(request_token) = self.paste_request_token.checked_add(1) else {
             self.paste_pending = false;
@@ -449,6 +475,7 @@ impl UiState {
     /// 窗口显示失败时回滚可见状态，但保留代次单调性。
     fn mark_show_failed(&mut self) {
         self.panel_visible = false;
+        self.paste_notice = None;
         #[cfg(windows)]
         {
             self.panel_target = None;
@@ -464,6 +491,7 @@ impl UiState {
             panel_visible: self.panel_visible,
             panel_generation: self.panel_generation,
             quitting: self.quitting,
+            paste_notice: self.paste_notice,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -491,6 +519,8 @@ pub struct UiStateSnapshot {
     pub panel_generation: u64,
     /// 是否已经接受退出请求；用于验证退出闩锁拒绝迟到事件。
     pub quitting: bool,
+    /// 当前固定降级提示类别；不携带剪贴板正文或原生错误详情。
+    pub paste_notice: Option<PasteFailureReason>,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
@@ -569,10 +599,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 | UiEvent::PasteSucceeded { .. }
                 | UiEvent::PasteFailed { .. }
         );
-        let (action, snapshot) = UI_STATE.with(|state| {
+        let (action, snapshot, paste_notice) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
             let action = state.apply(event);
-            (action, state.snapshot.clone())
+            (action, state.snapshot.clone(), state.paste_notice)
         });
 
         if action == UiAction::Quit {
@@ -588,6 +618,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             let Some(window) = weak_window.and_then(|weak| weak.upgrade()) else {
                 return;
             };
+
+            // 提示属性独立于卡片模型同步；PasteFailed 等事件不重建 ListView，也必须立即可见。
+            set_window_paste_notice(&window, paste_notice);
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
@@ -617,6 +650,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     let _ = post_ui_event(UiEvent::PasteFailed {
                         generation,
                         request_token,
+                        reason: PasteFailureReason::ClipboardNotReady,
                     });
                 }
             }
@@ -649,6 +683,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                         let _ = post_ui_event(UiEvent::PasteFailed {
                             generation,
                             request_token,
+                            reason: paste_failure_reason(error),
                         });
                     }
                 }
@@ -679,6 +714,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 UiAction::ScrollSelection => {}
                 UiAction::CopySelection { .. } => {}
                 UiAction::RequestPaste { .. } => {}
+                UiAction::ShowPasteNotice(_) => {
+                    // 目标执行失败后面板可能已退到原目标窗口后方；重新 show 只恢复面板可见性，
+                    // 不会重新捕获目标或发送任何输入，用户仍可按 Esc 或手动 Ctrl+V。
+                    if let Err(error) = window.show() {
+                        eprintln!("自动粘贴降级提示面板无法显示：{error}");
+                    }
+                }
                 #[cfg(windows)]
                 UiAction::ExecutePaste { .. } => {}
                 UiAction::None => {}
@@ -778,6 +820,26 @@ fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
+}
+
+/// 将固定的自动粘贴降级文案同步到 Slint；不把错误详情、正文或窗口标题交给 UI。
+fn set_window_paste_notice(window: &AppWindow, reason: Option<PasteFailureReason>) {
+    window.set_paste_notice_visible(reason.is_some());
+    window.set_paste_notice_text(SharedString::from(
+        reason
+            .map(PasteFailureReason::notice_text)
+            .unwrap_or_default(),
+    ));
+}
+
+#[cfg(windows)]
+/// 将 Win32 目标执行错误映射为固定的用户提示类别；不透传原生错误对象。
+fn paste_failure_reason(error: PasteExecutionError) -> PasteFailureReason {
+    match error {
+        PasteExecutionError::TargetChanged => PasteFailureReason::TargetChanged,
+        PasteExecutionError::FocusRestoreFailed => PasteFailureReason::FocusRestoreFailed,
+        PasteExecutionError::InputInjectionFailed => PasteFailureReason::InputInjectionFailed,
+    }
 }
 
 /// 返回窗口模型允许使用的首批摘要；完整内存快照保留在状态中供后续分页原子复用。
@@ -894,7 +956,7 @@ mod tests {
         selection_viewport_y, visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE,
         UI_HISTORY_MEMORY_CAPACITY,
     };
-    use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
+    use crate::command::{PasteFailureReason, UiClipboardItem, UiEvent, UiSnapshot};
     #[cfg(windows)]
     use crate::platform::windows::window::{IntegrityLevel, PanelTarget};
 
@@ -1191,6 +1253,7 @@ mod tests {
         state.apply(UiEvent::PasteFailed {
             generation: 1,
             request_token: 99,
+            reason: PasteFailureReason::ClipboardNotReady,
         });
         assert!(state.paste_pending);
 
@@ -1206,8 +1269,183 @@ mod tests {
         state.apply(UiEvent::PasteFailed {
             generation: 1,
             request_token: 1,
+            reason: PasteFailureReason::InputInjectionFailed,
         });
         assert!(!state.paste_pending);
+    }
+
+    /// 目标执行失败后必须保留面板、清理进行中标志并显示不泄露正文的固定复制提示。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴目标失败显示复制提示() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste {
+                request_token: 1,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            state.apply(UiEvent::PasteFailed {
+                generation: 1,
+                request_token: 1,
+                reason: PasteFailureReason::InputInjectionFailed,
+            }),
+            UiAction::ShowPasteNotice(PasteFailureReason::InputInjectionFailed)
+        );
+        assert!(state.panel_visible);
+        assert!(!state.paste_pending);
+        assert!(!state.paste_executing);
+        assert_eq!(
+            state.paste_notice,
+            Some(PasteFailureReason::InputInjectionFailed)
+        );
+        assert_eq!(
+            PasteFailureReason::InputInjectionFailed.notice_text(),
+            "内容已复制，请按 Ctrl + V"
+        );
+    }
+
+    /// 写回未成功时只能显示重试提示，不能误报系统剪贴板已经拥有内容。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴写回失败显示重试提示() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+        state.apply(UiEvent::PasteSelection {
+            generation: 1,
+            id: 1,
+            content_hash: [0; 32],
+        });
+
+        assert_eq!(
+            state.apply(UiEvent::PasteFailed {
+                generation: 1,
+                request_token: 1,
+                reason: PasteFailureReason::ClipboardNotReady,
+            }),
+            UiAction::ShowPasteNotice(PasteFailureReason::ClipboardNotReady)
+        );
+        assert_eq!(
+            state.paste_notice.map(PasteFailureReason::notice_text),
+            Some("无法准备剪贴板内容，请重试")
+        );
+    }
+
+    /// 复制取消或成功收尾后到达的同令牌失败不得重新显示旧提示。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴迟到失败不能污染已取消或成功请求() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+        state.apply(UiEvent::PasteSelection {
+            generation: 1,
+            id: 1,
+            content_hash: [0; 32],
+        });
+        state.apply(UiEvent::CopySelection);
+        assert_eq!(
+            state.apply(UiEvent::PasteFailed {
+                generation: 1,
+                request_token: 1,
+                reason: PasteFailureReason::InputInjectionFailed,
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.paste_notice, None);
+
+        state.apply(UiEvent::PasteSelection {
+            generation: 1,
+            id: 1,
+            content_hash: [0; 32],
+        });
+        state.apply(UiEvent::PastePrepared {
+            generation: 1,
+            request_token: 2,
+        });
+        assert_eq!(
+            state.apply(UiEvent::PasteSucceeded {
+                generation: 1,
+                request_token: 2,
+            }),
+            UiAction::Hide
+        );
+        assert_eq!(
+            state.apply(UiEvent::PasteFailed {
+                generation: 1,
+                request_token: 2,
+                reason: PasteFailureReason::TargetChanged,
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.paste_notice, None);
+    }
+
+    /// 写回成功后若目标快照在 Prepare 阶段丢失，也必须走“内容已复制”的降级提示。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴准备阶段缺少目标显示复制提示() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+        state.apply(UiEvent::PasteSelection {
+            generation: 1,
+            id: 1,
+            content_hash: [0; 32],
+        });
+        state.panel_target = None;
+
+        assert_eq!(
+            state.apply(UiEvent::PastePrepared {
+                generation: 1,
+                request_token: 1,
+            }),
+            UiAction::ShowPasteNotice(PasteFailureReason::TargetChanged)
+        );
+        assert!(state.panel_visible);
+        assert_eq!(state.paste_notice, Some(PasteFailureReason::TargetChanged));
     }
 
     /// 旧面板的准备/失败事件不能影响新打开代次，即使请求令牌数值碰巧相同也必须隔离。
@@ -1256,11 +1494,13 @@ mod tests {
         state.apply(UiEvent::PasteFailed {
             generation: 1,
             request_token: 1,
+            reason: PasteFailureReason::TargetChanged,
         });
         assert!(state.paste_pending);
         state.apply(UiEvent::PasteFailed {
             generation: 2,
             request_token: 2,
+            reason: PasteFailureReason::FocusRestoreFailed,
         });
         assert!(!state.paste_pending);
     }

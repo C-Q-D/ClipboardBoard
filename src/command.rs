@@ -102,6 +102,31 @@ pub struct UiSnapshot {
     pub selected_index: Option<usize>,
 }
 
+/// 自动粘贴失败的安全分类；类别只表达流程阶段，不携带剪贴板正文或窗口隐私。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasteFailureReason {
+    /// 后台尚未可靠写入系统剪贴板，不能向用户声称内容已复制。
+    ClipboardNotReady,
+    /// 剪贴板已经写回，但原目标失效、权限不允许或身份发生变化。
+    TargetChanged,
+    /// 剪贴板已经写回，但无法恢复原目标的前台焦点。
+    FocusRestoreFailed,
+    /// 剪贴板已经写回，但 Windows 未接受完整的 Ctrl+V 输入序列。
+    InputInjectionFailed,
+}
+
+impl PasteFailureReason {
+    /// 返回固定、无正文的用户提示；文案集中在领域枚举中避免各路径自由拼接错误。
+    pub const fn notice_text(self) -> &'static str {
+        match self {
+            Self::ClipboardNotReady => "无法准备剪贴板内容，请重试",
+            Self::TargetChanged | Self::FocusRestoreFailed | Self::InputInjectionFailed => {
+                "内容已复制，请按 Ctrl + V"
+            }
+        }
+    }
+}
+
 /// 后台线程可以提交给 UI 线程的事件集合。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
@@ -133,8 +158,12 @@ pub enum UiEvent {
     PastePrepared { generation: u64, request_token: u64 },
     /// UI 线程已完成 Ctrl+V；只有匹配当前 pending 令牌时才同步标记隐藏面板。
     PasteSucceeded { generation: u64, request_token: u64 },
-    /// 后台写回或目标复核失败；只清理当前代次的进行中标志，不在本原子显示提示。
-    PasteFailed { generation: u64, request_token: u64 },
+    /// 后台写回或目标复核失败；类别用于选择固定降级提示，不能携带正文或系统错误详情。
+    PasteFailed {
+        generation: u64,
+        request_token: u64,
+        reason: PasteFailureReason,
+    },
 }
 
 #[cfg(all(test, windows))]

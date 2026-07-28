@@ -1,8 +1,8 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
 //! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板
-//! 结果泵和托盘消息线程；启动恢复、Ctrl+Enter 仅复制和普通目标自动粘贴已经接入，
-//! 管理员目标降级提示及完整窗口交互仍由后续原子接入。
+//! 结果泵和托盘消息线程；启动恢复、Ctrl+Enter 仅复制、普通目标自动粘贴以及失败降级提示
+//! 已经接入，图片历史、搜索和完整设置能力仍由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
@@ -18,8 +18,8 @@ use clipboard_board::command::UiEvent;
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::{
-    process_capture, process_copy_request, process_paste_request, unix_millis_now,
-    CaptureProcessOutcome,
+    paste_failure_reason_for_copy_error, process_capture, process_copy_request,
+    process_paste_request, unix_millis_now, CaptureProcessOutcome,
 };
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
@@ -111,11 +111,12 @@ fn start_clipboard_pump(
                                 });
                             }
                             Err(error) => {
-                                // 自动粘贴失败只记录稳定错误并清理当前请求；用户提示由 ATOM-22 负责。
+                                // 写回桥失败按保守类别提示重试，不把可能的 CloseFailed 误报为已复制。
                                 eprintln!("自动粘贴写回失败：{error}");
                                 let _ = post_ui_event(UiEvent::PasteFailed {
                                     generation,
                                     request_token,
+                                    reason: paste_failure_reason_for_copy_error(&error),
                                 });
                             }
                         }

@@ -14,7 +14,7 @@ use crate::{
         ClipboardCaptureResult, ClipboardCopyRequest, ClipboardPasteRequest, ClipboardWriteError,
         ClipboardWriteExpectationStore, ClipboardWriter,
     },
-    command::{UiClipboardItem, UiEvent},
+    command::{PasteFailureReason, UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
     storage::{HistoryPayload, StorageError, StorageExecutor, TextUpsertInput, TextUpsertResult},
 };
@@ -160,6 +160,14 @@ pub fn process_paste_request(
     )
 }
 
+/// 将自动粘贴桥接错误保守归类为“剪贴板未就绪”。
+///
+/// `CloseFailed` 可能发生在 `SetClipboardData` 已转移所有权之后，但调用方无法再确认
+/// 用户是否能可靠使用该内容；因此 ATOM-22 不冒险显示“内容已复制”，统一要求重试。
+pub fn paste_failure_reason_for_copy_error(_error: &CopyProcessError) -> PasteFailureReason {
+    PasteFailureReason::ClipboardNotReady
+}
+
 /// 校验按 ID 读取的 payload 并调用注入的 writer；抽出纯接缝便于不改写真实剪贴板的测试。
 fn process_copy_payload<F>(
     payload: &HistoryPayload,
@@ -240,15 +248,16 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        process_capture, process_capture_with_upsert, process_copy_payload, process_paste_request,
-        CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
+        paste_failure_reason_for_copy_error, process_capture, process_capture_with_upsert,
+        process_copy_payload, process_paste_request, CaptureProcessError, CaptureProcessOutcome,
+        CopyProcessError,
     };
     use crate::{
         clipboard::{
             ClipboardCaptureResult, ClipboardPasteRequest, ClipboardWriteError,
             ClipboardWriteExpectationStore,
         },
-        command::UiEvent,
+        command::{PasteFailureReason, UiEvent},
         domain::ClipboardPayload,
         platform::windows::ProcessSource,
         storage::{HistoryPayload, StorageExecutor, TextUpsertResult},
@@ -546,5 +555,15 @@ mod tests {
         )
         .expect_err("旧哈希不应触碰系统剪贴板");
         assert_eq!(error.to_string(), "仅复制目标哈希已变化");
+    }
+
+    /// 包括 CloseClipboard 失败在内的桥接错误都必须保守显示重试提示，不能误报已复制。
+    #[test]
+    fn 自动粘贴桥错误统一保守降级() {
+        let error = CopyProcessError::Write(ClipboardWriteError::CloseFailed);
+        assert_eq!(
+            paste_failure_reason_for_copy_error(&error),
+            PasteFailureReason::ClipboardNotReady
+        );
     }
 }

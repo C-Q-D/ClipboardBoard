@@ -41,6 +41,9 @@ export component AppWindow inherits Window {
     background: #080808;
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
+    // 自动粘贴失败时只显示 Rust 侧选择的固定安全文案，不显示正文或原生错误详情。
+    in property <bool> paste-notice-visible: false;
+    in property <string> paste-notice-text: "";
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -169,6 +172,20 @@ export component AppWindow inherits Window {
                     color: #666666;
                     font-size: 13px;
                     horizontal-alignment: center;
+                }
+
+                if paste-notice-visible: Rectangle {
+                    height: 36px;
+                    background: #2a2114;
+                    border-radius: 8px;
+
+                    Text {
+                        text: paste-notice-text;
+                        color: #f1d59a;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
 
                 Rectangle {

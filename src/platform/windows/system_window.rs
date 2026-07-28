@@ -1,4 +1,4 @@
-//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键。
+//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键及单实例唤起消息。
 //!
 //! Win32 回调只负责把匹配的 WM_HOTKEY 转成 `UiEvent::OpenPanel` 并排入 UI 事件队列；
 //! 它不会直接访问 Slint 对象、剪贴板或其他业务状态。
@@ -17,12 +17,16 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
-    RegisterClassExW, TranslateMessage, HWND_MESSAGE, MSG, PM_NOREMOVE, WM_HOTKEY, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    RegisterClassExW, TranslateMessage, HWND_MESSAGE, MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 /// Win32 注册的窗口类名称；message-only 窗口不出现在任务栏或屏幕上。
-const WINDOW_CLASS_NAME: windows_sys::core::PCWSTR = windows_sys::core::w!("ClipboardBoardHotkey");
+pub(crate) const WINDOW_CLASS_NAME: windows_sys::core::PCWSTR =
+    windows_sys::core::w!("ClipboardBoardHotkey");
+
+/// 单实例二次启动使用的进程间消息；消息不携带剪贴板正文或其他敏感数据。
+pub(crate) const OPEN_PANEL_MESSAGE: u32 = WM_APP + 1;
 
 /// 在专用线程创建隐藏窗口、注册热键并运行消息泵。
 pub(crate) fn run(
@@ -139,9 +143,9 @@ unsafe extern "system" fn window_proc(
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
-    if is_default_hotkey_message(message, wparam) {
+    if is_open_panel_message(message) || is_default_hotkey_message(message, wparam) {
         if let Err(error) = post_ui_event(UiEvent::OpenPanel) {
-            eprintln!("全局快捷键事件无法进入 UI 事件队列：{error}");
+            eprintln!("打开面板事件无法进入 UI 事件队列：{error}");
         }
         return 0;
     }
@@ -164,6 +168,11 @@ fn classify_registration_error(code: u32, shortcut: &'static str) -> HotkeyError
 /// 只接受默认热键的 WM_HOTKEY 消息，其他消息交给 DefWindowProcW。
 fn is_default_hotkey_message(message: u32, wparam: usize) -> bool {
     message == WM_HOTKEY && wparam == super::hotkey::DEFAULT_HOTKEY.id as usize
+}
+
+/// 只接受固定的单实例唤起消息，避免把任意 WM_APP 消息当作业务命令。
+fn is_open_panel_message(message: u32) -> bool {
+    message == OPEN_PANEL_MESSAGE
 }
 
 /// 拉取并分发消息，返回值 -1 被视为 Win32 错误，0 表示收到退出消息。
@@ -192,7 +201,10 @@ fn message_loop() -> Result<(), HotkeyError> {
 mod tests {
     //! 此测试模块验证热键 ID 过滤和冲突错误映射，不依赖桌面上的其他热键占用者。
 
-    use super::{classify_registration_error, is_default_hotkey_message};
+    use super::{
+        classify_registration_error, is_default_hotkey_message, is_open_panel_message,
+        OPEN_PANEL_MESSAGE,
+    };
     use crate::platform::windows::hotkey::HotkeyError;
     use windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED;
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY;
@@ -203,6 +215,13 @@ mod tests {
         assert!(is_default_hotkey_message(WM_HOTKEY, 0x4342));
         assert!(!is_default_hotkey_message(WM_HOTKEY, 0x4343));
         assert!(!is_default_hotkey_message(WM_HOTKEY + 1, 0x4342));
+    }
+
+    /// 二次启动只能使用固定消息编号唤起主实例，其他消息必须被忽略。
+    #[test]
+    fn 只接受固定打开消息() {
+        assert!(is_open_panel_message(OPEN_PANEL_MESSAGE));
+        assert!(!is_open_panel_message(OPEN_PANEL_MESSAGE + 1));
     }
 
     /// Win32 的热键占用错误必须转换成带快捷键名称的明确错误。

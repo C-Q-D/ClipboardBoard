@@ -22,7 +22,8 @@ $requiredFiles = @(
     'src/platform/mod.rs',
     'src/platform/windows/mod.rs',
     'src/platform/windows/hotkey.rs',
-    'src/platform/windows/system_window.rs'
+    'src/platform/windows/system_window.rs',
+    'src/platform/windows/single_instance.rs'
 )
 
 foreach ($relativePath in $requiredFiles) {

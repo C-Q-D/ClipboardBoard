@@ -1,17 +1,23 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
-//! 当前入口只负责创建 UI、绑定弱窗口并启动热键管理器；托盘和剪贴板行为由后续原子接入。
+//! 当前入口先完成单实例判定，再创建 UI、绑定弱窗口并启动热键管理器；托盘和剪贴板行为由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::bind_app_window;
 #[cfg(windows)]
-use clipboard_board::platform::windows::HotkeyManager;
+use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
 use slint::ComponentHandle;
 
 /// 启动 ClipboardBoard 的最小桌面窗口。
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 单实例检查必须早于 UI、SQLite 和热键初始化，二次进程只负责通知主实例。
+    let _instance_guard = match acquire_or_activate()? {
+        SingleInstanceRole::Primary(guard) => guard,
+        SingleInstanceRole::Secondary => return Ok(()),
+    };
+
     let window = clipboard_board::create_app_window()?;
     bind_app_window(&window);
     window.hide()?;

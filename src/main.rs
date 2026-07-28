@@ -10,9 +10,13 @@ use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
 use clipboard_board::clipboard::ClipboardCaptureInbox;
 #[cfg(windows)]
+use clipboard_board::command::UiEvent;
+#[cfg(windows)]
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::{process_capture, unix_millis_now, CaptureProcessOutcome};
+#[cfg(windows)]
+use clipboard_board::history_restore::load_startup_snapshot;
 #[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
@@ -39,8 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_app_window(&window);
     window.hide()?;
 
-    // 存储执行器必须在热键和剪贴板监听前唯一创建，随后移动给结果泵线程。
-    let storage = StorageExecutor::open()?;
+    // 存储执行器必须在热键和剪贴板监听前唯一创建，并先完成启动恢复。
+    let mut storage = StorageExecutor::open()?;
+    let startup_snapshot = load_startup_snapshot(&mut storage)?;
+    post_ui_event(UiEvent::ReplaceSnapshot(startup_snapshot))?;
     let hotkey_manager = HotkeyManager::start()?;
     let capture_pump = match start_clipboard_pump(hotkey_manager.clipboard_inbox(), storage) {
         Ok(handle) => handle,

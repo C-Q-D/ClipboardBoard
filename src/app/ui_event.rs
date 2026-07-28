@@ -4,7 +4,7 @@
 //! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
 //! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
-use crate::command::{UiEvent, UiSnapshot};
+use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::AppWindow;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -21,6 +21,11 @@ use crate::platform::windows::window::{
 #[cfg(windows)]
 use slint::PhysicalPosition;
 
+/// 启动恢复后 UI 线程保留的摘要内存上限；完整正文不进入该缓存。
+pub const UI_HISTORY_MEMORY_CAPACITY: usize = 100;
+/// 单次写入 Slint 窗口模型的首批卡片上限，后续分页原子再扩展。
+pub const UI_FIRST_BATCH_SIZE: usize = 30;
+
 /// reducer 应用事件后交给 UI 窗口的最小副作用集合。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiAction {
@@ -35,7 +40,6 @@ enum UiAction {
 }
 
 /// UI 线程独占的内部状态，外部线程不能直接取得其实例或引用。
-#[derive(Default)]
 struct UiState {
     snapshot: UiSnapshot,
     /// 历史顺序和重复合并由独立协调器维护，UI 状态只同步其摘要快照。
@@ -50,6 +54,23 @@ struct UiState {
     panel_target: Option<PanelTarget>,
     applied_event_count: u64,
     applied_on_thread: Option<ThreadId>,
+}
+
+impl Default for UiState {
+    /// 使用 ATOM-18B 固定的 100 条内存历史容量初始化 UI 状态。
+    fn default() -> Self {
+        Self {
+            snapshot: UiSnapshot::default(),
+            history: MemoryHistory::new(UI_HISTORY_MEMORY_CAPACITY),
+            panel_visible: false,
+            panel_generation: 0,
+            quitting: false,
+            #[cfg(windows)]
+            panel_target: None,
+            applied_event_count: 0,
+            applied_on_thread: None,
+        }
+    }
 }
 
 impl UiState {
@@ -284,9 +305,7 @@ fn restore_selected_index(snapshot: &mut UiSnapshot, selected_hash: Option<[u8; 
 
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
 fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
-    let cards = snapshot
-        .items
-        .iter()
+    let cards = visible_snapshot_items(snapshot)
         .map(|item| crate::ClipboardCard {
             preview: SharedString::from(item.preview.as_str()),
             source: SharedString::from(item.source.as_str()),
@@ -294,6 +313,11 @@ fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
+}
+
+/// 返回窗口模型允许使用的首批摘要；完整内存快照保留在状态中供后续分页原子复用。
+fn visible_snapshot_items(snapshot: &UiSnapshot) -> impl Iterator<Item = &UiClipboardItem> {
+    snapshot.items.iter().take(UI_FIRST_BATCH_SIZE)
 }
 
 /// 读取当前面板代次；Slint 回调在 UI 线程运行，因此不需要跨线程锁。
@@ -359,8 +383,10 @@ pub fn ui_state_snapshot() -> UiStateSnapshot {
 mod tests {
     //! 此测试模块验证面板代次协议，确保旧的关闭事件不会误关闭新面板。
 
-    use super::{UiAction, UiState};
-    use crate::command::{UiClipboardItem, UiEvent};
+    use super::{
+        visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
+    };
+    use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
 
     /// 打开两轮面板后，第一轮的关闭事件必须被 reducer 拒绝。
     #[test]
@@ -531,5 +557,48 @@ mod tests {
         assert_eq!(state.snapshot.items.len(), 2);
         assert_eq!(state.snapshot.items[0].content_hash, [1; 32]);
         assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// UI 状态必须最多保留 100 条摘要，避免启动恢复或持续捕获无限增长。
+    #[test]
+    fn ui_内存历史容量固定为一百条() {
+        let mut state = UiState::default();
+        for index in 0..(UI_HISTORY_MEMORY_CAPACITY + 20) {
+            state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
+                id: index as u64 + 1,
+                preview: format!("条目-{index}"),
+                source: "测试来源".to_owned(),
+                relative_time: "刚刚".to_owned(),
+                content_hash: [index as u8; 32],
+                copy_count: 1,
+                is_pinned: false,
+            }));
+        }
+
+        assert_eq!(state.snapshot.items.len(), UI_HISTORY_MEMORY_CAPACITY);
+    }
+
+    /// 窗口模型只接收首批 30 条，内存快照的其余摘要不会一次构造成卡片。
+    #[test]
+    fn 窗口模型首批固定三十条() {
+        let snapshot = UiSnapshot {
+            items: (0..(UI_FIRST_BATCH_SIZE + 20))
+                .map(|index| UiClipboardItem {
+                    id: index as u64 + 1,
+                    preview: format!("条目-{index}"),
+                    source: "测试来源".to_owned(),
+                    relative_time: "刚刚".to_owned(),
+                    content_hash: [index as u8; 32],
+                    copy_count: 1,
+                    is_pinned: false,
+                })
+                .collect(),
+            selected_index: None,
+        };
+
+        assert_eq!(
+            visible_snapshot_items(&snapshot).count(),
+            UI_FIRST_BATCH_SIZE
+        );
     }
 }

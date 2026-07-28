@@ -42,6 +42,7 @@ fn 核心源码包含中文文件级职责说明() {
         "src/clipboard/io_worker.rs",
         "src/clipboard/reader.rs",
         "src/history_bridge.rs",
+        "src/history_restore.rs",
         "src/app/mod.rs",
         "src/app/ui_event.rs",
         "tests/ui_event.rs",

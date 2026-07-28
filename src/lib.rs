@@ -23,6 +23,10 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod history_bridge;
 
+// 启动恢复桥只在 Windows 目标暴露，因为它消费 Windows 主程序使用的存储生命周期。
+#[cfg(windows)]
+pub mod history_restore;
+
 // Windows 平台模块只在目标平台编译，避免把原生 API 泄漏到业务层公共接口。
 #[cfg(windows)]
 pub mod platform;

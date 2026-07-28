@@ -1,7 +1,7 @@
 //! 此模块提供搜索请求的防抖和结果代次协调，不执行 SQLite 查询或触碰 UI 对象。
 //!
 //! `SearchCoordinator` 由未来 UI 线程独占；它只保存最新的 `HistoryQuery`，在截止时间后
-//! 派发一个请求，并以 generation/in-flight 门禁拒绝迟到、取消后或重复的结果。
+//! 派发一个请求；SQLite 结果身份由独立 `HistoryPageCoordinator` 管理。
 
 use std::time::{Duration, Instant};
 
@@ -55,8 +55,6 @@ pub struct SearchCoordinator {
     latest_generation: Option<SearchGeneration>,
     /// 尚未到期的最新请求；新输入会覆盖它。
     pending: Option<PendingSearch>,
-    /// 已派发但尚未应用结果的代次；新输入或取消会清除它。
-    in_flight: Option<SearchGeneration>,
 }
 
 impl Default for SearchCoordinator {
@@ -79,7 +77,6 @@ impl SearchCoordinator {
             next_generation: 0,
             latest_generation: None,
             pending: None,
-            in_flight: None,
         }
     }
 
@@ -103,7 +100,6 @@ impl SearchCoordinator {
 
         self.next_generation = next;
         self.latest_generation = Some(generation);
-        self.in_flight = None;
         self.pending = Some(PendingSearch {
             request: SearchRequest { generation, query },
             deadline,
@@ -122,24 +118,12 @@ impl SearchCoordinator {
         }
 
         let pending = self.pending.take()?;
-        self.in_flight = Some(pending.request.generation);
         Some(pending.request)
     }
 
-    /// 接受当前 in-flight 代次的第一个结果；旧代次、取消后结果和重复结果均返回 `false`。
-    pub fn accept_result(&mut self, generation: SearchGeneration) -> bool {
-        if self.latest_generation == Some(generation) && self.in_flight == Some(generation) {
-            self.in_flight = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 取消待处理和进行中的查询；清除 in-flight 即可使所有迟到结果失效。
+    /// 取消尚未派发的防抖请求；已派发结果由分页协调器失效。
     pub fn cancel(&mut self) {
         self.pending = None;
-        self.in_flight = None;
     }
 
     /// 返回最新提交代次；尚未提交任何查询时返回 `None`。
@@ -150,11 +134,6 @@ impl SearchCoordinator {
     /// 返回当前是否存在尚未到期的请求。
     pub const fn has_pending(&self) -> bool {
         self.pending.is_some()
-    }
-
-    /// 返回当前是否存在等待结果应用的请求。
-    pub const fn has_in_flight(&self) -> bool {
-        self.in_flight.is_some()
     }
 }
 
@@ -202,7 +181,6 @@ mod tests {
         assert_eq!(request.generation, third);
         assert_eq!(request.query.keyword.as_deref(), Some("abc"));
         assert!(!coordinator.has_pending());
-        assert!(coordinator.has_in_flight());
     }
 
     /// 120 ms 截止点本身必须可派发，避免额外延迟一个事件循环周期。
@@ -228,7 +206,7 @@ mod tests {
 
     /// 已派发请求被新输入替换后，旧结果不得污染新 generation。
     #[test]
-    fn 新输入使旧结果失效且新结果只接受一次() {
+    fn 新输入使旧防抖请求失效() {
         let start = Instant::now();
         let mut coordinator = SearchCoordinator::new();
         let old_generation = coordinator
@@ -242,12 +220,10 @@ mod tests {
         let new_generation = coordinator
             .submit(query("new"), start + Duration::from_millis(121))
             .expect("新查询代次分配失败");
-        assert!(!coordinator.accept_result(old_generation));
         assert!(coordinator
             .poll(start + Duration::from_millis(241))
             .is_some());
-        assert!(coordinator.accept_result(new_generation));
-        assert!(!coordinator.accept_result(new_generation));
+        assert_eq!(coordinator.latest_generation(), Some(new_generation));
     }
 
     /// 取消或关闭语义必须同时丢弃 pending 和 in-flight 请求。
@@ -261,8 +237,6 @@ mod tests {
         assert!(coordinator.poll(start).is_some());
         coordinator.cancel();
         assert!(!coordinator.has_pending());
-        assert!(!coordinator.has_in_flight());
-        assert!(!coordinator.accept_result(generation));
         assert_eq!(coordinator.latest_generation(), Some(generation));
     }
 

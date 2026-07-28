@@ -8,6 +8,10 @@
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
+use crate::history_query::{
+    HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
+    HistoryRequestSender, HistoryResultReceiver,
+};
 use crate::search::{SearchCoordinator, SearchCoordinatorError};
 use crate::storage::HistoryQuery;
 use crate::AppWindow;
@@ -117,6 +121,12 @@ struct UiState {
     search_status: SearchStatus,
     /// 最近一次搜索提交代次；用于验证迟到计时器身份。
     search_generation: Option<u64>,
+    /// SQLite 数据集和单次请求身份协调器；只由 UI 线程修改。
+    history_pages: HistoryPageCoordinator,
+    /// 本次 reducer 事件产生的最新后台请求；事件入口会在离开状态借用后提交。
+    pending_history_request: Option<HistoryPageRequest>,
+    /// 当前成功首页返回的下一页游标，WCB-INT-10 将据此续页。
+    next_history_cursor: Option<crate::storage::HistoryCursor>,
     panel_visible: bool,
     /// 只有从隐藏进入可见的新会话才递增，用来隔离旧的 Esc 事件。
     panel_generation: u64,
@@ -137,6 +147,9 @@ impl Default for UiState {
             search_filter: SearchFilter::All,
             search_status: SearchStatus::Idle,
             search_generation: None,
+            history_pages: HistoryPageCoordinator::default(),
+            pending_history_request: None,
+            next_history_cursor: None,
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
@@ -172,6 +185,7 @@ impl UiState {
                     self.panel_visible = true;
                     self.reset_search_state();
                     self.select_first_if_needed();
+                    self.begin_history_dataset(true);
                     UiAction::Show
                 }
             }
@@ -183,6 +197,7 @@ impl UiState {
                     self.panel_visible = true;
                     self.reset_search_state();
                     self.select_first_if_needed();
+                    self.begin_history_dataset(true);
                     UiAction::Show
                 }
             }
@@ -190,12 +205,16 @@ impl UiState {
                 self.quitting = true;
                 self.panel_visible = false;
                 self.search.cancel();
+                self.history_pages.invalidate();
+                self.pending_history_request = None;
                 UiAction::Quit
             }
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
                     self.panel_visible = false;
                     self.search.cancel();
+                    self.history_pages.invalidate();
+                    self.pending_history_request = None;
                     UiAction::Hide
                 } else {
                     // 旧代次的 Esc 关闭事件只能被记录，不能关闭新一轮面板。
@@ -221,7 +240,13 @@ impl UiState {
                     .map(|item| item.content_hash);
                 // 捕获事件已经由 SQLite 返回最终快照，不能再走本地“旧值加一”的兼容路径。
                 self.history.record_persisted(item);
-                self.rebuild_visible_snapshot(selected_hash);
+                // 捕获先推进数据集，立即屏蔽已经完成 SQLite 但尚未到 UI 的旧首页。
+                // 当前筛选会被立即查询，因此取消尚未到期的同筛选防抖，避免重复首页。
+                self.search.cancel();
+                self.begin_history_dataset(self.panel_visible);
+                if !self.panel_visible {
+                    self.rebuild_visible_snapshot(selected_hash);
+                }
                 UiAction::None
             }
             UiEvent::SearchTextChanged(text) => self.begin_search(text, self.search_filter, now),
@@ -231,6 +256,7 @@ impl UiState {
             UiEvent::SearchDebounceElapsed { generation } => {
                 self.apply_search_if_current(generation, now)
             }
+            UiEvent::HistoryQueryWake => UiAction::None,
             UiEvent::MoveSelection { delta } => {
                 // 面板隐藏后拒绝迟到的键盘事件，避免旧事件改变下一轮打开时的选择状态。
                 if !self.panel_visible {
@@ -292,8 +318,42 @@ impl UiState {
         self.search_filter = SearchFilter::All;
         self.search_status = SearchStatus::Idle;
         self.search_generation = None;
+        self.pending_history_request = None;
+        self.next_history_cursor = None;
         self.snapshot.selected_index = None;
         self.rebuild_visible_snapshot(None);
+    }
+
+    /// 推进 SQLite 数据集；可见时立即生成当前筛选的首页请求。
+    fn begin_history_dataset(&mut self, request_now: bool) {
+        match self.history_pages.begin_dataset() {
+            Ok(_) if request_now => {
+                self.search_status = SearchStatus::Loading;
+                match self
+                    .history_pages
+                    .request_first_page(self.build_search_query())
+                {
+                    Ok(request) => self.pending_history_request = Some(request),
+                    Err(_) => self.mark_history_identity_error(),
+                }
+            }
+            Ok(_) => {
+                self.pending_history_request = None;
+            }
+            Err(HistoryPageCoordinatorError::GenerationExhausted) => {
+                self.mark_history_identity_error()
+            }
+            Err(
+                HistoryPageCoordinatorError::TokenExhausted
+                | HistoryPageCoordinatorError::NoActiveDataset,
+            ) => self.mark_history_identity_error(),
+        }
+    }
+
+    /// 身份耗尽只显示固定错误并保留当前卡片。
+    fn mark_history_identity_error(&mut self) {
+        self.pending_history_request = None;
+        self.search_status = SearchStatus::Error;
     }
 
     /// 提交一次关键词或标签变化；保留旧可见结果并等待当前代次到期，避免内容跳闪。
@@ -308,6 +368,11 @@ impl UiState {
         // `apply_search_if_current` 才会以新筛选集合替换卡片。
         self.snapshot.selected_index = None;
         self.search_status = SearchStatus::Loading;
+        // 输入事件发生时立即推进数据集；旧 SQLite 结果不能等到 120ms 到期才失效。
+        if self.history_pages.begin_dataset().is_err() {
+            self.mark_history_identity_error();
+            return UiAction::None;
+        }
 
         match self.search.submit(self.build_search_query(), now) {
             Ok(generation) => {
@@ -333,22 +398,16 @@ impl UiState {
             return UiAction::None;
         }
 
-        let Some(request) = self.search.poll(now) else {
+        let Some(search_request) = self.search.poll(now) else {
             return UiAction::None;
         };
-        if request.generation.as_u64() != generation
-            || !self.search.accept_result(request.generation)
-        {
+        if search_request.generation.as_u64() != generation {
             return UiAction::None;
         }
-
-        self.rebuild_visible_snapshot(None);
-        self.select_first_if_needed();
-        self.search_status = if self.snapshot.items.is_empty() {
-            SearchStatus::Empty
-        } else {
-            SearchStatus::Results
-        };
+        match self.history_pages.request_first_page(search_request.query) {
+            Ok(request) => self.pending_history_request = Some(request),
+            Err(_) => self.mark_history_identity_error(),
+        }
         UiAction::None
     }
 
@@ -365,9 +424,51 @@ impl UiState {
                 SearchFilter::Pinned => Some(true),
                 SearchFilter::All | SearchFilter::Text => None,
             },
-            limit: UI_HISTORY_MEMORY_CAPACITY as u32,
+            limit: UI_FIRST_BATCH_SIZE as u32,
             ..HistoryQuery::default()
         }
+    }
+
+    /// 应用从 latest 结果槽提取的首页；失败保留旧卡片，成功按 ID/哈希重定位选择。
+    fn apply_history_page_result(&mut self, result: HistoryPageResult) {
+        if !self
+            .history_pages
+            .accept_first_page(self.panel_visible, &result)
+        {
+            return;
+        }
+        match result.outcome {
+            Ok(page) => {
+                let selected_identity = self
+                    .snapshot
+                    .selected_index
+                    .and_then(|index| self.snapshot.items.get(index))
+                    .map(|item| (item.id, item.content_hash));
+                self.next_history_cursor = page.next_cursor;
+                self.history.replace(page.items.clone());
+                self.snapshot.items = page.items;
+                self.snapshot.selected_index = selected_identity.and_then(|(id, hash)| {
+                    self.snapshot
+                        .items
+                        .iter()
+                        .position(|item| item.id == id && item.content_hash == hash)
+                });
+                self.select_first_if_needed();
+                self.search_status = if self.snapshot.items.is_empty() {
+                    SearchStatus::Empty
+                } else {
+                    SearchStatus::Results
+                };
+            }
+            Err(_) => {
+                self.search_status = SearchStatus::Error;
+            }
+        }
+    }
+
+    /// 取出本次事件生成的后台请求；调用方必须在释放 UiState 借用后提交。
+    fn take_pending_history_request(&mut self) -> Option<HistoryPageRequest> {
+        self.pending_history_request.take()
     }
 
     /// 按当前关键词和标签在有界内存历史中重建可见列表，避免改变完整缓存顺序。
@@ -461,6 +562,10 @@ thread_local! {
     #[cfg(windows)]
     /// UI 线程只保留复制请求桥的 Clone，不持有存储执行器或剪贴板正文。
     static UI_COPY_INBOX: RefCell<Option<ClipboardCaptureInbox>> = const { RefCell::new(None) };
+    /// UI 线程只持有 latest-wins 查询发送端，提交不会等待 SQLite。
+    static UI_HISTORY_REQUESTS: RefCell<Option<HistoryRequestSender>> = const { RefCell::new(None) };
+    /// UI wake 到达后从该槽提取最新轻量结果，并在同一锁内清除 wake_pending。
+    static UI_HISTORY_RESULTS: RefCell<Option<HistoryResultReceiver>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -555,36 +660,89 @@ pub fn bind_copy_request_inbox(inbox: ClipboardCaptureInbox) {
     });
 }
 
+/// 在 UI 线程绑定 SQLite 查询的非阻塞请求端和 latest 结果端。
+pub fn bind_history_query_bridge(requests: HistoryRequestSender, results: HistoryResultReceiver) {
+    UI_HISTORY_REQUESTS.with(|slot| {
+        *slot.borrow_mut() = Some(requests);
+    });
+    UI_HISTORY_RESULTS.with(|slot| {
+        *slot.borrow_mut() = Some(results);
+    });
+}
+
+/// 关闭查询双向桥；Quit 调用后 worker 不再接受排队请求，迟到结果也不再唤醒 UI。
+fn close_history_query_bridge() {
+    UI_HISTORY_REQUESTS.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            sender.close();
+        }
+    });
+    UI_HISTORY_RESULTS.with(|slot| {
+        if let Some(receiver) = slot.borrow().as_ref() {
+            receiver.close();
+        }
+    });
+}
+
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
 ///
 /// 该函数只接受拥有型 `UiEvent`，不会同步执行 reducer。返回 `Ok(())` 只代表事件
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
+        let history_result = if matches!(&event, UiEvent::HistoryQueryWake) {
+            UI_HISTORY_RESULTS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(HistoryResultReceiver::take_latest)
+            })
+        } else {
+            None
+        };
         // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = !matches!(
             &event,
             UiEvent::MoveSelection { .. } | UiEvent::SelectItem { .. } | UiEvent::CopyItem { .. }
         );
-        let (action, snapshot, search_text, search_filter, search_status) =
+        let (action, mut snapshot, search_text, search_filter, mut search_status, request) =
             UI_STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 let action = state.apply(event);
+                if let Some(result) = history_result {
+                    state.apply_history_page_result(result);
+                }
                 (
                     action,
                     state.snapshot.clone(),
                     state.search_text.clone(),
                     state.search_filter,
                     state.search_status,
+                    state.take_pending_history_request(),
                 )
             });
+        if let Some(request) = request {
+            let submitted = UI_HISTORY_REQUESTS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|sender| sender.submit(request).is_ok())
+            });
+            if !submitted {
+                UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.mark_history_identity_error();
+                    snapshot = state.snapshot.clone();
+                    search_status = state.search_status;
+                });
+            }
+        }
         // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
         let refresh_model = may_refresh_model && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
             #[cfg(windows)]
             close_copy_request_gate();
+            close_history_query_bridge();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");
@@ -933,6 +1091,7 @@ mod tests {
         UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
+    use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
     use std::time::{Duration, Instant};
 
     /// 构造具有稳定哈希的测试卡片，便于验证首批边界而不混入重复去重行为。
@@ -946,6 +1105,124 @@ mod tests {
             copy_count: 1,
             is_pinned: false,
         }
+    }
+
+    /// 取出当前请求并模拟 worker 返回成功首页。
+    fn apply_success_page(state: &mut UiState, items: Vec<UiClipboardItem>) {
+        let request = state
+            .take_pending_history_request()
+            .expect("当前事件应生成 SQLite 首页请求");
+        state.apply_history_page_result(HistoryPageResult {
+            generation: request.generation,
+            token: request.token,
+            requested_cursor: request.query.cursor,
+            outcome: Ok(UiHistoryPage {
+                items,
+                next_cursor: None,
+            }),
+        });
+    }
+
+    /// 把指定请求包装成可注入 reducer 的首页结果。
+    fn page_result(
+        request: &crate::history_query::HistoryPageRequest,
+        outcome: Result<UiHistoryPage, HistoryQueryFailure>,
+    ) -> HistoryPageResult {
+        HistoryPageResult {
+            generation: request.generation,
+            token: request.token,
+            requested_cursor: request.query.cursor,
+            outcome,
+        }
+    }
+
+    /// 首次打开立即请求 30 条 SQLite 首页，可见状态下重复激活不得重查。
+    #[test]
+    fn 首次打开立即查询首页且重复激活不重查() {
+        let mut state = UiState::default();
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        let request = state
+            .take_pending_history_request()
+            .expect("首次打开必须生成首页请求");
+        assert_eq!(request.query.limit, UI_FIRST_BATCH_SIZE as u32);
+        assert!(request.query.cursor.is_none());
+
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Reassert);
+        assert!(state.take_pending_history_request().is_none());
+    }
+
+    /// 查询失败只显示固定错误，不能清空仍可交互的旧卡片。
+    #[test]
+    fn 首页查询失败保留旧卡片() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let request = state.take_pending_history_request().unwrap();
+        state.apply_history_page_result(page_result(
+            &request,
+            Err(HistoryQueryFailure::StorageUnavailable),
+        ));
+        assert_eq!(state.search_status, SearchStatus::Error);
+        assert_eq!(state.snapshot.items, vec![test_item(0)]);
+    }
+
+    /// 捕获提交会先推进数据集，使已经生成但尚未应用的旧首页失效。
+    #[test]
+    fn 捕获刷新拒绝旧首页结果() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_request = state.take_pending_history_request().unwrap();
+        state.apply(UiEvent::ClipboardCaptured(test_item(1)));
+        let current_request = state.take_pending_history_request().unwrap();
+
+        state.apply_history_page_result(page_result(
+            &old_request,
+            Ok(UiHistoryPage {
+                items: vec![test_item(99)],
+                next_cursor: None,
+            }),
+        ));
+        assert_ne!(state.snapshot.items, vec![test_item(99)]);
+
+        state.apply_history_page_result(page_result(
+            &current_request,
+            Ok(UiHistoryPage {
+                items: vec![test_item(1), test_item(0)],
+                next_cursor: None,
+            }),
+        ));
+        assert_eq!(state.snapshot.items[0], test_item(1));
+    }
+
+    /// 输入事件本身就必须使旧首页失效，不能等防抖到期后才建立隔离。
+    #[test]
+    fn 搜索输入立即拒绝旧首页结果() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_request = state.take_pending_history_request().unwrap();
+        state.apply_at(UiEvent::SearchTextChanged("新查询".to_owned()), start);
+
+        state.apply_history_page_result(page_result(
+            &old_request,
+            Ok(UiHistoryPage {
+                items: vec![test_item(99)],
+                next_cursor: None,
+            }),
+        ));
+        assert_eq!(state.snapshot.items, vec![test_item(0)]);
+        assert_eq!(state.search_status, SearchStatus::Loading);
     }
 
     /// 打开两轮面板后，第一轮的关闭事件必须被 reducer 拒绝。
@@ -1003,6 +1280,7 @@ mod tests {
             selected_index: None,
         }));
         state.apply(UiEvent::OpenPanel);
+        let _ = state.take_pending_history_request();
         state.apply(UiEvent::MoveSelection { delta: 1 });
         state.apply_at(UiEvent::SearchTextChanged("条目".to_owned()), start);
         let before = state.snapshot();
@@ -1421,6 +1699,13 @@ mod tests {
             UiEvent::SearchDebounceElapsed { generation: 1 },
             start + Duration::from_millis(120),
         );
+        apply_success_page(
+            &mut state,
+            vec![UiClipboardItem {
+                preview: "Rust 代码".to_owned(),
+                ..test_item(0)
+            }],
+        );
         assert_eq!(state.search_status, SearchStatus::Results);
         assert_eq!(state.snapshot.items.len(), 1);
         assert_eq!(state.snapshot.items[0].preview, "Rust 代码");
@@ -1446,6 +1731,7 @@ mod tests {
             selected_index: None,
         }));
         state.apply(UiEvent::OpenPanel);
+        let _ = state.take_pending_history_request();
 
         state.apply_at(UiEvent::SearchTextChanged("旧".to_owned()), start);
         state.apply_at(
@@ -1466,11 +1752,18 @@ mod tests {
             UiEvent::SearchDebounceElapsed { generation: 2 },
             start + Duration::from_millis(150),
         );
+        apply_success_page(
+            &mut state,
+            vec![UiClipboardItem {
+                preview: "新关键词".to_owned(),
+                ..test_item(1)
+            }],
+        );
         assert_eq!(state.search_status, SearchStatus::Results);
         assert_eq!(state.snapshot.items[0].preview, "新关键词");
     }
 
-    /// 收藏标签必须清空旧选择并只展示已收藏记录；文本标签仍保留当前文本历史语义。
+    /// 收藏标签必须清空旧选择，并以 SQLite 返回的收藏首页替换当前有界缓存。
     #[test]
     fn 收藏筛选重置选择并只保留收藏记录() {
         let start = Instant::now();
@@ -1482,6 +1775,7 @@ mod tests {
             selected_index: None,
         }));
         state.apply(UiEvent::OpenPanel);
+        let _ = state.take_pending_history_request();
         state.apply(UiEvent::MoveSelection { delta: 1 });
 
         assert!(matches!(
@@ -1493,11 +1787,14 @@ mod tests {
             UiEvent::SearchDebounceElapsed { generation: 1 },
             start + Duration::from_millis(120),
         );
+        let mut pinned_result = test_item(0);
+        pinned_result.is_pinned = true;
+        apply_success_page(&mut state, vec![pinned_result]);
         assert_eq!(state.search_filter, SearchFilter::Pinned);
         assert_eq!(state.snapshot.items.len(), 1);
         assert!(state.snapshot.items[0].is_pinned);
         assert_eq!(state.snapshot.selected_index, Some(0));
-        assert_eq!(state.history.items().len(), 2);
+        assert_eq!(state.history.items().len(), 1);
     }
 
     /// 面板关闭后到达的旧搜索事件不能重新显示结果或改变已取消的查询状态。

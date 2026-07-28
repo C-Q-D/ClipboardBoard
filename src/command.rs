@@ -186,6 +186,8 @@ pub enum UiEvent {
     SearchFilterChanged(SearchFilter),
     /// 防抖计时器到期事件；代次不匹配时必须丢弃，不能消费新请求。
     SearchDebounceElapsed { generation: u64 },
+    /// SQLite 查询 worker 的无正文唤醒；UI 从绑定的 latest 结果槽提取真实结果。
+    HistoryQueryWake,
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
     MoveSelection { delta: i32 },
     /// 请求选中一次点击时解析出的稳定记录身份；异步应用时必须重新校验面板代次和内容身份。

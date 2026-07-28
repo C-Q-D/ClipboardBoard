@@ -7,7 +7,7 @@
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
-use clipboard_board::app::{bind_app_window, bind_copy_request_inbox};
+use clipboard_board::app::{bind_app_window, bind_copy_request_inbox, bind_history_query_bridge};
 #[cfg(windows)]
 use clipboard_board::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
 #[cfg(windows)]
@@ -16,6 +16,10 @@ use clipboard_board::command::UiEvent;
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::run_clipboard_pump;
+#[cfg(windows)]
+use clipboard_board::history_query::{
+    history_request_channel, history_result_channel, start_history_query_worker,
+};
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
 #[cfg(windows)]
@@ -60,9 +64,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(error.into());
             }
         };
+    let (history_requests, history_request_receiver) = history_request_channel();
+    let (history_result_sender, history_results) = history_result_channel();
+    bind_history_query_bridge(history_requests.clone(), history_results.clone());
+    let history_query_worker = match start_history_query_worker(
+        storage.client(),
+        history_request_receiver,
+        history_result_sender,
+        || post_ui_event(UiEvent::HistoryQueryWake).is_ok(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            history_requests.close();
+            history_results.close();
+            let _ = hotkey_manager.stop();
+            let _ = capture_pump.join();
+            return Err(error.into());
+        }
+    };
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
+    history_requests.close();
+    history_results.close();
     let hotkey_result = hotkey_manager.stop();
     // UI Quit 已先关闭复制入口；关闭线性化点前取出的在途请求在此 join 前完成，
     // 因此进程真正退出后不会继续写回系统剪贴板。
@@ -70,7 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "剪贴板结果泵线程异常退出")
         .map(|_| ());
-    // 先关闭输入并排空已接受的捕获，再建立存储关闭线性化点，避免退出期丢失最后一条历史。
+    let history_query_result = history_query_worker
+        .join()
+        .map_err(|_| "历史查询线程异常退出")
+        .map(|_| ());
+    // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
     let storage_result = storage
         .begin_closing()
         .and_then(|()| storage.finish_shutdown());
@@ -79,6 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop_result?;
     hotkey_result?;
     capture_pump_result?;
+    history_query_result?;
     storage_result?;
     Ok(())
 }

@@ -8,6 +8,7 @@ description = "轻量 Windows 剪贴板工作台"
 license = "MIT"
 
 [dependencies]
+blake3 = "1.8.2"
 slint = "1.16.0"
 
 [build-dependencies]

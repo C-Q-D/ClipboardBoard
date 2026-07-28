@@ -8,6 +8,7 @@ slint::include_modules!();
 pub mod app;
 pub mod command;
 pub mod diagnostics;
+pub mod domain;
 
 // Windows 平台模块只在目标平台编译，避免把原生 API 泄漏到业务层公共接口。
 #[cfg(windows)]

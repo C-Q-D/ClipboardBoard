@@ -27,6 +27,8 @@ export component AppWindow inherits Window {
     callback panel-dismiss-requested();
     // 上下键只发出方向请求，选择状态和边界夹紧由 Rust UI reducer 统一处理。
     callback selection-move-requested(delta: int);
+    // Ctrl+Enter 只发出按当前选中项复制的请求，正文由后台按 ID 从存储读取。
+    callback copy-selection-requested();
     forward-focus: panel-focus;
 
     title: "ClipboardBoard";
@@ -55,6 +57,10 @@ export component AppWindow inherits Window {
             }
             if (event.text == Key.DownArrow) {
                 selection-move-requested(1);
+                accept
+            }
+            if (event.text == Key.Return && event.modifiers.control) {
+                copy-selection-requested();
                 accept
             }
             reject

@@ -28,6 +28,7 @@ $requiredFiles = @(
     'src/clipboard/mod.rs',
     'src/clipboard/io_worker.rs',
     'src/clipboard/reader.rs',
+    'src/clipboard/writer.rs',
     'src/history_bridge.rs',
     'src/history_restore.rs',
     'src/app/mod.rs',

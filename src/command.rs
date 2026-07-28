@@ -121,6 +121,8 @@ pub enum UiEvent {
     ClipboardCaptured(UiClipboardItem),
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
     MoveSelection { delta: i32 },
+    /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。
+    CopySelection,
 }
 
 #[cfg(all(test, windows))]

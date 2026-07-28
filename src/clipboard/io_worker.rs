@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use super::reader::{
     read_text_with_backend, ClipboardReadError, RetryPolicy, Win32ClipboardBackend,
 };
+use super::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
 use crate::domain::ClipboardPayload;
 use crate::platform::windows::ProcessSource;
 
@@ -54,6 +55,31 @@ pub struct ClipboardCaptureResult {
     pub payload: ClipboardPayload,
 }
 
+/// UI 请求只复制某条历史时提交的轻量命令；正文仍必须从存储线程按 ID 读取。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardCopyRequest {
+    /// 目标历史记录的数据库 ID。
+    pub id: u64,
+    /// UI 当前卡片看到的哈希，用于拒绝旧选择误写入新记录正文。
+    pub content_hash: [u8; 32],
+}
+
+impl ClipboardCopyRequest {
+    /// 创建带一致性哈希的仅复制请求，不携带完整剪贴板正文。
+    pub fn new(id: u64, content_hash: [u8; 32]) -> Self {
+        Self { id, content_hash }
+    }
+}
+
+/// 结果泵需要消费的两类工作；复制请求和捕获结果共享一个有界唤醒通道。
+#[derive(Debug)]
+pub enum ClipboardWorkItem {
+    /// ClipboardIO worker 发布的捕获结果。
+    Capture(Result<ClipboardCaptureResult, ClipboardReadError>),
+    /// UI 投递的按 ID 仅复制请求。
+    Copy(ClipboardCopyRequest),
+}
+
 /// 从消息线程移交捕获结果的容量为一 latest-wins 桥。
 ///
 /// 生产消费者可以在 UI 或历史协调器线程调用 `try_take`，不会访问消息线程的 HWND、
@@ -70,6 +96,8 @@ pub struct ClipboardCaptureInbox {
 struct CaptureInboxState {
     /// 尚未消费的唯一最新结果；成功和 sequence 失配错误都占用同一槽位。
     pending: Option<Result<ClipboardCaptureResult, ClipboardReadError>>,
+    /// 尚未处理的最新仅复制请求；快速重复按键只保留最后一次选择。
+    pending_copy: Option<ClipboardCopyRequest>,
     /// 关闭闩锁；worker 停止后消费者不再等待。
     closed: bool,
 }
@@ -80,6 +108,7 @@ impl ClipboardCaptureInbox {
         Self {
             state: Arc::new(Mutex::new(CaptureInboxState {
                 pending: None,
+                pending_copy: None,
                 closed: false,
             })),
             wake: Arc::new(Condvar::new()),
@@ -93,10 +122,39 @@ impl ClipboardCaptureInbox {
 
     /// 阻塞等待一个结果；桥关闭且没有待处理结果时返回 `None`。
     pub fn wait_take(&self) -> Option<Result<ClipboardCaptureResult, ClipboardReadError>> {
+        loop {
+            match self.wait_take_work()? {
+                ClipboardWorkItem::Capture(result) => return Some(result),
+                ClipboardWorkItem::Copy(_) => {
+                    // 兼容旧 API 的调用方不消费复制命令；生产结果泵使用 wait_take_work。
+                }
+            }
+        }
+    }
+
+    /// 投递最新仅复制请求；队列关闭后立即拒绝，UI 线程不等待数据库或系统剪贴板。
+    pub fn request_copy(&self, request: ClipboardCopyRequest) -> Result<(), ClipboardWorkerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ClipboardWorkerError::Disconnected)?;
+        if state.closed {
+            return Err(ClipboardWorkerError::Disconnected);
+        }
+        state.pending_copy = Some(request);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// 阻塞取得最新捕获或仅复制命令；复制请求优先，避免被持续复制事件饿死。
+    pub fn wait_take_work(&self) -> Option<ClipboardWorkItem> {
         let mut state = self.state.lock().ok()?;
         loop {
+            if let Some(request) = state.pending_copy.take() {
+                return Some(ClipboardWorkItem::Copy(request));
+            }
             if let Some(result) = state.pending.take() {
-                return Some(result);
+                return Some(ClipboardWorkItem::Capture(result));
             }
             if state.closed {
                 return None;
@@ -105,12 +163,13 @@ impl ClipboardCaptureInbox {
         }
     }
 
-    /// 标记结果桥关闭但保留最后一项，唤醒等待者先消费结果再结束。
+    /// 标记结果桥关闭；保留已经发布的捕获结果，但丢弃尚未执行的复制命令。
     ///
     /// 该方法只由 worker 在 `join` 完成后调用；这样在途读取仍有机会发布最终结果，
-    /// 关闭不会把已经交接给桥的正文静默丢弃。
+    /// 关闭不会把已经交接给桥的正文静默丢弃，也不会在 UI 已退出后启动新的 Win32 写回。
     pub(crate) fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
+            state.pending_copy = None;
             state.closed = true;
             self.wake.notify_all();
         }
@@ -244,12 +303,21 @@ impl ClipboardIoWorker {
 
     /// 使用调用方提供的结果桥启动 worker，便于消息线程和后续协调器共享同一接缝。
     pub fn start_with_inbox(inbox: ClipboardCaptureInbox) -> Result<Self, ClipboardWorkerError> {
+        Self::start_with_inbox_and_expectations(inbox, ClipboardWriteExpectationStore::new())
+    }
+
+    /// 使用调用方提供的写回预期启动 worker；自身写回事件会在发布历史前一次性消费。
+    pub fn start_with_inbox_and_expectations(
+        inbox: ClipboardCaptureInbox,
+        expectations: ClipboardWriteExpectationStore,
+    ) -> Result<Self, ClipboardWorkerError> {
         let queue = Arc::new(LatestRequestQueue::new());
         let worker_queue = Arc::clone(&queue);
         let worker_inbox = inbox.clone();
+        let worker_expectations = expectations;
         let join_handle = thread::Builder::new()
             .name("ClipboardIoWorker".to_owned())
-            .spawn(move || worker_loop(worker_queue, worker_inbox))
+            .spawn(move || worker_loop(worker_queue, worker_inbox, worker_expectations))
             .map_err(|_| ClipboardWorkerError::ThreadStart)?;
 
         Ok(Self {
@@ -337,7 +405,11 @@ impl Drop for ClipboardIoWorker {
 }
 
 /// worker 主循环；每个请求创建短生命周期 Win32 backend，避免句柄跨请求复用。
-fn worker_loop(queue: Arc<LatestRequestQueue>, inbox: ClipboardCaptureInbox) {
+fn worker_loop(
+    queue: Arc<LatestRequestQueue>,
+    inbox: ClipboardCaptureInbox,
+    expectations: ClipboardWriteExpectationStore,
+) {
     while let Some(request) = queue.pop() {
         let mut backend = Win32ClipboardBackend;
         let result = read_text_with_backend(
@@ -359,13 +431,30 @@ fn worker_loop(queue: Arc<LatestRequestQueue>, inbox: ClipboardCaptureInbox) {
                     source,
                     payload,
                 });
+                let publish_capture = should_publish_capture(&capture_result, &expectations);
                 // 先发布到公共桥，再尝试响应直连调用方；即使直连 Receiver 已被丢弃，
                 // 后续历史协调器仍能观察到同一个最新结果或 sequence 失配错误。
-                inbox.publish(capture_result.clone());
+                if publish_capture {
+                    inbox.publish(capture_result.clone());
+                }
                 let _ = response.send(capture_result);
             }
         }
     }
+}
+
+/// 仅在捕获结果不是已登记的自身 Unicode 写回时发布到历史桥，并保证预期只消费一次。
+fn should_publish_capture(
+    capture_result: &Result<ClipboardCaptureResult, ClipboardReadError>,
+    expectations: &ClipboardWriteExpectationStore,
+) -> bool {
+    !capture_result.as_ref().is_ok_and(|capture| {
+        expectations.consume_if_matches(
+            capture.sequence,
+            capture.payload.summary().content_hash,
+            ClipboardWriteFormat::UnicodeText,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -373,9 +462,11 @@ mod tests {
     //! 此测试模块验证 worker 的 latest-wins 队列、异步响应和停止回收协议。
 
     use super::{
-        ClipboardCaptureInbox, ClipboardCaptureRequest, ClipboardCaptureResult, ClipboardIoWorker,
+        should_publish_capture, ClipboardCaptureInbox, ClipboardCaptureRequest,
+        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardIoWorker, ClipboardWorkItem,
         ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
     };
+    use crate::clipboard::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
     use crate::domain::ClipboardPayload;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -505,6 +596,17 @@ mod tests {
         assert!(inbox.wait_take().is_none());
     }
 
+    /// 结果桥关闭时必须丢弃尚未执行的复制命令，避免停止阶段重新写入系统剪贴板。
+    #[test]
+    fn 关闭时丢弃待处理复制命令() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox
+            .request_copy(ClipboardCopyRequest::new(88, [8; 32]))
+            .expect("开放桥应接受复制命令");
+        inbox.close();
+        assert!(inbox.wait_take_work().is_none());
+    }
+
     /// 捕获请求必须把序号和来源快照绑定到同一个响应通道，避免快速复制时错配来源。
     #[test]
     fn 捕获请求保存序号和来源快照() {
@@ -533,5 +635,53 @@ mod tests {
             response: ReadResponse::Payload(sender),
         });
         assert_eq!(result, Err(ClipboardWorkerError::Disconnected));
+    }
+
+    /// 仅复制命令必须和捕获结果共用有界唤醒桥，并保留最新选择的 ID 与哈希。
+    #[test]
+    fn 仅复制请求进入工作桥() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox
+            .request_copy(ClipboardCopyRequest::new(9, [4; 32]))
+            .expect("开放桥应接受仅复制请求");
+
+        match inbox.wait_take_work().expect("应取得复制命令") {
+            ClipboardWorkItem::Copy(request) => {
+                assert_eq!(request.id, 9);
+                assert_eq!(request.content_hash, [4; 32]);
+            }
+            ClipboardWorkItem::Capture(_) => panic!("复制命令不能伪装为捕获结果"),
+        }
+    }
+
+    /// 桥关闭后不允许再写入复制命令，避免 UI 退出阶段阻塞或复活后台任务。
+    #[test]
+    fn 关闭后拒绝仅复制请求() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox.close();
+        assert_eq!(
+            inbox.request_copy(ClipboardCopyRequest::new(1, [1; 32])),
+            Err(ClipboardWorkerError::Disconnected)
+        );
+    }
+
+    /// 匹配的自身写回结果必须从历史桥吞掉，第二次看到同一结果则恢复正常发布。
+    #[test]
+    fn 自身写回结果只消费一次() {
+        let expectations = ClipboardWriteExpectationStore::new();
+        let payload = ClipboardPayload::from_text("自身写回");
+        let hash = payload.summary().content_hash;
+        let token = expectations
+            .arm(hash, ClipboardWriteFormat::UnicodeText)
+            .expect("预期队列应接受自身写回");
+        expectations.bind_sequence(token, 44);
+        let result = Ok(ClipboardCaptureResult {
+            sequence: 44,
+            source: None,
+            payload,
+        });
+
+        assert!(!should_publish_capture(&result, &expectations));
+        assert!(should_publish_capture(&result, &expectations));
     }
 }

@@ -4,6 +4,8 @@
 //! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
 //! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
+#[cfg(windows)]
+use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::AppWindow;
@@ -33,6 +35,8 @@ enum UiAction {
     Show,
     /// 选择索引已变化，需要在 UI 线程调整当前卡片视口。
     ScrollSelection,
+    /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
+    CopySelection { id: u64, content_hash: [u8; 32] },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
     Hide,
     /// 该事件只改变数据或已经过期，不触发窗口副作用。
@@ -167,6 +171,24 @@ impl UiState {
                 self.move_selection(delta);
                 UiAction::ScrollSelection
             }
+            UiEvent::CopySelection => {
+                if !self.panel_visible {
+                    return UiAction::None;
+                }
+                let Some(index) = self.snapshot.selected_index else {
+                    return UiAction::None;
+                };
+                let Some(item) = self.snapshot.items.get(index) else {
+                    return UiAction::None;
+                };
+                if index >= selection_limit(&self.snapshot) {
+                    return UiAction::None;
+                }
+                UiAction::CopySelection {
+                    id: item.id,
+                    content_hash: item.content_hash,
+                }
+            }
         }
     }
 
@@ -249,6 +271,9 @@ thread_local! {
     static UI_STATE: RefCell<UiState> = RefCell::new(UiState::default());
     /// UI 线程持有的弱窗口引用，避免事件入口形成窗口强引用环。
     static UI_WINDOW: RefCell<Option<slint::Weak<AppWindow>>> = const { RefCell::new(None) };
+    #[cfg(windows)]
+    /// UI 线程只保留复制请求桥的 Clone，不持有存储执行器或剪贴板正文。
+    static UI_COPY_INBOX: RefCell<Option<ClipboardCaptureInbox>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -286,6 +311,20 @@ pub fn bind_app_window(window: &AppWindow) {
             eprintln!("键盘选择事件无法进入 UI 事件队列：{error}");
         }
     });
+
+    window.on_copy_selection_requested(|| {
+        if let Err(error) = post_ui_event(UiEvent::CopySelection) {
+            eprintln!("仅复制事件无法进入 UI 事件队列：{error}");
+        }
+    });
+}
+
+#[cfg(windows)]
+/// 登记由消息线程创建的复制请求桥；正文读取和系统写回仍在历史结果泵线程完成。
+pub fn bind_copy_request_inbox(inbox: ClipboardCaptureInbox) {
+    UI_COPY_INBOX.with(|slot| {
+        *slot.borrow_mut() = Some(inbox);
+    });
 }
 
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
@@ -296,7 +335,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
         // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
-        let refresh_model = !matches!(&event, UiEvent::MoveSelection { .. });
+        let refresh_model = !matches!(
+            &event,
+            UiEvent::MoveSelection { .. } | UiEvent::CopySelection
+        );
         let (action, snapshot) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
             let action = state.apply(event);
@@ -325,6 +367,11 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 ensure_selection_visible(&window, snapshot.selected_index);
             }
 
+            if let UiAction::CopySelection { id, content_hash } = action {
+                #[cfg(windows)]
+                request_copy_selection(id, content_hash);
+            }
+
             match action {
                 UiAction::Show => {
                     #[cfg(windows)]
@@ -348,12 +395,28 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     }
                 }
                 UiAction::ScrollSelection => {}
+                UiAction::CopySelection { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
                 UiAction::Quit => unreachable!("退出动作必须在窗口副作用前处理"),
             }
         });
     })
+}
+
+#[cfg(windows)]
+/// 将 UI reducer 产生的 ID/哈希命令投递给有界复制工作桥；不在 UI 线程读取正文或调用 Win32。
+fn request_copy_selection(id: u64, content_hash: [u8; 32]) {
+    UI_COPY_INBOX.with(|slot| {
+        let binding = slot.borrow();
+        let Some(inbox) = binding.as_ref() else {
+            eprintln!("仅复制请求桥尚未就绪");
+            return;
+        };
+        if let Err(error) = inbox.request_copy(ClipboardCopyRequest::new(id, content_hash)) {
+            eprintln!("仅复制请求无法进入工作桥：{error:?}");
+        }
+    });
 }
 
 /// 按内容哈希重定位选中项；去重或容量裁剪后仍优先保持原条目身份。
@@ -736,6 +799,38 @@ mod tests {
 
         assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
         assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// Ctrl+Enter 只产生当前选中项的 ID/哈希动作，不携带正文也不改变面板可见性。
+    #[test]
+    fn 仅复制动作使用选中项身份() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+
+        assert_eq!(
+            state.apply(UiEvent::CopySelection),
+            UiAction::CopySelection {
+                id: 1,
+                content_hash: [0; 32],
+            }
+        );
+        assert!(state.panel_visible);
+    }
+
+    /// 没有可见面板时的迟到仅复制事件必须被 reducer 丢弃。
+    #[test]
+    fn 隐藏面板忽略迟到仅复制事件() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+
+        assert_eq!(state.apply(UiEvent::CopySelection), UiAction::None);
     }
 
     /// 空历史不应因为上下键产生伪造的索引。

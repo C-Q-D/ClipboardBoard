@@ -6,7 +6,10 @@
 use super::hotkey::{HotkeyError, HotkeySpec};
 use super::tray::{handle_callback, TrayGuard, TRAY_CALLBACK_MESSAGE};
 use crate::app::post_ui_event;
-use crate::clipboard::{ClipboardCaptureInbox, ClipboardCaptureRequest, ClipboardIoWorker};
+use crate::clipboard::{
+    ClipboardCaptureInbox, ClipboardCaptureRequest, ClipboardIoWorker,
+    ClipboardWriteExpectationStore,
+};
 use crate::command::UiEvent;
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
@@ -44,6 +47,7 @@ pub(crate) fn run(
     hotkey: HotkeySpec,
     ready_sender: SyncSender<Result<u32, HotkeyError>>,
     clipboard_inbox: ClipboardCaptureInbox,
+    write_expectations: ClipboardWriteExpectationStore,
 ) -> Result<(), HotkeyError> {
     let thread_id = unsafe { GetCurrentThreadId() };
 
@@ -110,7 +114,10 @@ pub(crate) fn run(
         return Err(error);
     }
 
-    let clipboard_worker = match ClipboardIoWorker::start_with_inbox(clipboard_inbox) {
+    let clipboard_worker = match ClipboardIoWorker::start_with_inbox_and_expectations(
+        clipboard_inbox,
+        write_expectations,
+    ) {
         Ok(worker) => worker,
         Err(_) => {
             unsafe {

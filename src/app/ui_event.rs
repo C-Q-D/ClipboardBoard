@@ -267,11 +267,11 @@ impl UiState {
                 UiAction::ScrollSelection
             }
             UiEvent::CopySelection => {
-                // 用户主动改用 Ctrl+Enter 时清除旧的自动粘贴降级提示，避免提示描述过期动作。
+                // 内部复制事件会清除旧的自动粘贴降级提示，避免提示描述过期动作。
                 self.paste_notice = None;
                 #[cfg(windows)]
                 {
-                    // Ctrl+Enter 明确取消尚未完成的自动粘贴；即使旧 Paste 已被 worker
+                    // 内部复制事件明确取消尚未完成的自动粘贴；即使旧 Paste 已被 worker
                     // 取走，后续带旧令牌的结果也会因 pending=false 被拒绝。
                     self.paste_pending = false;
                     self.paste_executing = false;
@@ -546,24 +546,6 @@ impl UiState {
         }
     }
 
-    #[cfg(windows)]
-    /// 在 Enter 回调所在的 UI 线程同步捕获当前选择，防止事件排队期间误用新选择。
-    fn paste_selection_event(&self) -> Option<UiEvent> {
-        if !self.panel_visible || self.paste_pending || self.panel_target.is_none() {
-            return None;
-        }
-        let index = self.snapshot.selected_index?;
-        if index >= selection_limit(&self.snapshot) {
-            return None;
-        }
-        let item = self.snapshot.items.get(index)?;
-        Some(UiEvent::PasteSelection {
-            generation: self.panel_generation,
-            id: item.id,
-            content_hash: item.content_hash,
-        })
-    }
-
     /// 面板首次显示时把选择置于当前首批第一项；空列表保持无选中项。
     fn select_first_if_needed(&mut self) {
         let limit = selection_limit(&self.snapshot);
@@ -683,7 +665,7 @@ pub struct UiStateSnapshot {
     pub applied_on_thread: Option<ThreadId>,
 }
 
-/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc/失焦回调接入代次关闭协议。
+/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc、失焦和上下选择回调接入状态协议。
 pub fn bind_app_window(window: &AppWindow) {
     UI_WINDOW.with(|target| {
         *target.borrow_mut() = Some(window.as_weak());
@@ -714,12 +696,6 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
-    window.on_copy_selection_requested(|| {
-        if let Err(error) = post_ui_event(UiEvent::CopySelection) {
-            eprintln!("仅复制事件无法进入 UI 事件队列：{error}");
-        }
-    });
-
     window.on_search_text_changed(|text| {
         if let Err(error) = post_ui_event(UiEvent::SearchTextChanged(text.to_string())) {
             eprintln!("搜索文本事件无法进入 UI 事件队列：{error}");
@@ -731,15 +707,6 @@ pub fn bind_app_window(window: &AppWindow) {
             filter,
         ))) {
             eprintln!("搜索筛选事件无法进入 UI 事件队列：{error}");
-        }
-    });
-
-    window.on_paste_selection_requested(|| {
-        let Some(event) = current_paste_selection_event() else {
-            return;
-        };
-        if let Err(error) = post_ui_event(event) {
-            eprintln!("自动粘贴事件无法进入 UI 事件队列：{error}");
         }
     });
 }
@@ -950,12 +917,6 @@ fn request_paste_selection(
             request_token,
         ))
     })
-}
-
-#[cfg(windows)]
-/// 在 UI 回调同步捕获当前选中项、代次和哈希，避免事件排队期间选择变化导致误粘贴。
-fn current_paste_selection_event() -> Option<UiEvent> {
-    UI_STATE.with(|state| state.borrow().paste_selection_event())
 }
 
 #[cfg(windows)]
@@ -1530,7 +1491,7 @@ mod tests {
         assert!(!state.panel_visible);
     }
 
-    /// Ctrl+Enter 只产生当前选中项的 ID/哈希动作，不携带正文也不改变面板可见性。
+    /// 内部复制事件只产生当前选中项的 ID/哈希动作，不携带正文也不改变面板可见性。
     #[test]
     fn 仅复制动作使用选中项身份() {
         let mut state = UiState::default();
@@ -1876,7 +1837,7 @@ mod tests {
             generation: 1,
             request_token: 1,
         });
-        // Ctrl+Enter 取消 A，随后同一面板代次可以发起 B。
+        // 内部复制事件取消 A，随后同一面板代次可以发起 B。
         state.apply(UiEvent::CopySelection);
         assert!(matches!(
             state.apply(UiEvent::PasteSelection {

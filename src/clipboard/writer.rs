@@ -1,7 +1,7 @@
 //! 此模块负责把历史文本写回 Windows 剪贴板，并维护一次性的自身写回预期事务。
 //!
 //! 写入事务先登记内容哈希和格式，再写入 `CF_UNICODETEXT`，成功后绑定精确剪贴板序号。
-//! 捕获 worker 使用同一预期存储消费匹配事件，避免 Ctrl+Enter 自身写回再次进入历史。
+//! 捕获 worker 使用同一预期存储消费匹配事件，避免应用自身写回再次进入历史。
 
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
@@ -52,7 +52,7 @@ pub const WRITE_EXPECTATION_TTL: Duration = Duration::from_secs(5);
 /// 跨 UI、写回线程和 ClipboardIO worker 共享的有界一次性预期存储。
 #[derive(Clone)]
 pub struct ClipboardWriteExpectationStore {
-    /// 锁内按写入顺序保存多个预期，避免旧捕获被后续 Ctrl+Enter 覆盖。
+    /// 锁内按写入顺序保存多个预期，避免旧捕获被后续应用写回覆盖。
     state: Arc<Mutex<ExpectationState>>,
     /// 写入事务从登记到绑定 sequence 持有该锁，禁止捕获在线程竞态窗口消费未绑定预期。
     write_lock: Arc<Mutex<()>>,

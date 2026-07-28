@@ -4,6 +4,7 @@
 //! 不会持有或跨线程传递原生窗口句柄。
 
 use super::system_window;
+use crate::clipboard::ClipboardCaptureInbox;
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -72,21 +73,26 @@ pub struct HotkeyManager {
     thread_id: u32,
     /// 线程句柄只在停止时 join，确保退出前注销热键。
     join_handle: Option<JoinHandle<Result<(), HotkeyError>>>,
+    /// 从 ClipboardIO worker 接收最新捕获结果的公共桥，供后续历史/UI 原子消费。
+    clipboard_inbox: ClipboardCaptureInbox,
 }
 
 impl HotkeyManager {
     /// 创建消息线程并等待它完成 HWND、热键注册和消息队列初始化。
     pub fn start() -> Result<Self, HotkeyError> {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let clipboard_inbox = ClipboardCaptureInbox::new();
+        let worker_inbox = clipboard_inbox.clone();
         let join_handle = thread::Builder::new()
             .name("clipboard-board-hotkey".to_owned())
-            .spawn(move || system_window::run(DEFAULT_HOTKEY, ready_sender))
+            .spawn(move || system_window::run(DEFAULT_HOTKEY, ready_sender, worker_inbox))
             .map_err(|error| HotkeyError::ThreadStart(error.to_string()))?;
 
         match ready_receiver.recv() {
             Ok(Ok(thread_id)) => Ok(Self {
                 thread_id,
                 join_handle: Some(join_handle),
+                clipboard_inbox,
             }),
             Ok(Err(error)) => {
                 let _ = join_handle.join();
@@ -97,6 +103,11 @@ impl HotkeyManager {
                 Err(HotkeyError::StartupChannelClosed)
             }
         }
+    }
+
+    /// 返回捕获结果桥副本；调用方只能消费拥有型结果，不会取得消息线程或 HWND 所有权。
+    pub fn clipboard_inbox(&self) -> ClipboardCaptureInbox {
+        self.clipboard_inbox.clone()
     }
 
     /// 请求消息线程退出并等待其完成注销，避免留下僵尸热键。

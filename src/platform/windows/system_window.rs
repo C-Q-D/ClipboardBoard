@@ -1,26 +1,36 @@
-//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键、单实例唤起及托盘消息。
+//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键、剪贴板更新、单实例唤起及托盘消息。
 //!
-//! Win32 回调只负责把匹配的消息转成 UI 事件并排入 UI 事件队列；它不会直接访问
-//! Slint 对象、剪贴板或其他业务状态。
+//! Win32 回调只负责把匹配的消息转成 UI 事件，或捕获 sequence/来源快照后交给
+//! ClipboardIO worker；它不会直接读取剪贴板正文、访问 Slint 对象或操作存储状态。
 
 use super::hotkey::{HotkeyError, HotkeySpec};
 use super::tray::{handle_callback, TrayGuard, TRAY_CALLBACK_MESSAGE};
 use crate::app::post_ui_event;
+use crate::clipboard::{ClipboardCaptureInbox, ClipboardCaptureRequest, ClipboardIoWorker};
 use crate::command::UiEvent;
+use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::SyncSender;
 
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, ERROR_HOTKEY_ALREADY_REGISTERED, HINSTANCE,
 };
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
-    RegisterClassExW, TranslateMessage, HWND_MESSAGE, MSG, PM_NOREMOVE, WM_APP, WM_HOTKEY,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    RegisterClassExW, TranslateMessage, HWND_MESSAGE, MSG, PM_NOREMOVE, WM_APP, WM_CLIPBOARDUPDATE,
+    WM_HOTKEY, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
+
+thread_local! {
+    /// 消息线程独占的 ClipboardIO worker；避免把原生窗口句柄或 worker 所有权跨线程传递。
+    static CLIPBOARD_WORKER: RefCell<Option<ClipboardIoWorker>> = const { RefCell::new(None) };
+}
 
 /// Win32 注册的窗口类名称；message-only 窗口不出现在任务栏或屏幕上。
 pub(crate) const WINDOW_CLASS_NAME: windows_sys::core::PCWSTR =
@@ -33,6 +43,7 @@ pub(crate) const OPEN_PANEL_MESSAGE: u32 = WM_APP + 1;
 pub(crate) fn run(
     hotkey: HotkeySpec,
     ready_sender: SyncSender<Result<u32, HotkeyError>>,
+    clipboard_inbox: ClipboardCaptureInbox,
 ) -> Result<(), HotkeyError> {
     let thread_id = unsafe { GetCurrentThreadId() };
 
@@ -99,24 +110,58 @@ pub(crate) fn run(
         return Err(error);
     }
 
-    // 托盘图标必须绑定到同一个 message-only HWND，确保回调和热键共享消息线程。
-    let mut tray = match TrayGuard::create(window) {
-        Ok(tray) => tray,
-        Err(error) => {
+    let clipboard_worker = match ClipboardIoWorker::start_with_inbox(clipboard_inbox) {
+        Ok(worker) => worker,
+        Err(_) => {
             unsafe {
                 let _ = UnregisterHotKey(window, hotkey.id);
                 let _ = DestroyWindow(window);
             }
+            let error = HotkeyError::Windows {
+                operation: "ClipboardIoWorker::start",
+                code: 0,
+            };
             let _ = ready_sender.send(Err(error.clone()));
             return Err(error);
         }
     };
 
+    if let Err(error) = unsafe { register_clipboard_listener(window) } {
+        let _ = clipboard_worker.stop();
+        unsafe {
+            let _ = UnregisterHotKey(window, hotkey.id);
+            let _ = DestroyWindow(window);
+        }
+        let _ = ready_sender.send(Err(error.clone()));
+        return Err(error);
+    }
+
+    // 托盘图标必须绑定到同一个 message-only HWND，确保回调和热键共享消息线程。
+    let mut tray = match TrayGuard::create(window) {
+        Ok(tray) => tray,
+        Err(error) => {
+            unsafe {
+                let _ = RemoveClipboardFormatListener(window);
+                let _ = UnregisterHotKey(window, hotkey.id);
+                let _ = DestroyWindow(window);
+            }
+            let _ = clipboard_worker.stop();
+            let _ = ready_sender.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+
+    CLIPBOARD_WORKER.with(|slot| {
+        *slot.borrow_mut() = Some(clipboard_worker);
+    });
+
     if ready_sender.send(Ok(thread_id)).is_err() {
         let _ = tray.remove();
         // 若第一次 NIM_DELETE 失败，Drop 会在 DestroyWindow 前再尝试一次。
         drop(tray);
+        let _ = stop_clipboard_worker();
         unsafe {
+            let _ = RemoveClipboardFormatListener(window);
             let _ = UnregisterHotKey(window, hotkey.id);
             let _ = DestroyWindow(window);
         }
@@ -124,6 +169,9 @@ pub(crate) fn run(
     }
 
     let message_loop_result = message_loop();
+    // 先停止更新通知，再回收 worker，确保退出阶段不再接受新的剪贴板事件。
+    let listener_result = unsafe { unregister_clipboard_listener(window) };
+    let worker_result = stop_clipboard_worker();
     // NIM_DELETE 必须发生在 DestroyWindow 之前；即使删除失败也继续注销热键和销毁窗口。
     let tray_result = tray.remove();
     // Drop 的兜底重试仍发生在 DestroyWindow 前，避免把通知数据绑定到已销毁 HWND。
@@ -132,7 +180,49 @@ pub(crate) fn run(
         let _ = UnregisterHotKey(window, hotkey.id);
         let _ = DestroyWindow(window);
     }
-    message_loop_result.and(tray_result)
+    message_loop_result
+        .and(listener_result)
+        .and(worker_result)
+        .and(tray_result)
+}
+
+/// 注册剪贴板监听；失败时保留 Win32 错误码，启动流程不会留下半初始化窗口。
+unsafe fn register_clipboard_listener(
+    window: windows_sys::Win32::Foundation::HWND,
+) -> Result<(), HotkeyError> {
+    if AddClipboardFormatListener(window) == 0 {
+        return Err(HotkeyError::Windows {
+            operation: "AddClipboardFormatListener",
+            code: GetLastError(),
+        });
+    }
+    Ok(())
+}
+
+/// 注销剪贴板监听；即使消息泵已退出也必须显式释放监听关系。
+unsafe fn unregister_clipboard_listener(
+    window: windows_sys::Win32::Foundation::HWND,
+) -> Result<(), HotkeyError> {
+    if RemoveClipboardFormatListener(window) == 0 {
+        return Err(HotkeyError::Windows {
+            operation: "RemoveClipboardFormatListener",
+            code: GetLastError(),
+        });
+    }
+    Ok(())
+}
+
+/// 取出并停止消息线程绑定的 worker；返回值只用于清理阶段的有限错误传播。
+fn stop_clipboard_worker() -> Result<(), HotkeyError> {
+    let worker = CLIPBOARD_WORKER.with(|slot| slot.borrow_mut().take());
+    worker
+        .map(|worker| {
+            worker.stop().map_err(|_| HotkeyError::Windows {
+                operation: "ClipboardIoWorker::stop",
+                code: 0,
+            })
+        })
+        .unwrap_or(Ok(()))
 }
 
 /// 注册窗口类；类已存在时复用它，避免重复启动测试造成无意义失败。
@@ -175,6 +265,11 @@ unsafe extern "system" fn window_proc(
         return 0;
     }
 
+    if is_clipboard_update_message(message) {
+        enqueue_clipboard_capture();
+        return 0;
+    }
+
     DefWindowProcW(window, message, wparam, lparam)
 }
 
@@ -198,6 +293,27 @@ fn classify_registration_error(code: u32, shortcut: &'static str) -> HotkeyError
 /// 只接受默认热键的 WM_HOTKEY 消息，其他消息交给 DefWindowProcW。
 fn is_default_hotkey_message(message: u32, wparam: usize) -> bool {
     message == WM_HOTKEY && wparam == super::hotkey::DEFAULT_HOTKEY.id as usize
+}
+
+/// 只接受系统定义的剪贴板更新消息，其他 WM_APP 消息不得触发读取。
+fn is_clipboard_update_message(message: u32) -> bool {
+    message == WM_CLIPBOARDUPDATE
+}
+
+/// 在消息线程捕获 sequence/来源快照，并把正文读取交给容量为一的 worker 队列。
+fn enqueue_clipboard_capture() {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let source = super::source::capture_foreground_source();
+    let request = ClipboardCaptureRequest::new(sequence, source);
+
+    CLIPBOARD_WORKER.with(|slot| {
+        let worker_slot = slot.borrow();
+        let Some(worker) = worker_slot.as_ref() else {
+            return;
+        };
+        // worker 会把成功结果或 sequence 失配错误发布到公共 inbox；消息线程不等待响应。
+        let _ = worker.request_capture(request);
+    });
 }
 
 /// 只接受固定的单实例唤起消息，避免把任意 WM_APP 消息当作业务命令。
@@ -233,12 +349,12 @@ mod tests {
 
     use super::TRAY_CALLBACK_MESSAGE;
     use super::{
-        classify_registration_error, is_default_hotkey_message, is_open_panel_message,
-        is_tray_callback_message, OPEN_PANEL_MESSAGE,
+        classify_registration_error, is_clipboard_update_message, is_default_hotkey_message,
+        is_open_panel_message, is_tray_callback_message, OPEN_PANEL_MESSAGE,
     };
     use crate::platform::windows::hotkey::HotkeyError;
     use windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED;
-    use windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CLIPBOARDUPDATE, WM_HOTKEY};
 
     /// 只有固定 ID 的 WM_HOTKEY 才能进入 UI 事件转换分支。
     #[test]
@@ -260,6 +376,13 @@ mod tests {
     fn 只接受固定托盘消息() {
         assert!(is_tray_callback_message(TRAY_CALLBACK_MESSAGE));
         assert!(!is_tray_callback_message(TRAY_CALLBACK_MESSAGE + 1));
+    }
+
+    /// 只有 WM_CLIPBOARDUPDATE 才能进入捕获队列，避免普通消息误触发读取。
+    #[test]
+    fn 只接受剪贴板更新消息() {
+        assert!(is_clipboard_update_message(WM_CLIPBOARDUPDATE));
+        assert!(!is_clipboard_update_message(WM_CLIPBOARDUPDATE + 1));
     }
 
     /// Win32 的热键占用错误必须转换成带快捷键名称的明确错误。

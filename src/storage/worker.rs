@@ -35,23 +35,24 @@ ON CONFLICT(content_hash) DO UPDATE SET
     END
 "#;
 
-/// 首页摘要查询；通过多取一行判断是否存在下一页，不使用 OFFSET。
-const HISTORY_PAGE_SQL: &str = r#"
+/// 带关键词、来源、类型和收藏筛选的摘要查询；所有筛选参数都通过绑定值传入。
+///
+/// `?1` 和 `?2` 是已经转义并包裹 `%` 的 LIKE 模式；游标条件位于筛选条件之后，
+/// 因而下一页只会在同一筛选集合中继续，不会因为未匹配记录改变分页边界。
+const HISTORY_QUERY_SQL: &str = r#"
 SELECT id, item_type, preview_text, source_exe, source_app, copy_count,
        is_pinned, created_at, copied_at, last_used_at
 FROM clipboard_items
+WHERE (?1 IS NULL OR text_content LIKE ?1 ESCAPE '\'
+                    OR preview_text LIKE ?1 ESCAPE '\')
+  AND (?2 IS NULL OR source_app LIKE ?2 ESCAPE '\'
+                   OR source_exe LIKE ?2 ESCAPE '\')
+  AND (?3 IS NULL OR item_type = ?3)
+  AND (?4 IS NULL OR is_pinned = ?4)
+  AND (?5 IS NULL OR copied_at < ?5
+                  OR (copied_at = ?5 AND id < ?6))
 ORDER BY copied_at DESC, id DESC
-LIMIT ?1
-"#;
-
-/// 后续摘要查询；复合游标严格排除锚点及其之前的记录。
-const HISTORY_PAGE_AFTER_SQL: &str = r#"
-SELECT id, item_type, preview_text, source_exe, source_app, copy_count,
-       is_pinned, created_at, copied_at, last_used_at
-FROM clipboard_items
-WHERE copied_at < ?1 OR (copied_at = ?1 AND id < ?2)
-ORDER BY copied_at DESC, id DESC
-LIMIT ?3
+LIMIT ?7
 "#;
 
 /// 按主键读取完整 payload；可空正文和原始哈希字节保持数据库语义。
@@ -129,6 +130,23 @@ pub struct HistoryCursor {
     pub copied_at: i64,
     /// 游标锚点的数据库 ID。
     pub id: i64,
+}
+
+/// 历史摘要查询的拥有型筛选和分页请求；不携带 SQLite 连接或借用字符串。
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct HistoryQuery {
+    /// 在正文或预览中执行包含匹配；空字符串等同于未提供。
+    pub keyword: Option<String>,
+    /// 在来源应用名或可执行文件名中执行包含匹配；空字符串等同于未提供。
+    pub source: Option<String>,
+    /// 按 `item_type` 精确筛选；空字符串等同于未提供。
+    pub item_type: Option<String>,
+    /// 按收藏状态精确筛选；`None` 表示全部状态。
+    pub is_pinned: Option<bool>,
+    /// 同一筛选集合内的复合游标；`None` 表示从最新记录开始。
+    pub cursor: Option<HistoryCursor>,
+    /// 本次最多返回的摘要数量；仍受存储层固定上限约束。
+    pub limit: u32,
 }
 
 /// 历史列表摘要；不携带完整正文，适合放入有界 UI 模型。
@@ -210,10 +228,8 @@ enum StorageCommand {
     },
     /// 在 worker 的唯一连接上读取一页历史摘要。
     ListHistory {
-        /// 可选的复合游标锚点。
-        cursor: Option<HistoryCursor>,
-        /// 已通过页大小校验的请求数量。
-        limit: u32,
+        /// 已通过页大小校验的筛选和分页请求。
+        query: HistoryQuery,
         /// 返回摘要页和下一页游标。
         reply: SyncSender<Result<HistoryPage, StorageError>>,
     },
@@ -347,6 +363,19 @@ impl StorageExecutor {
         cursor: Option<HistoryCursor>,
         limit: u32,
     ) -> Result<HistoryPage, StorageError> {
+        self.query_history_summaries(HistoryQuery {
+            cursor,
+            limit,
+            ..HistoryQuery::default()
+        })
+    }
+
+    /// 使用关键词、来源、类型、收藏和复合游标查询摘要；正文始终留在 SQLite worker 内。
+    pub fn query_history_summaries(
+        &mut self,
+        query: HistoryQuery,
+    ) -> Result<HistoryPage, StorageError> {
+        let limit = query.limit;
         if limit > MAX_HISTORY_PAGE_SIZE {
             return Err(StorageError::InvalidPageSize {
                 requested: limit,
@@ -358,8 +387,7 @@ impl StorageExecutor {
         if self
             .command_sender
             .send(StorageCommand::ListHistory {
-                cursor,
-                limit,
+                query,
                 reply: reply_sender,
             })
             .is_err()
@@ -480,12 +508,8 @@ fn storage_thread(
             StorageCommand::UpsertText { input, reply } => {
                 let _ = reply.send(upsert_text(&mut state.connection, input));
             }
-            StorageCommand::ListHistory {
-                cursor,
-                limit,
-                reply,
-            } => {
-                let _ = reply.send(list_history_summaries(&state.connection, cursor, limit));
+            StorageCommand::ListHistory { query, reply } => {
+                let _ = reply.send(query_history_summaries(&state.connection, query));
             }
             StorageCommand::GetHistoryPayload { id, reply } => {
                 let _ = reply.send(get_history_payload(&state.connection, id));
@@ -597,12 +621,19 @@ WHERE content_hash = ?1
     Ok(result)
 }
 
-/// 从 worker 的唯一连接读取一页摘要，并用多取一行决定 next_cursor。
-fn list_history_summaries(
+/// 从 worker 的唯一连接执行筛选摘要查询，并用多取一行决定 next_cursor。
+fn query_history_summaries(
     connection: &Connection,
-    cursor: Option<HistoryCursor>,
-    limit: u32,
+    query: HistoryQuery,
 ) -> Result<HistoryPage, StorageError> {
+    let HistoryQuery {
+        keyword,
+        source,
+        item_type,
+        is_pinned,
+        cursor,
+        limit,
+    } = query;
     if limit == 0 {
         return Ok(HistoryPage {
             items: Vec::new(),
@@ -611,16 +642,26 @@ fn list_history_summaries(
     }
 
     let query_limit = i64::from(limit) + 1;
-    let mut summaries = if let Some(cursor) = cursor {
-        let mut statement = connection.prepare(HISTORY_PAGE_AFTER_SQL)?;
-        collect_history_summaries(
-            &mut statement,
-            params![cursor.copied_at, cursor.id, query_limit],
-        )?
-    } else {
-        let mut statement = connection.prepare(HISTORY_PAGE_SQL)?;
-        collect_history_summaries(&mut statement, params![query_limit])?
-    };
+    let keyword_pattern = contains_like_pattern(keyword.as_deref());
+    let source_pattern = contains_like_pattern(source.as_deref());
+    let item_type = non_empty_filter(item_type.as_deref());
+    let pinned_value = is_pinned.map(|value| if value { 1_i64 } else { 0_i64 });
+    let cursor_time = cursor.map(|value| value.copied_at);
+    let cursor_id = cursor.map(|value| value.id);
+
+    let mut statement = connection.prepare(HISTORY_QUERY_SQL)?;
+    let mut summaries = collect_history_summaries(
+        &mut statement,
+        params![
+            keyword_pattern.as_deref(),
+            source_pattern.as_deref(),
+            item_type,
+            pinned_value,
+            cursor_time,
+            cursor_id,
+            query_limit,
+        ],
+    )?;
 
     let has_more = summaries.len() > limit as usize;
     if has_more {
@@ -639,6 +680,30 @@ fn list_history_summaries(
         items: summaries,
         next_cursor,
     })
+}
+
+/// 将用户输入转换为包含匹配模式；空字符串不生成无意义的 `%%` 条件。
+fn contains_like_pattern(value: Option<&str>) -> Option<String> {
+    let value = non_empty_filter(value)?;
+    let escaped = escape_like_pattern(value);
+    Some(format!("%{escaped}%"))
+}
+
+/// 将空字符串统一当作未提供筛选，同时保留用户输入中的空白和符号。
+fn non_empty_filter(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// 按 SQLite ESCAPE 约定转义反斜杠、百分号和下划线，防止用户输入改变通配语义。
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// 将 SQLite 行映射为不携带正文的历史摘要，并集中维护列顺序。
@@ -708,7 +773,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{HistoryCursor, StorageExecutor, TextUpsertInput};
+    use super::{HistoryCursor, HistoryQuery, StorageExecutor, TextUpsertInput};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1138,6 +1203,234 @@ mod tests {
             .expect("读取尾部之后摘要失败");
         assert!(after_tail.items.is_empty());
         assert_eq!(after_tail.next_cursor, None);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证关键词、来源、类型和收藏筛选均在 SQLite worker 内生效，并按字面处理通配符。
+    #[test]
+    fn history_query_filters_and_escapes_literals() {
+        let directory = temporary_directory();
+        {
+            let mut executor = StorageExecutor::open_at(&directory).expect("启动筛选查询线程失败");
+            executor
+                .upsert_text(TextUpsertInput {
+                    content_hash: test_hash(51),
+                    text_content: r"中文 100%_ \done".to_owned(),
+                    preview_text: "中文预览".to_owned(),
+                    source_exe: Some("code_100.exe".to_owned()),
+                    source_app: Some("Visual Studio Code".to_owned()),
+                    copied_at: 100,
+                })
+                .expect("写入通配符测试记录失败");
+            executor
+                .upsert_text(TextUpsertInput {
+                    content_hash: test_hash(52),
+                    text_content: "GitHub issue".to_owned(),
+                    preview_text: "GitHub 预览".to_owned(),
+                    source_exe: Some("chrome.exe".to_owned()),
+                    source_app: Some("Google Chrome".to_owned()),
+                    copied_at: 200,
+                })
+                .expect("写入来源测试记录失败");
+            executor
+                .upsert_text(TextUpsertInput {
+                    content_hash: test_hash(53),
+                    text_content: "普通内容".to_owned(),
+                    preview_text: "普通预览".to_owned(),
+                    source_exe: Some("wechat.exe".to_owned()),
+                    source_app: Some("微信".to_owned()),
+                    copied_at: 150,
+                })
+                .expect("写入无匹配测试记录失败");
+        }
+
+        {
+            let connection =
+                Connection::open(directory.join("clipboard.db")).expect("打开筛选测试数据库失败");
+            connection
+                .execute(
+                    "UPDATE clipboard_items SET is_pinned = 1 WHERE content_hash = ?1",
+                    params![test_hash(51).as_slice()],
+                )
+                .expect("设置文本收藏状态失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', '截图', X'54', 1, 1, 250, 250)",
+                    [],
+                )
+                .expect("写入图片筛选记录失败");
+        }
+
+        let mut executor = StorageExecutor::open_at(&directory).expect("重新打开筛选查询线程失败");
+        let literal = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some(r"100%_ \done".to_owned()),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("字面通配符查询失败");
+        assert_eq!(
+            literal.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let source = executor
+            .query_history_summaries(HistoryQuery {
+                source: Some("chrome".to_owned()),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("来源查询失败");
+        assert_eq!(
+            source.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let image = executor
+            .query_history_summaries(HistoryQuery {
+                item_type: Some("image".to_owned()),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("类型查询失败");
+        assert_eq!(
+            image.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![4]
+        );
+
+        let pinned = executor
+            .query_history_summaries(HistoryQuery {
+                is_pinned: Some(true),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("收藏查询失败");
+        assert_eq!(
+            pinned.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![4, 1]
+        );
+
+        let combined = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("GitHub".to_owned()),
+                source: Some("chrome.exe".to_owned()),
+                item_type: Some("text".to_owned()),
+                is_pinned: Some(false),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("组合筛选查询失败");
+        assert_eq!(
+            combined
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let empty = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("不存在".to_owned()),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("无结果查询失败");
+        assert!(empty.items.is_empty());
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证筛选集合内部仍按同毫秒复合游标分页，并保持零页和超限页语义。
+    #[test]
+    fn history_query_cursor_pages_are_filter_stable() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动筛选分页线程失败");
+        for (hash_value, copied_at, text) in [
+            (61_u8, 100_i64, "分页-61"),
+            (62_u8, 100_i64, "分页-62"),
+            (63_u8, 100_i64, "分页-63"),
+            (64_u8, 100_i64, "其他-64"),
+            (65_u8, 99_i64, "分页-65"),
+        ] {
+            executor
+                .upsert_text(TextUpsertInput {
+                    content_hash: test_hash(hash_value),
+                    text_content: text.to_owned(),
+                    preview_text: text.to_owned(),
+                    source_exe: Some("pager.exe".to_owned()),
+                    source_app: Some("分页测试".to_owned()),
+                    copied_at,
+                })
+                .expect("写入筛选分页记录失败");
+        }
+
+        let first_page = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("分页".to_owned()),
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .expect("读取筛选首页失败");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            first_page.next_cursor,
+            Some(HistoryCursor {
+                copied_at: 100,
+                id: 2,
+            })
+        );
+
+        let second_page = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("分页".to_owned()),
+                cursor: first_page.next_cursor,
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .expect("读取筛选第二页失败");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1, 5]
+        );
+        assert_eq!(second_page.next_cursor, None);
+
+        let all_ids = [first_page, second_page]
+            .into_iter()
+            .flat_map(|page| page.items.into_iter().map(|item| item.id))
+            .collect::<Vec<_>>();
+        assert_eq!(all_ids, vec![3, 2, 1, 5]);
+
+        let zero_page = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("分页".to_owned()),
+                limit: 0,
+                ..HistoryQuery::default()
+            })
+            .expect("读取零页筛选结果失败");
+        assert!(zero_page.items.is_empty());
+        assert!(matches!(
+            executor.query_history_summaries(HistoryQuery {
+                limit: 101,
+                ..HistoryQuery::default()
+            }),
+            Err(crate::storage::StorageError::InvalidPageSize {
+                requested: 101,
+                max: 100
+            })
+        ));
         drop(executor);
         remove_directory(&directory);
     }

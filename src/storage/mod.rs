@@ -37,6 +37,13 @@ pub enum StorageError {
         /// 当前存储层允许的最大页大小。
         max: u32,
     },
+    /// 历史摘要中的内容哈希不是固定 32 字节，整页必须失败。
+    InvalidContentHashLength {
+        /// 损坏记录的数据库 ID。
+        id: i64,
+        /// SQLite 实际返回的哈希字节数。
+        length: usize,
+    },
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
 }
@@ -58,6 +65,9 @@ impl fmt::Display for StorageError {
             Self::ChannelClosed => write!(formatter, "存储线程命令通道已关闭"),
             Self::InvalidPageSize { requested, max } => {
                 write!(formatter, "历史查询页大小 {requested} 超过上限 {max}")
+            }
+            Self::InvalidContentHashLength { id, length } => {
+                write!(formatter, "历史摘要 {id} 的内容哈希长度无效：{length}")
             }
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }

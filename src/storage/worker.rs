@@ -40,8 +40,8 @@ ON CONFLICT(content_hash) DO UPDATE SET
 /// `?1` 和 `?2` 是已经转义并包裹 `%` 的 LIKE 模式；游标条件位于筛选条件之后，
 /// 因而下一页只会在同一筛选集合中继续，不会因为未匹配记录改变分页边界。
 const HISTORY_QUERY_SQL: &str = r#"
-SELECT id, item_type, preview_text, source_exe, source_app, copy_count,
-       is_pinned, created_at, copied_at, last_used_at
+SELECT id, item_type, preview_text, content_hash, source_exe, source_app,
+       copy_count, is_pinned, created_at, copied_at, last_used_at
 FROM clipboard_items
 WHERE (?1 IS NULL OR text_content LIKE ?1 ESCAPE '\'
                     OR preview_text LIKE ?1 ESCAPE '\')
@@ -158,6 +158,8 @@ pub struct HistorySummary {
     pub item_type: String,
     /// 列表卡片使用的预览文本。
     pub preview_text: String,
+    /// 严格校验后的 32 字节内容哈希，分页卡片无需读取正文即可建立复制身份。
+    pub content_hash: [u8; 32],
     /// 来源可执行文件名；数据库允许为空。
     pub source_exe: Option<String>,
     /// 来源应用显示名；数据库允许为空。
@@ -707,18 +709,27 @@ fn escape_like_pattern(value: &str) -> String {
 }
 
 /// 将 SQLite 行映射为不携带正文的历史摘要，并集中维护列顺序。
-fn history_summary_from_row(row: &Row<'_>) -> rusqlite::Result<HistorySummary> {
+fn history_summary_from_row(row: &Row<'_>) -> Result<HistorySummary, StorageError> {
+    let id = row.get(0)?;
+    let content_hash_blob: Vec<u8> = row.get(3)?;
+    let content_hash = content_hash_blob.as_slice().try_into().map_err(|_| {
+        StorageError::InvalidContentHashLength {
+            id,
+            length: content_hash_blob.len(),
+        }
+    })?;
     Ok(HistorySummary {
-        id: row.get(0)?,
+        id,
         item_type: row.get(1)?,
         preview_text: row.get(2)?,
-        source_exe: row.get(3)?,
-        source_app: row.get(4)?,
-        copy_count: row.get(5)?,
-        is_pinned: row.get::<_, i64>(6)? != 0,
-        created_at: row.get(7)?,
-        copied_at: row.get(8)?,
-        last_used_at: row.get(9)?,
+        content_hash,
+        source_exe: row.get(4)?,
+        source_app: row.get(5)?,
+        copy_count: row.get(6)?,
+        is_pinned: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+        copied_at: row.get(9)?,
+        last_used_at: row.get(10)?,
     })
 }
 
@@ -730,8 +741,13 @@ fn collect_history_summaries<P>(
 where
     P: rusqlite::Params,
 {
-    let rows = statement.query_map(parameters, history_summary_from_row)?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    let mut rows = statement.query(parameters)?;
+    let mut summaries = Vec::new();
+    while let Some(row) = rows.next()? {
+        // 任一行哈希损坏都会立即返回错误，禁止跳过坏记录后交付不完整页面。
+        summaries.push(history_summary_from_row(row)?);
+    }
+    Ok(summaries)
 }
 
 /// 按 ID 读取完整 payload；OptionalExtension 将不存在映射为稳定的 None。
@@ -1099,6 +1115,8 @@ mod tests {
         let first_page = executor
             .list_history_summaries(None, 2)
             .expect("读取首页摘要失败");
+        assert_eq!(first_page.items[0].content_hash, test_hash(43));
+        assert_eq!(first_page.items[1].content_hash, test_hash(42));
         assert_eq!(
             first_page
                 .items
@@ -1256,8 +1274,8 @@ mod tests {
                 .expect("设置文本收藏状态失败");
             connection
                 .execute(
-                    "INSERT INTO clipboard_items (item_type, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', '截图', X'54', 1, 1, 250, 250)",
-                    [],
+                    "INSERT INTO clipboard_items (item_type, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', '截图', ?1, 1, 1, 250, 250)",
+                    params![vec![0x54_u8; 32]],
                 )
                 .expect("写入图片筛选记录失败");
         }
@@ -1487,8 +1505,8 @@ mod tests {
             crate::storage::migration::migrate(&mut connection).expect("非文本数据库迁移失败");
             connection
                 .execute(
-                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', NULL, 'image preview', X'01', 1, 1, 10, 20)",
-                    [],
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', NULL, 'image preview', ?1, 1, 1, 10, 20)",
+                    params![vec![1_u8; 32]],
                 )
                 .expect("写入非文本测试记录失败");
         }
@@ -1507,12 +1525,45 @@ mod tests {
             .expect("非文本记录不存在");
         assert_eq!(payload.item_type, "image");
         assert_eq!(payload.text_content, None);
-        assert_eq!(payload.content_hash, vec![1]);
+        assert_eq!(payload.content_hash, vec![1; 32]);
         assert_eq!(payload.source_exe, None);
         assert_eq!(payload.source_app, None);
         assert_eq!(payload.last_used_at, None);
         drop(executor);
         remove_directory(&directory);
+    }
+
+    /// 摘要哈希为 31 或 33 字节时整页失败，不能截断、补零或跳过损坏行。
+    #[test]
+    fn history_summary_rejects_invalid_hash_lengths() {
+        for length in [31_usize, 33] {
+            let directory = temporary_directory();
+            let database_path = directory.join("clipboard.db");
+            {
+                let mut connection =
+                    Connection::open(&database_path).expect("创建损坏哈希数据库失败");
+                crate::storage::migration::migrate(&mut connection)
+                    .expect("损坏哈希数据库迁移失败");
+                connection
+                    .execute(
+                        "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('text', '正文', '预览', ?1, 1, 0, 1, 1)",
+                        params![vec![7_u8; length]],
+                    )
+                    .expect("写入损坏哈希记录失败");
+            }
+
+            let mut executor =
+                StorageExecutor::open_at(&directory).expect("打开损坏哈希查询线程失败");
+            assert!(matches!(
+                executor.list_history_summaries(None, 10),
+                Err(crate::storage::StorageError::InvalidContentHashLength {
+                    id: 1,
+                    length: actual,
+                }) if actual == length
+            ));
+            drop(executor);
+            remove_directory(&directory);
+        }
     }
 
     /// 验证未来 schema 版本会在 ready 前传播为启动错误，不会降级数据库。

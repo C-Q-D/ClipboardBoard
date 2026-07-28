@@ -36,6 +36,8 @@ pub enum StartupRestoreError {
     InvalidCopyCount { id: i64, copy_count: i64 },
     /// payload 哈希不是当前文本域要求的 32 字节 BLAKE3 值。
     InvalidHashLength { id: i64, length: usize },
+    /// 摘要哈希与按 ID 读取的 payload 哈希不同，不能安全建立复制身份。
+    MismatchedHash { id: i64 },
 }
 
 impl fmt::Display for StartupRestoreError {
@@ -61,6 +63,9 @@ impl fmt::Display for StartupRestoreError {
             }
             Self::InvalidHashLength { id, length } => {
                 write!(formatter, "历史记录 {id} 哈希长度无效：{length}")
+            }
+            Self::MismatchedHash { id } => {
+                write!(formatter, "历史记录 {id} 的摘要哈希与 payload 不一致")
             }
         }
     }
@@ -142,6 +147,9 @@ fn build_ui_item(
             length: payload.content_hash.len(),
         }
     })?;
+    if content_hash != summary.content_hash {
+        return Err(StartupRestoreError::MismatchedHash { id: summary.id });
+    }
 
     let source = summary
         .source_app
@@ -161,7 +169,7 @@ fn build_ui_item(
         preview: summary.preview_text.clone(),
         source,
         relative_time: relative_time(summary.copied_at, now),
-        content_hash,
+        content_hash: summary.content_hash,
         copy_count,
         is_pinned: summary.is_pinned,
     })
@@ -284,6 +292,7 @@ mod tests {
             id: 1,
             item_type: "text".to_owned(),
             preview_text: "文本".to_owned(),
+            content_hash: [1; 32],
             source_exe: None,
             source_app: None,
             copy_count: 1,
@@ -310,6 +319,43 @@ mod tests {
         assert!(matches!(
             result,
             Err(StartupRestoreError::InvalidHashLength { length: 3, .. })
+        ));
+    }
+
+    /// 摘要与 payload 各自长度正确但内容不同，也必须阻止启动恢复。
+    #[test]
+    fn 摘要与_payload_哈希不一致阻止恢复() {
+        let summary = crate::storage::HistorySummary {
+            id: 1,
+            item_type: "text".to_owned(),
+            preview_text: "文本".to_owned(),
+            content_hash: [2; 32],
+            source_exe: None,
+            source_app: None,
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 1,
+            last_used_at: None,
+        };
+        let payload = HistoryPayload {
+            id: 1,
+            item_type: "text".to_owned(),
+            text_content: Some("正文".to_owned()),
+            preview_text: "文本".to_owned(),
+            content_hash: vec![1; 32],
+            source_exe: None,
+            source_app: None,
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 1,
+            last_used_at: None,
+        };
+
+        assert!(matches!(
+            super::build_ui_item(&summary, &payload, 1_000),
+            Err(StartupRestoreError::MismatchedHash { id: 1 })
         ));
     }
 }

@@ -8,7 +8,7 @@ use crate::clipboard::ClipboardCaptureResult;
 
 /// 单条剪贴板历史的最小 UI 展示数据。
 ///
-/// 当前原子只保留能够证明跨线程传输安全的字段；完整剪贴板内容会在后续历史原子中扩展。
+/// 当前原子只保留跨线程传输安全的摘要和轻量历史元数据；完整剪贴板内容仍不进入 UI DTO。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiClipboardItem {
     /// 历史记录的稳定标识，后续用于选择、删除和粘贴。
@@ -19,6 +19,12 @@ pub struct UiClipboardItem {
     pub source: String,
     /// 面向当前列表的相对时间文案；本原子只产生“刚刚”，历史刷新由后续原子负责。
     pub relative_time: String,
+    /// 规范化文本哈希；历史协调器据此合并重复内容，不需要再次读取正文。
+    pub content_hash: [u8; 32],
+    /// 同一规范内容被复制的次数；由历史协调器做饱和递增。
+    pub copy_count: u64,
+    /// 用户是否收藏该记录；合并重复内容时必须保留旧值。
+    pub is_pinned: bool,
 }
 
 impl UiClipboardItem {
@@ -26,6 +32,8 @@ impl UiClipboardItem {
     #[cfg(windows)]
     pub fn from_capture(capture: &ClipboardCaptureResult) -> Self {
         let summary = capture.payload.summary();
+        let content_hash = summary.content_hash;
+        let preview = summary.preview;
         let source = capture
             .source
             .as_ref()
@@ -34,9 +42,12 @@ impl UiClipboardItem {
 
         Self {
             id: capture.sequence as u64,
-            preview: summary.preview,
+            preview,
             source,
             relative_time: "刚刚".to_owned(),
+            content_hash,
+            copy_count: 1,
+            is_pinned: false,
         }
     }
 }
@@ -96,6 +107,9 @@ mod tests {
         assert_eq!(item.preview, "第一行\n第二行");
         assert_eq!(item.source, "Code");
         assert_eq!(item.relative_time, "刚刚");
+        assert_eq!(item.content_hash, capture.payload.summary().content_hash);
+        assert_eq!(item.copy_count, 1);
+        assert!(!item.is_pinned);
     }
 
     /// 来源查询失败时仍必须生成可显示的卡片，避免一次权限失败终止 UI 流程。

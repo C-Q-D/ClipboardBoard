@@ -9,6 +9,7 @@ pub mod app;
 pub mod command;
 pub mod diagnostics;
 pub mod domain;
+pub mod history;
 
 // ClipboardIO 依赖 Windows 剪贴板和全局内存 API，只在 Windows 目标暴露，避免跨平台构建
 // 引入无法实现的原生句柄类型。

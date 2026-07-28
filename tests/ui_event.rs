@@ -28,6 +28,9 @@ fn 后台事件在事件循环线程更新状态() {
                 preview: "来自后台线程的结果".to_owned(),
                 source: "测试来源".to_owned(),
                 relative_time: "刚刚".to_owned(),
+                content_hash: [7; 32],
+                copy_count: 1,
+                is_pinned: false,
             }],
             selected_index: Some(0),
         });

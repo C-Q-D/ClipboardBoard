@@ -4,7 +4,8 @@
 //! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
 //! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
-use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
+use crate::command::{UiEvent, UiSnapshot};
+use crate::history::MemoryHistory;
 use crate::AppWindow;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
@@ -19,9 +20,6 @@ use crate::platform::windows::window::{
 };
 #[cfg(windows)]
 use slint::PhysicalPosition;
-
-/// UI 内存列表的当前上限；只保存摘要卡片，不把完整正文复制进 Slint 模型。
-const UI_HISTORY_CAPACITY: usize = 50;
 
 /// reducer 应用事件后交给 UI 窗口的最小副作用集合。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +38,8 @@ enum UiAction {
 #[derive(Default)]
 struct UiState {
     snapshot: UiSnapshot,
+    /// 历史顺序和重复合并由独立协调器维护，UI 状态只同步其摘要快照。
+    history: MemoryHistory,
     panel_visible: bool,
     /// 每次成功处理打开请求都会递增，用来隔离旧的 Esc/失焦事件。
     panel_generation: u64,
@@ -111,11 +111,25 @@ impl UiState {
                 }
             }
             UiEvent::ReplaceSnapshot(snapshot) => {
+                let selected_hash = snapshot
+                    .selected_index
+                    .and_then(|index| snapshot.items.get(index))
+                    .map(|item| item.content_hash);
+                self.history.replace(snapshot.items.clone());
                 self.snapshot = snapshot;
+                self.snapshot.items = self.history.items().to_vec();
+                restore_selected_index(&mut self.snapshot, selected_hash);
                 UiAction::None
             }
             UiEvent::ClipboardCaptured(item) => {
-                prepend_clipboard_item(&mut self.snapshot, item);
+                let selected_hash = self
+                    .snapshot
+                    .selected_index
+                    .and_then(|index| self.snapshot.items.get(index))
+                    .map(|item| item.content_hash);
+                self.history.record(item);
+                self.snapshot.items = self.history.items().to_vec();
+                restore_selected_index(&mut self.snapshot, selected_hash);
                 UiAction::None
             }
         }
@@ -252,14 +266,19 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     })
 }
 
-/// 将新捕获记录插入列表顶部，并限制 UI 常驻卡片数量以控制内存和布局成本。
-fn prepend_clipboard_item(snapshot: &mut UiSnapshot, item: UiClipboardItem) {
-    snapshot.items.insert(0, item);
-    snapshot.items.truncate(UI_HISTORY_CAPACITY);
-    if let Some(selected_index) = snapshot.selected_index {
-        let maximum_index = snapshot.items.len().saturating_sub(1);
-        snapshot.selected_index = Some(selected_index.saturating_add(1).min(maximum_index));
-    }
+/// 按内容哈希重定位选中项；去重或容量裁剪后仍优先保持原条目身份。
+fn restore_selected_index(snapshot: &mut UiSnapshot, selected_hash: Option<[u8; 32]>) {
+    snapshot.selected_index = selected_hash
+        .and_then(|hash| {
+            snapshot
+                .items
+                .iter()
+                .position(|item| item.content_hash == hash)
+        })
+        .or_else(|| {
+            selected_hash
+                .and_then(|_| (!snapshot.items.is_empty()).then_some(snapshot.items.len() - 1))
+        });
 }
 
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
@@ -414,6 +433,9 @@ mod tests {
                 preview: "旧内容".to_owned(),
                 source: "旧来源".to_owned(),
                 relative_time: "1分钟前".to_owned(),
+                content_hash: [1; 32],
+                copy_count: 1,
+                is_pinned: false,
             }],
             selected_index: Some(0),
         }));
@@ -424,6 +446,9 @@ mod tests {
                 preview: "新摘要".to_owned(),
                 source: "新来源".to_owned(),
                 relative_time: "刚刚".to_owned(),
+                content_hash: [2; 32],
+                copy_count: 1,
+                is_pinned: false,
             })),
             UiAction::None
         );
@@ -431,5 +456,79 @@ mod tests {
         assert_eq!(state.snapshot.items[0].source, "新来源");
         assert_eq!(state.snapshot.items[0].relative_time, "刚刚");
         assert_eq!(state.snapshot.selected_index, Some(1));
+    }
+
+    /// 相同哈希再次捕获时，UI 只显示一张卡片并保留收藏和原始摘要。
+    #[test]
+    fn 捕获重复文本合并并保留收藏() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
+            id: 1,
+            preview: "收藏正文".to_owned(),
+            source: "旧来源".to_owned(),
+            relative_time: "之前".to_owned(),
+            content_hash: [9; 32],
+            copy_count: 1,
+            is_pinned: true,
+        }));
+        state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
+            id: 2,
+            preview: "新复制摘要".to_owned(),
+            source: "新来源".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [9; 32],
+            copy_count: 1,
+            is_pinned: false,
+        }));
+
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(state.snapshot.items[0].id, 1);
+        assert_eq!(state.snapshot.items[0].preview, "收藏正文");
+        assert_eq!(state.snapshot.items[0].source, "旧来源");
+        assert_eq!(state.snapshot.items[0].relative_time, "刚刚");
+        assert_eq!(state.snapshot.items[0].copy_count, 2);
+        assert!(state.snapshot.items[0].is_pinned);
+    }
+
+    /// 恢复快照去重后，原选中条目按哈希重定位而不是仅按旧索引截断。
+    #[test]
+    fn 恢复快照去重后保持选中条目身份() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(crate::command::UiSnapshot {
+            items: vec![
+                UiClipboardItem {
+                    id: 1,
+                    preview: "第一条".to_owned(),
+                    source: "来源".to_owned(),
+                    relative_time: "一".to_owned(),
+                    content_hash: [1; 32],
+                    copy_count: 1,
+                    is_pinned: false,
+                },
+                UiClipboardItem {
+                    id: 2,
+                    preview: "重复条目".to_owned(),
+                    source: "来源".to_owned(),
+                    relative_time: "二".to_owned(),
+                    content_hash: [1; 32],
+                    copy_count: 1,
+                    is_pinned: false,
+                },
+                UiClipboardItem {
+                    id: 3,
+                    preview: "第三条".to_owned(),
+                    source: "来源".to_owned(),
+                    relative_time: "三".to_owned(),
+                    content_hash: [3; 32],
+                    copy_count: 1,
+                    is_pinned: false,
+                },
+            ],
+            selected_index: Some(1),
+        }));
+
+        assert_eq!(state.snapshot.items.len(), 2);
+        assert_eq!(state.snapshot.items[0].content_hash, [1; 32]);
+        assert_eq!(state.snapshot.selected_index, Some(0));
     }
 }

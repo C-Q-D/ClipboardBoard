@@ -1,0 +1,57 @@
+// 此文件定义 ClipboardBoard 的黑色浮动看板骨架。
+// 当前版本只验证视觉语法和窗口尺寸，不包含热键、列表或任何真实剪贴板数据。
+
+export component AppWindow inherits Window {
+    title: "ClipboardBoard";
+    width: 560px;
+    height: 640px;
+    background: #080808;
+
+    Rectangle {
+        background: #080808;
+
+        VerticalLayout {
+            x: 24px;
+            y: 24px;
+            width: parent.width - 48px;
+            height: parent.height - 48px;
+            spacing: 12px;
+
+            Text {
+                text: "CLIPBOARD";
+                color: #f5f5f5;
+                font-size: 12px;
+                font-weight: 700;
+                letter-spacing: 2px;
+            }
+
+            Rectangle {
+                height: 1px;
+                background: #2a2a2a;
+            }
+
+            Text {
+                text: "按 Alt + V 呼出你的剪贴板历史";
+                color: #f5f5f5;
+                font-size: 22px;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: "正在建立轻量、本地优先的工作台。";
+                color: #8c8c8c;
+                font-size: 14px;
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+            }
+
+            Text {
+                text: "Esc 关闭";
+                color: #8c8c8c;
+                font-size: 12px;
+            }
+        }
+    }
+}

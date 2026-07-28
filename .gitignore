@@ -1,0 +1,13 @@
+# Rust 编译产物由 Cargo 自动生成，不应进入版本控制。
+/target/
+
+# Windows 和编辑器生成的本地文件不属于项目源码。
+/.idea/
+/.vscode/
+*.user
+*.suo
+
+# 运行时日志和本地数据在后续原子中生成，不应提交。
+/logs/
+/data/
+/images/

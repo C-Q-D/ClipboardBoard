@@ -1,0 +1,14 @@
+# ClipboardBoard 的最小 Rust + Slint 桌面应用配置。
+[package]
+name = "clipboard-board"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "轻量 Windows 剪贴板工作台"
+license = "MIT"
+
+[dependencies]
+slint = "1.16.0"
+
+[build-dependencies]
+slint-build = "1.16.0"

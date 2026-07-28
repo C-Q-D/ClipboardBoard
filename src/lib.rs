@@ -1,0 +1,26 @@
+//! 此库负责暴露 ClipboardBoard 的最小界面创建入口。
+//!
+//! 当前原子只提供可运行的黑色看板骨架；热键、剪贴板、存储和后台线程由后续原子逐步加入。
+
+slint::include_modules!();
+
+/// 创建主窗口实例。
+///
+/// 调用方负责启动 Slint 事件循环；创建失败时返回平台初始化错误，不在此处吞掉错误。
+pub fn create_app_window() -> Result<AppWindow, slint::PlatformError> {
+    AppWindow::new()
+}
+
+#[cfg(test)]
+mod tests {
+    //! 此测试模块验证当前原子对外暴露的最小应用接口仍可被编译使用。
+
+    use super::create_app_window;
+
+    /// 验证窗口构造函数的返回类型仍保持为可处理的平台错误结果。
+    #[test]
+    fn 主窗口构造函数保持可调用() {
+        let constructor = create_app_window;
+        let _ = constructor;
+    }
+}

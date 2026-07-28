@@ -1,8 +1,8 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
 //! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板
-//! 结果泵和托盘消息线程。WCB-INT-01 已移除键盘复制和粘贴入口，底层自动输入基础设施
-//! 由下一原子独立删除；鼠标显式复制、图片历史和完整设置能力仍由后续原子接入。
+//! 结果泵和托盘消息线程。应用只负责显式写回系统剪贴板，不注入粘贴按键；鼠标复制
+//! 按钮、图片历史和完整设置能力仍由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
@@ -18,8 +18,7 @@ use clipboard_board::command::UiEvent;
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::{
-    paste_failure_reason_for_copy_error, process_capture, process_copy_request,
-    process_paste_request, unix_millis_now, CaptureProcessOutcome,
+    process_capture, process_copy_request, unix_millis_now, CaptureProcessOutcome,
 };
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
@@ -98,27 +97,6 @@ fn start_clipboard_pump(
                         {
                             // 仅复制失败只输出稳定错误，不把正文写入日志或 UI。
                             eprintln!("仅复制处理失败：{error}");
-                        }
-                    }
-                    ClipboardWorkItem::Paste(request) => {
-                        let generation = request.generation;
-                        let request_token = request.request_token;
-                        match process_paste_request(&mut storage, request, &write_expectations) {
-                            Ok(_) => {
-                                let _ = post_ui_event(UiEvent::PastePrepared {
-                                    generation,
-                                    request_token,
-                                });
-                            }
-                            Err(error) => {
-                                // 写回桥失败按保守类别提示重试，不把可能的 CloseFailed 误报为已复制。
-                                eprintln!("自动粘贴写回失败：{error}");
-                                let _ = post_ui_event(UiEvent::PasteFailed {
-                                    generation,
-                                    request_token,
-                                    reason: paste_failure_reason_for_copy_error(&error),
-                                });
-                            }
                         }
                     }
                     ClipboardWorkItem::Capture(event) => {

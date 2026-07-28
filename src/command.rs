@@ -13,7 +13,7 @@ use crate::storage::TextUpsertResult;
 /// 当前原子只保留跨线程传输安全的摘要和轻量历史元数据；完整剪贴板内容仍不进入 UI DTO。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiClipboardItem {
-    /// 历史记录的稳定标识，后续用于选择、删除和粘贴。
+    /// 历史记录的稳定标识，后续用于选择、删除和显式复制。
     pub id: u64,
     /// 展示给用户的纯文本预览。
     pub preview: String,
@@ -163,31 +163,6 @@ impl SearchStatus {
     }
 }
 
-/// 自动粘贴失败的安全分类；类别只表达流程阶段，不携带剪贴板正文或窗口隐私。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PasteFailureReason {
-    /// 后台尚未可靠写入系统剪贴板，不能向用户声称内容已复制。
-    ClipboardNotReady,
-    /// 剪贴板已经写回，但原目标失效、权限不允许或身份发生变化。
-    TargetChanged,
-    /// 剪贴板已经写回，但无法恢复原目标的前台焦点。
-    FocusRestoreFailed,
-    /// 剪贴板已经写回，但 Windows 未接受完整的 Ctrl+V 输入序列。
-    InputInjectionFailed,
-}
-
-impl PasteFailureReason {
-    /// 返回固定、无正文的用户提示；文案集中在领域枚举中避免各路径自由拼接错误。
-    pub const fn notice_text(self) -> &'static str {
-        match self {
-            Self::ClipboardNotReady => "无法准备剪贴板内容，请重试",
-            Self::TargetChanged | Self::FocusRestoreFailed | Self::InputInjectionFailed => {
-                "内容已复制，请按 Ctrl + V"
-            }
-        }
-    }
-}
-
 /// 后台线程可以提交给 UI 线程的事件集合。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
@@ -215,22 +190,6 @@ pub enum UiEvent {
     MoveSelection { delta: i32 },
     /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。
     CopySelection,
-    /// 请求 UI reducer 为指定打开代次的选中项准备自动粘贴；正文仍不进入事件。
-    PasteSelection {
-        generation: u64,
-        id: u64,
-        content_hash: [u8; 32],
-    },
-    /// 后台已经完成文本写回，UI 线程必须按当前打开代次和请求令牌再次复核目标后才能注入输入。
-    PastePrepared { generation: u64, request_token: u64 },
-    /// UI 线程已完成 Ctrl+V；只有匹配当前 pending 令牌时才同步标记隐藏面板。
-    PasteSucceeded { generation: u64, request_token: u64 },
-    /// 后台写回或目标复核失败；类别用于选择固定降级提示，不能携带正文或系统错误详情。
-    PasteFailed {
-        generation: u64,
-        request_token: u64,
-        reason: PasteFailureReason,
-    },
 }
 
 #[cfg(all(test, windows))]

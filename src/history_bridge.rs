@@ -11,10 +11,10 @@ use std::{
 
 use crate::{
     clipboard::{
-        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardPasteRequest, ClipboardWriteError,
+        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWriteError,
         ClipboardWriteExpectationStore, ClipboardWriter,
     },
-    command::{PasteFailureReason, UiClipboardItem, UiEvent},
+    command::{UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
     storage::{HistoryPayload, StorageError, StorageExecutor, TextUpsertInput, TextUpsertResult},
 };
@@ -144,30 +144,6 @@ pub fn process_copy_request(
     })
 }
 
-/// 按 UI 提供的 ID 读取完整文本，复用仅复制的完整性校验后写入系统剪贴板。
-///
-/// 自动粘贴与仅复制必须共享同一正文哈希、内部 NUL 和自身事件抑制契约；本函数只
-/// 负责把带面板代次的请求转换为相同的写回操作，目标窗口复核留在 UI 线程完成。
-pub fn process_paste_request(
-    storage: &mut StorageExecutor,
-    request: ClipboardPasteRequest,
-    expectations: &ClipboardWriteExpectationStore,
-) -> Result<u32, CopyProcessError> {
-    process_copy_request(
-        storage,
-        ClipboardCopyRequest::new(request.id, request.content_hash),
-        expectations,
-    )
-}
-
-/// 将自动粘贴桥接错误保守归类为“剪贴板未就绪”。
-///
-/// `CloseFailed` 可能发生在 `SetClipboardData` 已转移所有权之后，但调用方无法再确认
-/// 用户是否能可靠使用该内容；因此 ATOM-22 不冒险显示“内容已复制”，统一要求重试。
-pub fn paste_failure_reason_for_copy_error(_error: &CopyProcessError) -> PasteFailureReason {
-    PasteFailureReason::ClipboardNotReady
-}
-
 /// 校验按 ID 读取的 payload 并调用注入的 writer；抽出纯接缝便于不改写真实剪贴板的测试。
 fn process_copy_payload<F>(
     payload: &HistoryPayload,
@@ -248,16 +224,12 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        paste_failure_reason_for_copy_error, process_capture, process_capture_with_upsert,
-        process_copy_payload, process_paste_request, CaptureProcessError, CaptureProcessOutcome,
-        CopyProcessError,
+        process_capture, process_capture_with_upsert, process_copy_payload, CaptureProcessError,
+        CaptureProcessOutcome, CopyProcessError,
     };
     use crate::{
-        clipboard::{
-            ClipboardCaptureResult, ClipboardPasteRequest, ClipboardWriteError,
-            ClipboardWriteExpectationStore,
-        },
-        command::{PasteFailureReason, UiEvent},
+        clipboard::{ClipboardCaptureResult, ClipboardWriteError},
+        command::UiEvent,
         domain::ClipboardPayload,
         platform::windows::ProcessSource,
         storage::{HistoryPayload, StorageExecutor, TextUpsertResult},
@@ -528,42 +500,5 @@ mod tests {
             Err(CopyProcessError::InvalidPayload)
         ));
         assert_eq!(writes, 0);
-    }
-
-    /// 自动粘贴桥必须按 ID 读取真实 payload，并在触碰系统剪贴板前拒绝旧哈希请求。
-    #[test]
-    fn 自动粘贴桥拒绝旧哈希而不触碰写入器() {
-        let directory = test_directory("paste-stale-hash");
-        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
-        let result = storage
-            .upsert_text(crate::storage::TextUpsertInput {
-                content_hash: ClipboardPayload::from_text("自动粘贴正文")
-                    .summary()
-                    .content_hash,
-                text_content: "自动粘贴正文".to_owned(),
-                preview_text: "自动粘贴正文".to_owned(),
-                source_exe: None,
-                source_app: None,
-                copied_at: 1,
-            })
-            .expect("预置文本记录失败");
-        let request = ClipboardPasteRequest::new(result.id as u64, [9; 32], 3, 4);
-        let error = process_paste_request(
-            &mut storage,
-            request,
-            &ClipboardWriteExpectationStore::new(),
-        )
-        .expect_err("旧哈希不应触碰系统剪贴板");
-        assert_eq!(error.to_string(), "仅复制目标哈希已变化");
-    }
-
-    /// 包括 CloseClipboard 失败在内的桥接错误都必须保守显示重试提示，不能误报已复制。
-    #[test]
-    fn 自动粘贴桥错误统一保守降级() {
-        let error = CopyProcessError::Write(ClipboardWriteError::CloseFailed);
-        assert_eq!(
-            paste_failure_reason_for_copy_error(&error),
-            PasteFailureReason::ClipboardNotReady
-        );
     }
 }

@@ -10,7 +10,7 @@ pub mod writer;
 
 pub use io_worker::{
     ClipboardCaptureInbox, ClipboardCaptureRequest, ClipboardCaptureResult, ClipboardCopyRequest,
-    ClipboardIoWorker, ClipboardPasteRequest, ClipboardWorkItem, ClipboardWorkerError,
+    ClipboardIoWorker, ClipboardWorkItem, ClipboardWorkerError,
 };
 pub use reader::{
     read_text_with_backend, ClipboardBackend, ClipboardReadError, RetryPolicy, MAX_TEXT_BYTES,

@@ -28,8 +28,10 @@ pub struct UiSnapshot {
 pub enum UiEvent {
     /// 请求 UI 线程打开临时看板；事件来源可以是全局热键或后续托盘入口。
     OpenPanel,
+    /// 请求 UI 线程关闭指定一次打开操作对应的临时看板。
+    ///
+    /// 事件携带打开代次，避免旧的 Esc 或失焦事件误关闭后来重新打开的面板。
+    HidePanel { generation: u64 },
     /// 用一个完整且拥有所有权的快照替换 UI 历史状态。
     ReplaceSnapshot(UiSnapshot),
-    /// 更新临时看板是否可见；窗口生命周期由后续原子接管。
-    SetPanelVisible(bool),
 }

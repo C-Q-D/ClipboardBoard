@@ -37,6 +37,8 @@ fn 核心源码包含中文文件级职责说明() {
         "src/platform/windows/hotkey.rs",
         "src/platform/windows/system_window.rs",
         "src/platform/windows/single_instance.rs",
+        "src/platform/windows/window/mod.rs",
+        "src/platform/windows/window/lifecycle.rs",
     ] {
         assert_has_chinese_file_comment(relative_path);
     }

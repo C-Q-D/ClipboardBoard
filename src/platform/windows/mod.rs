@@ -3,6 +3,7 @@
 mod hotkey;
 mod single_instance;
 mod system_window;
+pub(crate) mod window;
 
 pub use hotkey::{HotkeyError, HotkeyManager};
 pub use single_instance::{

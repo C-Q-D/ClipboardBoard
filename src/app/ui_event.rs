@@ -1,34 +1,111 @@
 //! 此模块提供唯一的 UI 事件投递入口，并将可变 UI 状态限制在事件循环线程。
 //!
 //! `thread_local!` 是这里的刻意选择：它让后台线程拿不到 UI 状态的可变引用，
-//! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。后续接入 AppWindow
-//! 时，Slint 属性和模型更新也必须继续放在这个闭包内。
+//! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
+//! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
 use crate::command::{UiEvent, UiSnapshot};
 use crate::AppWindow;
 use slint::ComponentHandle;
 use std::cell::RefCell;
 use std::thread::{self, ThreadId};
+#[cfg(windows)]
+use std::time::Duration;
+
+#[cfg(windows)]
+use crate::platform::windows::window::{
+    capture_target, center_position, cursor_work_area, move_panel, panel_hwnd, panel_size,
+    PanelTarget,
+};
+#[cfg(windows)]
+use slint::PhysicalPosition;
+
+/// reducer 应用事件后交给 UI 窗口的最小副作用集合。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiAction {
+    /// 显示面板，并在显示前完成目标快照与工作区定位。
+    Show,
+    /// 隐藏面板；实际调用必须仍在 UI 线程执行。
+    Hide,
+    /// 该事件只改变数据或已经过期，不触发窗口副作用。
+    None,
+}
 
 /// UI 线程独占的内部状态，外部线程不能直接取得其实例或引用。
 #[derive(Default)]
 struct UiState {
     snapshot: UiSnapshot,
     panel_visible: bool,
+    /// 每次成功处理打开请求都会递增，用来隔离旧的 Esc/失焦事件。
+    panel_generation: u64,
+    #[cfg(windows)]
+    /// 仅在 UI 线程持有的目标身份；后续粘贴前必须重新查询并比较。
+    panel_target: Option<PanelTarget>,
     applied_event_count: u64,
     applied_on_thread: Option<ThreadId>,
 }
 
 impl UiState {
     /// 在 UI 事件循环线程内应用一个事件并记录线程证据。
-    fn apply(&mut self, event: UiEvent) {
+    fn apply(&mut self, event: UiEvent) -> UiAction {
         self.applied_event_count += 1;
         self.applied_on_thread = Some(thread::current().id());
 
         match event {
-            UiEvent::OpenPanel => self.panel_visible = true,
-            UiEvent::ReplaceSnapshot(snapshot) => self.snapshot = snapshot,
-            UiEvent::SetPanelVisible(visible) => self.panel_visible = visible,
+            UiEvent::OpenPanel => {
+                if self.panel_visible {
+                    self.panel_visible = false;
+                    #[cfg(windows)]
+                    {
+                        self.panel_target = None;
+                    }
+                    UiAction::Hide
+                } else {
+                    // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
+                    self.panel_generation = self.panel_generation.saturating_add(1).max(1);
+                    self.panel_visible = true;
+                    UiAction::Show
+                }
+            }
+            UiEvent::HidePanel { generation } => {
+                if self.panel_visible && generation == self.panel_generation {
+                    self.panel_visible = false;
+                    #[cfg(windows)]
+                    {
+                        self.panel_target = None;
+                    }
+                    UiAction::Hide
+                } else {
+                    // 旧代次的失焦回调只能被记录，不能关闭新一轮面板。
+                    UiAction::None
+                }
+            }
+            UiEvent::ReplaceSnapshot(snapshot) => {
+                self.snapshot = snapshot;
+                UiAction::None
+            }
+        }
+    }
+
+    /// 返回当前打开代次，回调据此生成不会误伤新面板的关闭事件。
+    fn panel_generation(&self) -> u64 {
+        self.panel_generation
+    }
+
+    #[cfg(windows)]
+    /// 保存当前打开代次的目标身份；显示失败时也必须清空，避免残留句柄被复用。
+    fn set_panel_target(&mut self, target: Option<PanelTarget>) {
+        if self.panel_visible {
+            self.panel_target = target;
+        }
+    }
+
+    /// 窗口显示失败时回滚可见状态，但保留代次单调性。
+    fn mark_show_failed(&mut self) {
+        self.panel_visible = false;
+        #[cfg(windows)]
+        {
+            self.panel_target = None;
         }
     }
 
@@ -37,6 +114,7 @@ impl UiState {
         UiStateSnapshot {
             snapshot: self.snapshot.clone(),
             panel_visible: self.panel_visible,
+            panel_generation: self.panel_generation,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -57,16 +135,25 @@ pub struct UiStateSnapshot {
     pub snapshot: UiSnapshot,
     /// 当前看板可见性。
     pub panel_visible: bool,
+    /// 当前面板打开代次；只用于验证关闭事件是否仍属于当前实例。
+    pub panel_generation: u64,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
     pub applied_on_thread: Option<ThreadId>,
 }
 
-/// 在 UI 线程登记主窗口弱引用，后续 `OpenPanel` 事件只在 UI 闭包内升级它。
+/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc/失焦回调接入代次关闭协议。
 pub fn bind_app_window(window: &AppWindow) {
     UI_WINDOW.with(|target| {
         *target.borrow_mut() = Some(window.as_weak());
+    });
+
+    window.on_panel_dismiss_requested(|| {
+        let generation = current_panel_generation();
+        if let Err(error) = post_ui_event(UiEvent::HidePanel { generation }) {
+            eprintln!("面板关闭事件无法进入 UI 事件队列：{error}");
+        }
     });
 }
 
@@ -76,23 +163,137 @@ pub fn bind_app_window(window: &AppWindow) {
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
-        let should_open_panel = matches!(&event, UiEvent::OpenPanel);
-        UI_STATE.with(|state| state.borrow_mut().apply(event));
+        let action = UI_STATE.with(|state| state.borrow_mut().apply(event));
 
-        if should_open_panel {
-            UI_WINDOW.with(|target| {
-                let weak_window = target.borrow().clone();
-                if let Some(window) = weak_window.and_then(|weak| weak.upgrade()) {
-                    if let Err(error) = window.show() {
-                        eprintln!("无法显示剪贴板看板：{error}");
+        UI_WINDOW.with(|target| {
+            let weak_window = target.borrow().clone();
+            let Some(window) = weak_window.and_then(|weak| weak.upgrade()) else {
+                return;
+            };
+
+            match action {
+                UiAction::Show => {
+                    #[cfg(windows)]
+                    prepare_panel_show();
+
+                    match window.show() {
+                        Ok(()) => {
+                            #[cfg(windows)]
+                            schedule_panel_position(&window, current_panel_generation(), 3);
+                        }
+                        Err(error) => {
+                            UI_STATE.with(|state| state.borrow_mut().mark_show_failed());
+                            eprintln!("无法显示剪贴板看板：{error}");
+                        }
                     }
                 }
-            });
-        }
+                UiAction::Hide => {
+                    if let Err(error) = window.hide() {
+                        eprintln!("无法隐藏剪贴板看板：{error}");
+                    }
+                }
+                UiAction::None => {}
+            }
+        });
     })
+}
+
+/// 读取当前面板代次；Slint 回调在 UI 线程运行，因此不需要跨线程锁。
+pub fn current_panel_generation() -> u64 {
+    UI_STATE.with(|state| state.borrow().panel_generation())
+}
+
+#[cfg(windows)]
+/// 在 UI 线程显示面板前保存目标窗口，并按鼠标所在显示器工作区定位。
+fn prepare_panel_show() {
+    let target = capture_target(panel_hwnd());
+    UI_STATE.with(|state| state.borrow_mut().set_panel_target(target));
+}
+
+#[cfg(windows)]
+/// 在窗口真正显示后设置物理坐标，避免部分 Windows 后端用默认位置覆盖预定位结果。
+fn position_panel(window: &AppWindow) -> bool {
+    let slint_size = window.window().size();
+    let (width, height) = panel_size().unwrap_or((slint_size.width, slint_size.height));
+    if let Some(area) = cursor_work_area() {
+        let position = center_position(area, width, height);
+        // Winit 的首次显示可能异步创建 HWND；找到原生窗口后只保留一个物理位置来源。
+        let moved = move_panel(position);
+        if moved {
+            return true;
+        }
+        // HWND 尚未创建时先写入 Slint 属性，定时器下一轮会用 Win32 位置覆盖它。
+        window
+            .window()
+            .set_position(PhysicalPosition::new(position.x, position.y));
+    }
+    false
+}
+
+#[cfg(windows)]
+/// 在面板 HWND 真正创建后重试物理定位，并用代次防止旧定时器移动新一轮或已隐藏的面板。
+fn schedule_panel_position(window: &AppWindow, generation: u64, remaining_attempts: u8) {
+    let weak_window = window.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(16), move || {
+        let is_current = UI_STATE.with(|state| {
+            let state = state.borrow();
+            state.panel_visible && state.panel_generation() == generation
+        });
+        if !is_current {
+            return;
+        }
+
+        let Some(window) = weak_window.upgrade() else {
+            return;
+        };
+        if !position_panel(&window) && remaining_attempts > 0 {
+            schedule_panel_position(&window, generation, remaining_attempts - 1);
+        }
+    });
 }
 
 /// 读取当前线程的 UI 状态快照；生产调用方应只在 UI 事件闭包内使用此函数。
 pub fn ui_state_snapshot() -> UiStateSnapshot {
     UI_STATE.with(|state| state.borrow().snapshot())
+}
+
+#[cfg(test)]
+mod tests {
+    //! 此测试模块验证面板代次协议，确保旧的关闭事件不会误关闭新面板。
+
+    use super::{UiAction, UiState};
+    use crate::command::UiEvent;
+
+    /// 打开两轮面板后，第一轮的关闭事件必须被 reducer 拒绝。
+    #[test]
+    fn 过期关闭事件不会关闭新代次() {
+        let mut state = UiState::default();
+
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        let first_generation = state.panel_generation();
+        assert_eq!(
+            state.apply(UiEvent::HidePanel {
+                generation: first_generation
+            }),
+            UiAction::Hide
+        );
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        let second_generation = state.panel_generation();
+        assert!(second_generation > first_generation);
+
+        assert_eq!(
+            state.apply(UiEvent::HidePanel {
+                generation: first_generation,
+            }),
+            UiAction::None
+        );
+        assert!(state.panel_visible);
+        assert_eq!(
+            state.apply(UiEvent::HidePanel {
+                generation: second_generation,
+            }),
+            UiAction::Hide
+        );
+        assert!(!state.panel_visible);
+    }
 }

@@ -1,14 +1,32 @@
-// 此文件定义 ClipboardBoard 的黑色浮动看板骨架。
-// 当前版本只验证视觉语法和窗口尺寸，不包含热键、列表或任何真实剪贴板数据。
+// 此文件定义 ClipboardBoard 的黑色浮动看板骨架和面板关闭回调。
+// 当前版本只验证生命周期与视觉语法，不包含列表或任何真实剪贴板数据。
 
 export component AppWindow inherits Window {
+    // Rust 侧在 UI 线程登记此回调，并用打开代次处理 Esc/失焦竞态。
+    callback panel-dismiss-requested();
+    forward-focus: panel-focus;
+
     title: "ClipboardBoard";
     width: 560px;
     height: 640px;
     background: #080808;
 
-    Rectangle {
-        background: #080808;
+    panel-focus := FocusScope {
+        // Esc 和失去焦点都只发出请求，是否真的隐藏由 Rust reducer 的代次判断决定。
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                panel-dismiss-requested();
+                accept
+            }
+            reject
+        }
+
+        focus-lost => {
+            panel-dismiss-requested();
+        }
+
+        Rectangle {
+            background: #080808;
 
         VerticalLayout {
             x: 24px;
@@ -52,6 +70,7 @@ export component AppWindow inherits Window {
                 color: #8c8c8c;
                 font-size: 12px;
             }
+        }
         }
     }
 }

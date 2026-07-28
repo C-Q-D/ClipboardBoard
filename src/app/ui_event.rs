@@ -4,9 +4,9 @@
 //! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
 //! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
-use crate::command::{UiEvent, UiSnapshot};
+use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
 use crate::AppWindow;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
@@ -19,6 +19,9 @@ use crate::platform::windows::window::{
 };
 #[cfg(windows)]
 use slint::PhysicalPosition;
+
+/// UI 内存列表的当前上限；只保存摘要卡片，不把完整正文复制进 Slint 模型。
+const UI_HISTORY_CAPACITY: usize = 50;
 
 /// reducer 应用事件后交给 UI 窗口的最小副作用集合。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +114,10 @@ impl UiState {
                 self.snapshot = snapshot;
                 UiAction::None
             }
+            UiEvent::ClipboardCaptured(item) => {
+                prepend_clipboard_item(&mut self.snapshot, item);
+                UiAction::None
+            }
         }
     }
 
@@ -193,7 +200,11 @@ pub fn bind_app_window(window: &AppWindow) {
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
-        let action = UI_STATE.with(|state| state.borrow_mut().apply(event));
+        let (action, snapshot) = UI_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let action = state.apply(event);
+            (action, state.snapshot.clone())
+        });
 
         if action == UiAction::Quit {
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
@@ -208,6 +219,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             let Some(window) = weak_window.and_then(|weak| weak.upgrade()) else {
                 return;
             };
+
+            // 每次快照事件都在 UI 线程重建轻量卡片模型；模型只包含摘要、来源和时间文案。
+            set_window_snapshot(&window, &snapshot);
 
             match action {
                 UiAction::Show => {
@@ -236,6 +250,30 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             }
         });
     })
+}
+
+/// 将新捕获记录插入列表顶部，并限制 UI 常驻卡片数量以控制内存和布局成本。
+fn prepend_clipboard_item(snapshot: &mut UiSnapshot, item: UiClipboardItem) {
+    snapshot.items.insert(0, item);
+    snapshot.items.truncate(UI_HISTORY_CAPACITY);
+    if let Some(selected_index) = snapshot.selected_index {
+        let maximum_index = snapshot.items.len().saturating_sub(1);
+        snapshot.selected_index = Some(selected_index.saturating_add(1).min(maximum_index));
+    }
+}
+
+/// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
+fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
+    let cards = snapshot
+        .items
+        .iter()
+        .map(|item| crate::ClipboardCard {
+            preview: SharedString::from(item.preview.as_str()),
+            source: SharedString::from(item.source.as_str()),
+            relative_time: SharedString::from(item.relative_time.as_str()),
+        })
+        .collect::<Vec<_>>();
+    window.set_cards(ModelRc::new(VecModel::from(cards)));
 }
 
 /// 读取当前面板代次；Slint 回调在 UI 线程运行，因此不需要跨线程锁。
@@ -302,7 +340,7 @@ mod tests {
     //! 此测试模块验证面板代次协议，确保旧的关闭事件不会误关闭新面板。
 
     use super::{UiAction, UiState};
-    use crate::command::UiEvent;
+    use crate::command::{UiClipboardItem, UiEvent};
 
     /// 打开两轮面板后，第一轮的关闭事件必须被 reducer 拒绝。
     #[test]
@@ -364,5 +402,34 @@ mod tests {
             UiAction::None
         );
         assert!(!state.panel_visible);
+    }
+
+    /// 新捕获事件必须插入列表顶部，并且不能把完整正文带入 UI 状态。
+    #[test]
+    fn 捕获事件置顶摘要卡片() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(crate::command::UiSnapshot {
+            items: vec![UiClipboardItem {
+                id: 1,
+                preview: "旧内容".to_owned(),
+                source: "旧来源".to_owned(),
+                relative_time: "1分钟前".to_owned(),
+            }],
+            selected_index: Some(0),
+        }));
+
+        assert_eq!(
+            state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
+                id: 2,
+                preview: "新摘要".to_owned(),
+                source: "新来源".to_owned(),
+                relative_time: "刚刚".to_owned(),
+            })),
+            UiAction::None
+        );
+        assert_eq!(state.snapshot.items[0].preview, "新摘要");
+        assert_eq!(state.snapshot.items[0].source, "新来源");
+        assert_eq!(state.snapshot.items[0].relative_time, "刚刚");
+        assert_eq!(state.snapshot.selected_index, Some(1));
     }
 }

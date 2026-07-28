@@ -1,5 +1,11 @@
-// 此文件定义 ClipboardBoard 的黑色浮动看板骨架和面板关闭回调。
-// 当前版本只验证生命周期与视觉语法，不包含列表或任何真实剪贴板数据。
+// 此文件定义 ClipboardBoard 的黑色浮动看板、文本摘要卡片和面板关闭回调。
+// 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
+
+export struct ClipboardCard {
+    preview: string,
+    source: string,
+    relative_time: string,
+}
 
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次处理 Esc/失焦竞态。
@@ -10,6 +16,7 @@ export component AppWindow inherits Window {
     width: 560px;
     height: 640px;
     background: #080808;
+    in property <[ClipboardCard]> cards: [];
 
     panel-focus := FocusScope {
         // Esc 和失去焦点都只发出请求，是否真的隐藏由 Rust reducer 的代次判断决定。
@@ -28,49 +35,99 @@ export component AppWindow inherits Window {
         Rectangle {
             background: #080808;
 
-        VerticalLayout {
-            x: 24px;
-            y: 24px;
-            width: parent.width - 48px;
-            height: parent.height - 48px;
-            spacing: 12px;
+            VerticalLayout {
+                x: 24px;
+                y: 24px;
+                width: parent.width - 48px;
+                height: parent.height - 48px;
+                spacing: 12px;
 
-            Text {
-                text: "CLIPBOARD";
-                color: #f5f5f5;
-                font-size: 12px;
-                font-weight: 700;
-                letter-spacing: 2px;
-            }
+                Text {
+                    text: "CLIPBOARD";
+                    color: #f5f5f5;
+                    font-size: 12px;
+                    font-weight: 700;
+                    letter-spacing: 2px;
+                }
 
-            Rectangle {
-                height: 1px;
-                background: #2a2a2a;
-            }
+                Rectangle {
+                    height: 1px;
+                    background: #2a2a2a;
+                }
 
-            Text {
-                text: "按 Alt + V 呼出你的剪贴板历史";
-                color: #f5f5f5;
-                font-size: 22px;
-                wrap: word-wrap;
-            }
+                Text {
+                    text: "最近复制";
+                    color: #f5f5f5;
+                    font-size: 20px;
+                }
 
-            Text {
-                text: "正在建立轻量、本地优先的工作台。";
-                color: #8c8c8c;
-                font-size: 14px;
-            }
+                Text {
+                    text: "内容会在这里按最新复制时间排列";
+                    color: #8c8c8c;
+                    font-size: 14px;
+                }
 
-            Rectangle {
-                vertical-stretch: 1;
-            }
+                VerticalLayout {
+                    vertical-stretch: 1;
+                    spacing: 10px;
 
-            Text {
-                text: "Esc 关闭";
-                color: #8c8c8c;
-                font-size: 12px;
+                    for card in cards: Rectangle {
+                        height: 96px;
+                        background: #141414;
+                        border-radius: 10px;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+
+                            Text {
+                                text: card.preview;
+                                color: #f5f5f5;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                                overflow: elide;
+                                vertical-stretch: 1;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                Text {
+                                    text: card.source;
+                                    color: #8c8c8c;
+                                    font-size: 11px;
+                                }
+
+                                Text {
+                                    text: card.relative_time;
+                                    color: #666666;
+                                    font-size: 11px;
+                                    horizontal-alignment: right;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if cards.length == 0: Text {
+                    text: "复制一段文本，最新内容会出现在这里";
+                    color: #666666;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: #2a2a2a;
+                }
+
+                Text {
+                    text: "↑↓ 选择    Enter 粘贴    Esc 关闭";
+                    color: #8c8c8c;
+                    font-size: 12px;
+                }
             }
-        }
         }
     }
 }

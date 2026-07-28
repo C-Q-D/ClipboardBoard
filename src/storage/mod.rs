@@ -1,13 +1,13 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前原子只负责连接创建、v1 迁移和线程归属探针；历史写入、查询、清理和 UI 接线由后续原子实现。
+//! 当前原子负责连接创建、v1 迁移、线程归属探针和文本历史事务 upsert；查询、清理和 UI 接线由后续原子实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
 mod migration;
 mod worker;
 
-pub use worker::{StorageExecutor, StorageStatus};
+pub use worker::{StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult};
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
 #[derive(Debug)]

@@ -10,12 +10,27 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use super::{migration, StorageError};
 
-/// 存储线程命令队列的容量；当前原子只有探针和关闭命令，避免无限堆积。
+/// 存储线程命令队列的容量；探针、文本 upsert 和关闭命令共用有界队列，避免无限堆积。
 const COMMAND_QUEUE_CAPACITY: usize = 4;
+
+/// 文本历史 upsert 的固定 SQL；重复记录只更新最近复制时间和饱和计数。
+const UPSERT_TEXT_SQL: &str = r#"
+INSERT INTO clipboard_items
+    (item_type, text_content, preview_text, content_hash, source_exe, source_app,
+     copy_count, is_pinned, created_at, copied_at, last_used_at)
+VALUES ('text', ?1, ?2, ?3, ?4, ?5, 1, 0, ?6, ?6, NULL)
+ON CONFLICT(content_hash) DO UPDATE SET
+    copied_at = excluded.copied_at,
+    copy_count = CASE
+        WHEN copy_count >= 9223372036854775807 THEN 9223372036854775807
+        WHEN copy_count <= 0 THEN 2
+        ELSE copy_count + 1
+    END
+"#;
 
 /// 返回给调用方的只读存储状态和真实连接线程探针。
 #[derive(Debug)]
@@ -34,12 +49,61 @@ pub struct StorageStatus {
     pub clipboard_item_count: i64,
 }
 
+/// 文本历史写入的最小输入；调用方只提交已经完成哈希和预览裁剪的值。
+#[derive(Debug, Eq, PartialEq)]
+pub struct TextUpsertInput {
+    /// 文本内容的固定 BLAKE3 哈希，作为历史记录的唯一键。
+    pub content_hash: [u8; 32],
+    /// 必须原样保存、供后续写回剪贴板的完整文本。
+    pub text_content: String,
+    /// 列表卡片使用的短预览，不参与去重判定。
+    pub preview_text: String,
+    /// 复制发生时的源可执行文件名；未知时为空。
+    pub source_exe: Option<String>,
+    /// 复制发生时的源应用显示名；未知时为空。
+    pub source_app: Option<String>,
+    /// 复制事件发生的 Unix 毫秒时间戳。
+    pub copied_at: i64,
+}
+
+/// 文本历史事务写入后返回的稳定快照，不暴露 SQLite 连接或游标。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TextUpsertResult {
+    /// 历史记录的数据库主键。
+    pub id: i64,
+    /// 本次写入使用的内容哈希。
+    pub content_hash: [u8; 32],
+    /// 数据库中最终保留的预览文本。
+    pub preview_text: String,
+    /// 数据库中最终保留的源可执行文件名。
+    pub source_exe: Option<String>,
+    /// 数据库中最终保留的源应用显示名。
+    pub source_app: Option<String>,
+    /// 数据库中最终保留的复制次数，重复写入时饱和递增。
+    pub copy_count: i64,
+    /// 数据库中最终保留的收藏状态。
+    pub is_pinned: bool,
+    /// 首次创建时间；重复写入不得改变它。
+    pub created_at: i64,
+    /// 最近一次复制时间。
+    pub copied_at: i64,
+    /// 最近一次被用户使用的时间；写入操作不得覆盖它。
+    pub last_used_at: Option<i64>,
+}
+
 /// 可发送给存储线程的内部命令；不对外暴露连接、Statement 或 SQL 句柄。
 enum StorageCommand {
     /// 在实际连接上执行只读线程归属探针。
     Inspect {
         /// 返回探针结果的有界通道。
         reply: SyncSender<Result<StorageStatus, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上原子插入或更新一条文本历史。
+    UpsertText {
+        /// 已校验的文本写入输入；完整文本只在 worker 内部使用。
+        input: TextUpsertInput,
+        /// 返回同一事务中读取的最终稳定快照。
+        reply: SyncSender<Result<TextUpsertResult, StorageError>>,
     },
     /// 请求 worker 先关闭连接，再结束命令循环。
     Shutdown {
@@ -126,24 +190,35 @@ impl StorageExecutor {
             })
             .is_err()
         {
-            let join_result = self.join_worker();
-            return if join_result.is_err() {
-                Err(StorageError::WorkerPanicked)
-            } else {
-                Err(StorageError::ChannelClosed)
-            };
+            return Err(self.worker_failure_error());
         }
 
         match reply_receiver.recv() {
             Ok(result) => result,
-            Err(_) => {
-                let join_result = self.join_worker();
-                if join_result.is_err() {
-                    Err(StorageError::WorkerPanicked)
-                } else {
-                    Err(StorageError::ChannelClosed)
-                }
-            }
+            Err(_) => Err(self.worker_failure_error()),
+        }
+    }
+
+    /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
+    pub fn upsert_text(
+        &mut self,
+        input: TextUpsertInput,
+    ) -> Result<TextUpsertResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        if self
+            .command_sender
+            .send(StorageCommand::UpsertText {
+                input,
+                reply: reply_sender,
+            })
+            .is_err()
+        {
+            return Err(self.worker_failure_error());
+        }
+
+        match reply_receiver.recv() {
+            Ok(result) => result,
+            Err(_) => Err(self.worker_failure_error()),
         }
     }
 
@@ -174,6 +249,15 @@ impl StorageExecutor {
             .ok_or(StorageError::WorkerPanicked)?
             .join()
             .map_err(|_| StorageError::WorkerPanicked)
+    }
+
+    /// 将命令或回执通道断开统一映射为可诊断的线程生命周期错误。
+    fn worker_failure_error(&mut self) -> StorageError {
+        if self.join_worker().is_err() {
+            StorageError::WorkerPanicked
+        } else {
+            StorageError::ChannelClosed
+        }
     }
 }
 
@@ -221,6 +305,9 @@ fn storage_thread(
         match command {
             StorageCommand::Inspect { reply } => {
                 let _ = reply.send(inspect_state(&mut state));
+            }
+            StorageCommand::UpsertText { input, reply } => {
+                let _ = reply.send(upsert_text(&mut state.connection, input));
             }
             StorageCommand::Shutdown { reply } => {
                 let _ = reply.send(Ok(()));
@@ -273,9 +360,65 @@ fn inspect_state(state: &mut StorageState) -> Result<StorageStatus, StorageError
     })
 }
 
+/// 使用同一 SQLite 事务完成文本历史 upsert，并在提交前读取最终快照。
+fn upsert_text(
+    connection: &mut Connection,
+    input: TextUpsertInput,
+) -> Result<TextUpsertResult, StorageError> {
+    let TextUpsertInput {
+        content_hash,
+        text_content,
+        preview_text,
+        source_exe,
+        source_app,
+        copied_at,
+    } = input;
+    let content_hash_blob = content_hash.to_vec();
+    let transaction = connection.transaction()?;
+
+    transaction.execute(
+        UPSERT_TEXT_SQL,
+        params![
+            &text_content,
+            &preview_text,
+            content_hash_blob.as_slice(),
+            &source_exe,
+            &source_app,
+            copied_at,
+        ],
+    )?;
+
+    let result = transaction.query_row(
+        r#"
+SELECT id, preview_text, source_exe, source_app, copy_count, is_pinned,
+       created_at, copied_at, last_used_at
+FROM clipboard_items
+WHERE content_hash = ?1
+"#,
+        params![content_hash_blob.as_slice()],
+        |row| {
+            Ok(TextUpsertResult {
+                id: row.get(0)?,
+                content_hash,
+                preview_text: row.get(1)?,
+                source_exe: row.get(2)?,
+                source_app: row.get(3)?,
+                copy_count: row.get(4)?,
+                is_pinned: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
+                copied_at: row.get(7)?,
+                last_used_at: row.get(8)?,
+            })
+        },
+    )?;
+
+    transaction.commit()?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
-    //! 此测试模块验证执行器就绪、迁移隔离、坏 schema 传播和真实连接线程归属。
+    //! 此测试模块验证线程执行器、文本事务规则、迁移隔离和错误回滚语义。
 
     use std::{
         fs,
@@ -284,9 +427,9 @@ mod tests {
         thread,
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
 
-    use super::StorageExecutor;
+    use super::{StorageExecutor, TextUpsertInput};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -294,7 +437,7 @@ mod tests {
     fn temporary_directory() -> PathBuf {
         let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "clipboard-board-atom15-{}-{sequence}",
+            "clipboard-board-atom16-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("创建存储测试目录失败");
@@ -304,6 +447,23 @@ mod tests {
     /// 释放当前测试自己创建的目录；调用方必须先丢弃执行器以释放 SQLite 文件句柄。
     fn remove_directory(directory: &Path) {
         fs::remove_dir_all(directory).expect("清理存储测试目录失败");
+    }
+
+    /// 生成固定长度哈希，测试只关心冲突键是否稳定，不模拟真实 BLAKE3 算法。
+    fn test_hash(value: u8) -> [u8; 32] {
+        [value; 32]
+    }
+
+    /// 生成一条带来源信息的文本 upsert 输入，便于测试重复写入和字段保留规则。
+    fn text_input(hash_value: u8, text: &str, preview: &str, copied_at: i64) -> TextUpsertInput {
+        TextUpsertInput {
+            content_hash: test_hash(hash_value),
+            text_content: text.to_owned(),
+            preview_text: preview.to_owned(),
+            source_exe: Some(format!("old-{hash_value}.exe")),
+            source_app: Some(format!("Old App {hash_value}")),
+            copied_at,
+        }
     }
 
     /// 验证打开执行器只有在 v1 迁移提交后才返回，并且重复打开保持幂等。
@@ -380,6 +540,198 @@ mod tests {
             1
         );
         drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证首次插入、同毫秒重复写入、收藏字段保留和单行去重都在稳定公共接缝上成立。
+    #[test]
+    fn text_upsert_deduplicates_and_preserves_old_fields() {
+        let directory = temporary_directory();
+        let first = {
+            let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+            let first = executor
+                .upsert_text(text_input(11, "old body", "old preview", 100))
+                .expect("首次文本 upsert 失败");
+            assert_eq!(first.id, 1);
+            assert_eq!(first.content_hash, test_hash(11));
+            assert_eq!(first.preview_text, "old preview");
+            assert_eq!(first.copy_count, 1);
+            assert!(!first.is_pinned);
+            assert_eq!(first.created_at, 100);
+            assert_eq!(first.copied_at, 100);
+            assert_eq!(first.last_used_at, None);
+            first
+        };
+
+        {
+            let database_path = directory.join("clipboard.db");
+            let connection = Connection::open(&database_path).expect("打开文本数据库失败");
+            connection
+                .execute(
+                    "UPDATE clipboard_items SET is_pinned = 1, last_used_at = 777 WHERE id = ?1",
+                    params![first.id],
+                )
+                .expect("预置收藏字段失败");
+        }
+
+        let mut executor = StorageExecutor::open_at(&directory).expect("重新启动存储线程失败");
+        let duplicate = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: test_hash(11),
+                text_content: "new body must be ignored".to_owned(),
+                preview_text: "new preview must be ignored".to_owned(),
+                source_exe: Some("new.exe".to_owned()),
+                source_app: Some("New App".to_owned()),
+                copied_at: 100,
+            })
+            .expect("重复文本 upsert 失败");
+
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(duplicate.preview_text, "old preview");
+        assert_eq!(duplicate.source_exe.as_deref(), Some("old-11.exe"));
+        assert_eq!(duplicate.source_app.as_deref(), Some("Old App 11"));
+        assert_eq!(duplicate.copy_count, 2);
+        assert!(duplicate.is_pinned);
+        assert_eq!(duplicate.created_at, 100);
+        assert_eq!(duplicate.copied_at, 100);
+        assert_eq!(duplicate.last_used_at, Some(777));
+        assert_eq!(
+            executor
+                .status()
+                .expect("读取去重后的状态失败")
+                .clipboard_item_count,
+            1
+        );
+        drop(executor);
+
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("重新打开文本数据库失败");
+        let stored_text: String = connection
+            .query_row(
+                "SELECT text_content FROM clipboard_items WHERE id = ?1",
+                params![first.id],
+                |row| row.get(0),
+            )
+            .expect("读取原始文本失败");
+        assert_eq!(stored_text, "old body");
+        drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 验证最大值饱和递增以及异常的零值、负值都不会溢出或产生无效计数。
+    #[test]
+    fn text_upsert_normalizes_and_saturates_copy_count() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        {
+            let mut connection = Connection::open(&database_path).expect("创建计数数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("计数数据库迁移失败");
+            for (hash_value, copy_count) in [(21_u8, i64::MAX), (22_u8, 0), (23_u8, -1)] {
+                connection
+                    .execute(
+                        "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, created_at, copied_at) VALUES ('text', 'old', 'old', ?1, ?2, 1, 1)",
+                        params![test_hash(hash_value).as_slice(), copy_count],
+                    )
+                    .expect("预置复制计数失败");
+            }
+        }
+
+        let mut executor = StorageExecutor::open_at(&directory).expect("打开计数数据库失败");
+        let max_result = executor
+            .upsert_text(text_input(21, "new", "new", 2))
+            .expect("最大计数 upsert 失败");
+        let zero_result = executor
+            .upsert_text(text_input(22, "new", "new", 2))
+            .expect("零计数 upsert 失败");
+        let negative_result = executor
+            .upsert_text(text_input(23, "new", "new", 2))
+            .expect("负计数 upsert 失败");
+
+        assert_eq!(max_result.copy_count, i64::MAX);
+        assert_eq!(zero_result.copy_count, 2);
+        assert_eq!(negative_result.copy_count, 2);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证触发器使更新事务整体回滚，且失败后 worker 仍可继续执行状态探针。
+    #[test]
+    fn text_upsert_rolls_back_on_update_error_and_keeps_worker_alive() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        {
+            let mut connection = Connection::open(&database_path).expect("创建回滚数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("回滚数据库迁移失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, source_exe, source_app, copy_count, is_pinned, created_at, copied_at, last_used_at) VALUES ('text', 'old body', 'old preview', ?1, 'old.exe', 'Old App', 4, 1, 10, 20, 30)",
+                    params![test_hash(31).as_slice()],
+                )
+                .expect("预置回滚记录失败");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_text_update BEFORE UPDATE OF copied_at ON clipboard_items FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'forced upsert failure'); END;",
+                )
+                .expect("创建回滚触发器失败");
+        }
+
+        let mut executor = StorageExecutor::open_at(&directory).expect("打开回滚数据库失败");
+        let result = executor.upsert_text(TextUpsertInput {
+            content_hash: test_hash(31),
+            text_content: "new body".to_owned(),
+            preview_text: "new preview".to_owned(),
+            source_exe: Some("new.exe".to_owned()),
+            source_app: Some("New App".to_owned()),
+            copied_at: 99,
+        });
+        assert!(matches!(
+            result,
+            Err(crate::storage::StorageError::Sqlite(_))
+        ));
+        assert_eq!(
+            executor
+                .status()
+                .expect("回滚后 worker 探针失败")
+                .clipboard_item_count,
+            1
+        );
+        drop(executor);
+
+        let connection = Connection::open(&database_path).expect("回滚后重新打开数据库失败");
+        let stored = connection
+            .query_row(
+                "SELECT text_content, preview_text, source_exe, source_app, copy_count, is_pinned, created_at, copied_at, last_used_at FROM clipboard_items WHERE content_hash = ?1",
+                params![test_hash(31).as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .expect("读取回滚记录失败");
+        assert_eq!(
+            stored,
+            (
+                "old body".to_owned(),
+                "old preview".to_owned(),
+                "old.exe".to_owned(),
+                "Old App".to_owned(),
+                4,
+                1,
+                10,
+                20,
+                30,
+            )
+        );
+        drop(connection);
         remove_directory(&directory);
     }
 

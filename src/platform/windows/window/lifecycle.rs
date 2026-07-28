@@ -1,4 +1,4 @@
-//! 此文件实现临时看板的原生窗口查找和显示器工作区定位。
+//! 此文件实现临时看板的原生窗口查找、显示器工作区定位和 topmost 断言。
 //!
 //! 应用只用 Win32 修正 Slint 窗口的物理位置与尺寸，不保存外部目标窗口，也不向
 //! 其他进程注入键盘输入。
@@ -11,9 +11,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTOPRIMARY,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER,
+    SWP_NOMOVE, SWP_NOSIZE,
 };
 
 /// 鼠标所在显示器扣除任务栏后的物理工作区。
@@ -38,23 +39,44 @@ pub(crate) struct PanelPosition {
     pub(crate) y: i32,
 }
 
-/// 通过 Win32 物理像素移动已创建的面板窗口，修正部分后端在首次显示时覆盖位置的问题。
+/// 通过 Win32 物理像素移动已创建的面板并断言 topmost，修正后端覆盖位置或层级的问题。
 pub(crate) fn move_panel(position: PanelPosition) -> bool {
+    set_panel_topmost(Some(position))
+}
+
+/// 在不改变当前位置和尺寸的前提下重新断言 topmost，供重复热键激活路径使用。
+pub(crate) fn reassert_panel_topmost() -> bool {
+    set_panel_topmost(None)
+}
+
+/// 使用统一的 `HWND_TOPMOST` 调用设置面板层级；`None` 只改变 Z 序。
+fn set_panel_topmost(position: Option<PanelPosition>) -> bool {
     let hwnd = find_panel_hwnd();
     if hwnd.is_null() {
         return false;
     }
+    let (x, y) = position.map(|value| (value.x, value.y)).unwrap_or((0, 0));
 
     unsafe {
         SetWindowPos(
             hwnd,
-            null_mut(),
-            position.x,
-            position.y,
+            HWND_TOPMOST,
+            x,
+            y,
             0,
             0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            panel_position_flags(position.is_some()),
         ) != 0
+    }
+}
+
+/// 根据是否需要移动计算稳定的 `SetWindowPos` flags；任何路径都不能禁用 Z 序更新。
+const fn panel_position_flags(reposition: bool) -> u32 {
+    let base = SWP_NOSIZE | SWP_NOACTIVATE;
+    if reposition {
+        base
+    } else {
+        base | SWP_NOMOVE
     }
 }
 
@@ -164,7 +186,7 @@ fn work_area_from_rect(rect: RECT) -> WorkArea {
 mod tests {
     //! 此测试模块覆盖不依赖桌面状态的窗口定位边界。
 
-    use super::{center_position, PanelPosition, WorkArea};
+    use super::{center_position, panel_position_flags, PanelPosition, WorkArea};
 
     /// 负坐标显示器也必须按工作区真实坐标居中，而不能错误地从零点计算。
     #[test]
@@ -193,6 +215,25 @@ mod tests {
         assert_eq!(
             center_position(area, 560, 640),
             PanelPosition { x: 100, y: 50 }
+        );
+    }
+
+    /// 首次定位和重复激活都必须允许修改 Z 序，重复激活额外禁止移动。
+    #[test]
+    fn topmost_调用保留_z_序更新() {
+        let positioned = panel_position_flags(true);
+        let reasserted = panel_position_flags(false);
+        assert_eq!(
+            positioned & windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            0
+        );
+        assert_eq!(
+            reasserted & windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            0
+        );
+        assert_ne!(
+            reasserted & windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
+            0
         );
     }
 }

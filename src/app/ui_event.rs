@@ -21,6 +21,7 @@ use std::time::Instant;
 #[cfg(windows)]
 use crate::platform::windows::window::{
     activate_panel, center_position, cursor_work_area, move_panel, panel_size,
+    reassert_panel_topmost,
 };
 #[cfg(windows)]
 use slint::PhysicalPosition;
@@ -59,6 +60,8 @@ enum ActivationAttempt {
     Done,
     /// HWND 尚未就绪或激活暂时被拒绝，剩余预算允许再次尝试。
     Retry,
+    /// 重试预算已经耗尽且 topmost 断言仍失败，只记录固定诊断并保持面板状态。
+    TopmostRejected,
     /// 重试预算已经耗尽且激活仍被拒绝，只记录诊断并保持面板状态。
     ActivationRejected,
 }
@@ -87,10 +90,12 @@ where
         ActivationAttempt::Done
     } else if remaining_attempts > 0 {
         ActivationAttempt::Retry
+    } else if !positioned {
+        ActivationAttempt::TopmostRejected
     } else if !activated {
         ActivationAttempt::ActivationRejected
     } else {
-        // Slint 预定位已经生效时，最终找不到 HWND 不再无限重试。
+        // 前面的穷尽分支已经覆盖所有失败组合。
         ActivationAttempt::Done
     }
 }
@@ -779,13 +784,23 @@ fn schedule_panel_activation(
             return;
         };
         match activation_attempt(
-            || !reposition || position_panel(&window),
+            || {
+                if reposition {
+                    position_panel(&window)
+                } else {
+                    reassert_panel_topmost()
+                }
+            },
             activate_panel,
             remaining_attempts,
         ) {
             ActivationAttempt::Done => {}
             ActivationAttempt::Retry => {
                 schedule_panel_activation(&window, generation, remaining_attempts - 1, reposition);
+            }
+            ActivationAttempt::TopmostRejected => {
+                // SetWindowPos 失败不能误报成功；保留可见状态并等待下一次热键重新断言。
+                eprintln!("Windows 暂未允许剪贴板看板保持置顶");
             }
             ActivationAttempt::ActivationRejected => {
                 // Windows 前台锁拒绝激活时只记录固定诊断；面板仍保持可见并等待用户点击。
@@ -943,6 +958,10 @@ mod tests {
         assert_eq!(
             activation_attempt(|| true, || false, 0),
             ActivationAttempt::ActivationRejected
+        );
+        assert_eq!(
+            activation_attempt(|| false, || true, 0),
+            ActivationAttempt::TopmostRejected
         );
         assert_eq!(
             activation_attempt(|| true, || true, 2),

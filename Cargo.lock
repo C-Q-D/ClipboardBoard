@@ -792,6 +792,7 @@ dependencies = [
 name = "clipboard-board"
 version = "0.1.0"
 dependencies = [
+ "i-slint-backend-testing",
  "slint",
  "slint-build",
 ]

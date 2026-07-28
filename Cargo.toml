@@ -12,3 +12,7 @@ slint = "1.16.0"
 
 [build-dependencies]
 slint-build = "1.16.0"
+
+# 仅用于隔离集成测试，验证 Slint 事件循环的线程投递边界；生产程序不依赖测试后端。
+[dev-dependencies]
+i-slint-backend-testing = "=1.17.1"

@@ -14,7 +14,11 @@ $requiredFiles = @(
     'build.rs',
     'src/lib.rs',
     'src/main.rs',
-    'ui/app-window.slint'
+    'ui/app-window.slint',
+    'src/command.rs',
+    'src/app/mod.rs',
+    'src/app/ui_event.rs',
+    'tests/ui_event.rs'
 )
 
 foreach ($relativePath in $requiredFiles) {

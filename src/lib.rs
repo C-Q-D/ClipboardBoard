@@ -4,6 +4,10 @@
 
 slint::include_modules!();
 
+// 公开应用核心模块，后续平台线程只能通过这些模块与 UI 线程通信。
+pub mod app;
+pub mod command;
+
 /// 创建主窗口实例。
 ///
 /// 调用方负责启动 Slint 事件循环；创建失败时返回平台初始化错误，不在此处吞掉错误。

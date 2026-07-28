@@ -28,6 +28,10 @@ fn 核心源码包含中文文件级职责说明() {
         "src/lib.rs",
         "src/main.rs",
         "ui/app-window.slint",
+        "src/command.rs",
+        "src/app/mod.rs",
+        "src/app/ui_event.rs",
+        "tests/ui_event.rs",
     ] {
         assert_has_chinese_file_comment(relative_path);
     }

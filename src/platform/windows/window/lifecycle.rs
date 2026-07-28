@@ -12,8 +12,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTOPRIMARY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetCursorPos, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER,
+    FindWindowExW, GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER,
 };
 
 /// 鼠标所在显示器扣除任务栏后的物理工作区。
@@ -85,6 +85,18 @@ fn find_panel_hwnd() -> windows_sys::Win32::Foundation::HWND {
             windows_sys::core::w!("ClipboardBoard"),
         )
     }
+}
+
+/// 尝试重新激活已经创建的面板窗口；Windows 前台锁拒绝请求时返回 `false`。
+///
+/// 失败只影响本次输入焦点申请，不改变 UI reducer 的可见状态；用户仍可直接点击面板。
+pub(crate) fn activate_panel() -> bool {
+    let hwnd = find_panel_hwnd();
+    if hwnd.is_null() {
+        return false;
+    }
+
+    unsafe { SetForegroundWindow(hwnd) != 0 }
 }
 
 /// 读取鼠标所在显示器的任务栏避让工作区；显示器查询失败时返回 `None`。

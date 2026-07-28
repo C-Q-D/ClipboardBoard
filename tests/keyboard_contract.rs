@@ -1,9 +1,9 @@
 //! 此集成测试验证面板级键盘捕获先于搜索框等内部控件执行。
 //!
-//! 测试只验证 WCB-INT-01 的 Esc、上下选择和 Enter 无动作契约，不涉及窗口置顶、
-//! 失焦生命周期、鼠标卡片或后续分页行为。
+//! 测试验证 WCB-INT-01 的键盘契约，以及 WCB-INT-03 的失焦驻留和原生关闭拒绝；
+//! 不涉及窗口置顶、鼠标卡片或后续分页行为。
 
-use clipboard_board::create_app_window;
+use clipboard_board::{app::bind_app_window, create_app_window};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, SharedString};
 use std::cell::{Cell, RefCell};
@@ -56,6 +56,7 @@ fn send_text(window: &clipboard_board::AppWindow, text: &str) {
 fn 内部焦点遵守面板级键盘契约() {
     i_slint_backend_testing::init_integration_test_with_mock_time();
     let window = create_app_window().expect("测试窗口应成功创建");
+    bind_app_window(&window);
 
     let dismiss_count = Rc::new(Cell::new(0_u32));
     let dismiss_count_for_callback = Rc::clone(&dismiss_count);
@@ -76,6 +77,12 @@ fn 内部焦点遵守面板级键盘契约() {
     });
 
     window.show().expect("测试窗口应成功显示");
+    window
+        .window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(false));
+    assert!(window.window().is_visible());
+    window.window().dispatch_event(WindowEvent::CloseRequested);
+    assert!(window.window().is_visible());
     // 搜索框位于固定顶部工具区；先点击并输入字符，以可观察回调证明内部 LineEdit 已获焦。
     focus_search_input(&window);
     send_text(&window, "x");

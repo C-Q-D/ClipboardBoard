@@ -11,7 +11,7 @@ use crate::history::MemoryHistory;
 use crate::search::{SearchCoordinator, SearchCoordinatorError};
 use crate::storage::HistoryQuery;
 use crate::AppWindow;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
@@ -19,7 +19,9 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(windows)]
-use crate::platform::windows::window::{center_position, cursor_work_area, move_panel, panel_size};
+use crate::platform::windows::window::{
+    activate_panel, center_position, cursor_work_area, move_panel, panel_size,
+};
 #[cfg(windows)]
 use slint::PhysicalPosition;
 
@@ -33,6 +35,8 @@ pub const UI_FIRST_BATCH_SIZE: usize = 30;
 enum UiAction {
     /// 显示面板，并在显示前完成目标快照与工作区定位。
     Show,
+    /// 面板已经可见时重新显示并申请激活，不创建新会话或重置任何状态。
+    Reassert,
     /// 选择索引已变化，需要在 UI 线程调整当前卡片视口。
     ScrollSelection,
     /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
@@ -45,6 +49,50 @@ enum UiAction {
     None,
     /// 退出 Slint 事件循环；只允许第一次 Quit 事件触发。
     Quit,
+}
+
+/// 单次原生定位与激活尝试的有限结果；调用方据此决定重试或只记录固定诊断。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationAttempt {
+    /// 原生窗口已定位且 Windows 接受激活请求。
+    Done,
+    /// HWND 尚未就绪或激活暂时被拒绝，剩余预算允许再次尝试。
+    Retry,
+    /// 重试预算已经耗尽且激活仍被拒绝，只记录诊断并保持面板状态。
+    ActivationRejected,
+}
+
+/// 执行显示副作用并仅在成功时安排激活；函数不接收 UI 状态，因此失败不能回滚会话。
+fn perform_show_action<E, S, A>(show: S, schedule_activation: A) -> Result<(), E>
+where
+    S: FnOnce() -> Result<(), E>,
+    A: FnOnce(),
+{
+    show()?;
+    schedule_activation();
+    Ok(())
+}
+
+/// 执行一次可注入的定位和激活尝试，隔离 Win32 失败与 UI reducer 状态。
+#[cfg(windows)]
+fn activation_attempt<P, A>(position: P, activate: A, remaining_attempts: u8) -> ActivationAttempt
+where
+    P: FnOnce() -> bool,
+    A: FnOnce() -> bool,
+{
+    let positioned = position();
+    let activated = activate();
+    if positioned && activated {
+        ActivationAttempt::Done
+    } else if remaining_attempts > 0 {
+        ActivationAttempt::Retry
+    } else if !activated {
+        ActivationAttempt::ActivationRejected
+    } else {
+        // Slint 预定位已经生效时，最终找不到 HWND 不再无限重试。
+        ActivationAttempt::Done
+    }
 }
 
 /// UI 线程独占的内部状态，外部线程不能直接取得其实例或引用。
@@ -63,7 +111,7 @@ struct UiState {
     /// 最近一次搜索提交代次；用于验证迟到计时器身份。
     search_generation: Option<u64>,
     panel_visible: bool,
-    /// 每次成功处理打开请求都会递增，用来隔离旧的 Esc/失焦事件。
+    /// 只有从隐藏进入可见的新会话才递增，用来隔离旧的 Esc 事件。
     panel_generation: u64,
     /// 退出请求的一次性闩锁；置位后拒绝所有后续 UI 事件。
     quitting: bool,
@@ -110,9 +158,7 @@ impl UiState {
         match event {
             UiEvent::OpenPanel => {
                 if self.panel_visible {
-                    self.panel_visible = false;
-                    self.search.cancel();
-                    UiAction::Hide
+                    UiAction::Reassert
                 } else {
                     // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
@@ -124,7 +170,7 @@ impl UiState {
             }
             UiEvent::ShowPanel => {
                 if self.panel_visible {
-                    UiAction::None
+                    UiAction::Reassert
                 } else {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
@@ -145,7 +191,7 @@ impl UiState {
                     self.search.cancel();
                     UiAction::Hide
                 } else {
-                    // 旧代次的失焦回调只能被记录，不能关闭新一轮面板。
+                    // 旧代次的 Esc 关闭事件只能被记录，不能关闭新一轮面板。
                     UiAction::None
                 }
             }
@@ -358,11 +404,6 @@ impl UiState {
         self.panel_generation
     }
 
-    /// 窗口显示失败时回滚可见状态，但保留代次单调性。
-    fn mark_show_failed(&mut self) {
-        self.panel_visible = false;
-    }
-
     /// 复制出不可变观测结果，避免把内部可变引用暴露给调用方。
     fn snapshot(&self) -> UiStateSnapshot {
         UiStateSnapshot {
@@ -415,7 +456,7 @@ pub struct UiStateSnapshot {
     pub applied_on_thread: Option<ThreadId>,
 }
 
-/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc、失焦和上下选择回调接入状态协议。
+/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc、原生关闭和上下选择回调接入状态协议。
 pub fn bind_app_window(window: &AppWindow) {
     UI_WINDOW.with(|target| {
         *target.borrow_mut() = Some(window.as_weak());
@@ -428,12 +469,10 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
-    window.on_panel_focus_lost_requested(|| {
-        let generation = current_panel_generation();
-        if let Err(error) = post_ui_event(UiEvent::HidePanel { generation }) {
-            eprintln!("面板失焦事件无法进入 UI 事件队列：{error}");
-        }
-    });
+    // 标题栏关闭和 Alt+F4 都只拒绝本次原生关闭请求；Esc 仍通过显式事件隐藏到托盘。
+    window
+        .window()
+        .on_close_requested(|| CloseRequestResponse::KeepWindowShown);
 
     window.on_selection_move_requested(|delta| {
         if let Err(error) = post_ui_event(UiEvent::MoveSelection { delta }) {
@@ -472,7 +511,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
         // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
-        let refresh_model = !matches!(
+        let may_refresh_model = !matches!(
             &event,
             UiEvent::MoveSelection { .. } | UiEvent::CopySelection
         );
@@ -488,6 +527,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     state.search_status,
                 )
             });
+        // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
+        let refresh_model = may_refresh_model && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
@@ -523,17 +564,39 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             }
 
             match action {
-                UiAction::Show => match window.show() {
-                    Ok(()) => {
-                        ensure_selection_visible(&window, snapshot.selected_index);
-                        #[cfg(windows)]
-                        schedule_panel_position(&window, current_panel_generation(), 3);
-                    }
-                    Err(error) => {
-                        UI_STATE.with(|state| state.borrow_mut().mark_show_failed());
+                UiAction::Show => {
+                    let show_result = perform_show_action(
+                        || window.show(),
+                        || {
+                            ensure_selection_visible(&window, snapshot.selected_index);
+                            #[cfg(windows)]
+                            schedule_panel_activation(&window, current_panel_generation(), 3, true);
+                        },
+                    );
+                    if let Err(error) = show_result {
+                        // 平台显示失败不能回滚 reducer；面板会话、搜索、筛选和选择保持不变，
+                        // 后续 Alt+V 仍可通过 Reassert 重试。
                         eprintln!("无法显示剪贴板看板：{error}");
                     }
-                },
+                }
+                UiAction::Reassert => {
+                    let show_result = perform_show_action(
+                        || window.show(),
+                        || {
+                            #[cfg(windows)]
+                            schedule_panel_activation(
+                                &window,
+                                current_panel_generation(),
+                                3,
+                                false,
+                            );
+                        },
+                    );
+                    if let Err(error) = show_result {
+                        // Reassert 失败只等待下次热键重试，不能隐藏或重建当前面板会话。
+                        eprintln!("无法重新激活剪贴板看板：{error}");
+                    }
+                }
                 UiAction::Hide => {
                     if let Err(error) = window.hide() {
                         eprintln!("无法隐藏剪贴板看板：{error}");
@@ -695,8 +758,13 @@ fn position_panel(window: &AppWindow) -> bool {
 }
 
 #[cfg(windows)]
-/// 在面板 HWND 真正创建后重试物理定位，并用代次防止旧定时器移动新一轮或已隐藏的面板。
-fn schedule_panel_position(window: &AppWindow, generation: u64, remaining_attempts: u8) {
+/// 在面板 HWND 真正创建后重试物理定位和激活，并用代次拒绝旧会话定时器。
+fn schedule_panel_activation(
+    window: &AppWindow,
+    generation: u64,
+    remaining_attempts: u8,
+    reposition: bool,
+) {
     let weak_window = window.as_weak();
     slint::Timer::single_shot(Duration::from_millis(16), move || {
         let is_current = UI_STATE.with(|state| {
@@ -710,8 +778,19 @@ fn schedule_panel_position(window: &AppWindow, generation: u64, remaining_attemp
         let Some(window) = weak_window.upgrade() else {
             return;
         };
-        if !position_panel(&window) && remaining_attempts > 0 {
-            schedule_panel_position(&window, generation, remaining_attempts - 1);
+        match activation_attempt(
+            || !reposition || position_panel(&window),
+            activate_panel,
+            remaining_attempts,
+        ) {
+            ActivationAttempt::Done => {}
+            ActivationAttempt::Retry => {
+                schedule_panel_activation(&window, generation, remaining_attempts - 1, reposition);
+            }
+            ActivationAttempt::ActivationRejected => {
+                // Windows 前台锁拒绝激活时只记录固定诊断；面板仍保持可见并等待用户点击。
+                eprintln!("Windows 暂未允许激活剪贴板看板");
+            }
         }
     });
 }
@@ -725,9 +804,11 @@ pub fn ui_state_snapshot() -> UiStateSnapshot {
 mod tests {
     //! 此测试模块验证面板代次协议，确保旧的关闭事件不会误关闭新面板。
 
+    #[cfg(windows)]
+    use super::{activation_attempt, ActivationAttempt};
     use super::{
-        selection_viewport_y, visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE,
-        UI_HISTORY_MEMORY_CAPACITY,
+        perform_show_action, selection_viewport_y, visible_snapshot_items, UiAction, UiState,
+        UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
     use std::time::{Duration, Instant};
@@ -778,16 +859,95 @@ mod tests {
         assert!(!state.panel_visible);
     }
 
-    /// 托盘打开必须是幂等显示，不能像热键一样把已显示面板再次隐藏。
+    /// 托盘打开必须在已显示时重新断言窗口，而不创建新的面板会话。
     #[test]
     fn 托盘打开幂等显示面板() {
         let mut state = UiState::default();
 
         assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::Show);
         let generation = state.panel_generation();
-        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::None);
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::Reassert);
         assert!(state.panel_visible);
         assert_eq!(state.panel_generation(), generation);
+    }
+
+    /// 重复热键只重新激活窗口，不能重置 generation、搜索条件或当前选择。
+    #[test]
+    fn 重复热键保持当前面板会话() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.apply(UiEvent::MoveSelection { delta: 1 });
+        state.apply_at(UiEvent::SearchTextChanged("条目".to_owned()), start);
+        let before = state.snapshot();
+
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Reassert);
+        let after = state.snapshot();
+        assert_eq!(after.snapshot, before.snapshot);
+        assert_eq!(after.search_text, before.search_text);
+        assert_eq!(after.search_filter, before.search_filter);
+        assert_eq!(after.search_status, before.search_status);
+        assert_eq!(after.search_generation, before.search_generation);
+        assert_eq!(after.panel_generation, before.panel_generation);
+        assert!(after.panel_visible);
+    }
+
+    /// 显示和重新激活失败都不能回滚 reducer 会话，也不能安排后续原生激活。
+    #[test]
+    fn 窗口显示失败保持当前会话() {
+        for already_visible in [false, true] {
+            let mut state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), test_item(1)],
+                selected_index: Some(1),
+            }));
+            if already_visible {
+                state.apply(UiEvent::OpenPanel);
+                state.search_text = "保留查询".to_owned();
+            }
+            let action = state.apply(UiEvent::OpenPanel);
+            assert_eq!(
+                action,
+                if already_visible {
+                    UiAction::Reassert
+                } else {
+                    UiAction::Show
+                }
+            );
+            let before = state.snapshot();
+            let activation_scheduled = std::cell::Cell::new(false);
+
+            let result = perform_show_action(
+                || Err::<(), _>("注入显示失败"),
+                || activation_scheduled.set(true),
+            );
+
+            assert_eq!(result, Err("注入显示失败"));
+            assert!(!activation_scheduled.get());
+            assert_eq!(state.snapshot(), before);
+        }
+    }
+
+    /// 激活被 Windows 拒绝时只消费重试预算，耗尽后返回固定记录结果。
+    #[cfg(windows)]
+    #[test]
+    fn 激活失败只重试或记录() {
+        assert_eq!(
+            activation_attempt(|| true, || false, 2),
+            ActivationAttempt::Retry
+        );
+        assert_eq!(
+            activation_attempt(|| true, || false, 0),
+            ActivationAttempt::ActivationRejected
+        );
+        assert_eq!(
+            activation_attempt(|| true, || true, 2),
+            ActivationAttempt::Done
+        );
     }
 
     /// 第一次退出后，迟到的打开和关闭事件都必须被 reducer 拒绝。

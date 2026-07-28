@@ -5,4 +5,6 @@
 
 mod lifecycle;
 
-pub(crate) use lifecycle::{center_position, cursor_work_area, move_panel, panel_size};
+pub(crate) use lifecycle::{
+    activate_panel, center_position, cursor_work_area, move_panel, panel_size,
+};

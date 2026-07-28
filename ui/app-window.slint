@@ -25,10 +25,8 @@ component ListView inherits Flickable {
 
 // AppWindow 是快捷键呼出的临时黑色看板，Rust 侧负责生命周期和事件代次。
 export component AppWindow inherits Window {
-    // Rust 侧在 UI 线程登记此回调，并用打开代次处理 Esc/失焦竞态。
+    // Rust 侧在 UI 线程登记此回调，并用打开代次确保只有当前会话的 Esc 可以隐藏。
     callback panel-dismiss-requested();
-    // 焦点丢失单独建模，后续持久面板原子会调整为只响应用户主动关闭。
-    callback panel-focus-lost-requested();
     // 上下键只发出方向请求，选择状态和边界夹紧由 Rust UI reducer 统一处理。
     callback selection-move-requested(delta: int);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
@@ -74,9 +72,6 @@ export component AppWindow inherits Window {
             }
         }
 
-        focus-lost => {
-            panel-focus-lost-requested();
-        }
 
         Rectangle {
             background: #080808;

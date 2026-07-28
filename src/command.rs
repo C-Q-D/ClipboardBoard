@@ -102,6 +102,67 @@ pub struct UiSnapshot {
     pub selected_index: Option<usize>,
 }
 
+/// 看板当前支持的基础历史筛选；图片筛选要等图片历史原子完成后再启用。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchFilter {
+    /// 不限制内容类型或收藏状态。
+    #[default]
+    All,
+    /// 只显示当前已经支持的文本记录。
+    Text,
+    /// 只显示用户收藏的记录。
+    Pinned,
+}
+
+impl SearchFilter {
+    /// 将 UI 标签索引转换为受限枚举；未知值保守回退到“全部”。
+    pub const fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Text,
+            2 => Self::Pinned,
+            _ => Self::All,
+        }
+    }
+
+    /// 返回 Slint 标签使用的稳定索引，避免 UI 直接依赖 Rust 枚举布局。
+    pub const fn as_index(self) -> i32 {
+        match self {
+            Self::All => 0,
+            Self::Text => 1,
+            Self::Pinned => 2,
+        }
+    }
+}
+
+/// 搜索结果的可观察状态；UI 必须区分加载中、空结果和错误，避免空列表造成歧义。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchStatus {
+    /// 未输入关键词且尚未触发搜索。
+    #[default]
+    Idle,
+    /// 已提交新代次，仍在等待防抖或结果应用。
+    Loading,
+    /// 当前筛选得到至少一条结果。
+    Results,
+    /// 当前筛选已经完成但没有匹配记录。
+    Empty,
+    /// 搜索代次无法分配等不可恢复状态；不展示底层错误详情。
+    Error,
+}
+
+impl SearchStatus {
+    /// 返回 Slint 使用的稳定状态标识；文案仍由 UI 负责排版。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Loading => "loading",
+            Self::Results => "results",
+            Self::Empty => "empty",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// 自动粘贴失败的安全分类；类别只表达流程阶段，不携带剪贴板正文或窗口隐私。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PasteFailureReason {
@@ -144,6 +205,12 @@ pub enum UiEvent {
     ReplaceSnapshot(UiSnapshot),
     /// 将一条已由持久化结果转换的剪贴板记录交给 UI 线程置顶显示。
     ClipboardCaptured(UiClipboardItem),
+    /// 搜索框文本变化；完整正文只作为用户主动输入的查询词进入 UI 状态。
+    SearchTextChanged(String),
+    /// 搜索筛选标签变化；未知索引在 UI 回调边界转换为“全部”。
+    SearchFilterChanged(SearchFilter),
+    /// 防抖计时器到期事件；代次不匹配时必须丢弃，不能消费新请求。
+    SearchDebounceElapsed { generation: u64 },
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
     MoveSelection { delta: i32 },
     /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。

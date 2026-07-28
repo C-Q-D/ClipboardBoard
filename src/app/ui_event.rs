@@ -6,14 +6,19 @@
 
 #[cfg(windows)]
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest, ClipboardPasteRequest};
-use crate::command::{PasteFailureReason, UiClipboardItem, UiEvent, UiSnapshot};
+use crate::command::{
+    PasteFailureReason, SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot,
+};
 use crate::history::MemoryHistory;
+use crate::search::{SearchCoordinator, SearchCoordinatorError};
+use crate::storage::HistoryQuery;
 use crate::AppWindow;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(windows)]
 use crate::platform::windows::window::{
@@ -37,6 +42,8 @@ enum UiAction {
     ScrollSelection,
     /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
     CopySelection { id: u64, content_hash: [u8; 32] },
+    /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
+    ScheduleSearch { generation: u64 },
     /// 请求后台按 ID 写回文本，完成后由当前 UI 代次执行目标复核和自动粘贴。
     RequestPaste {
         id: u64,
@@ -66,6 +73,16 @@ struct UiState {
     snapshot: UiSnapshot,
     /// 历史顺序和重复合并由独立协调器维护，UI 状态只同步其摘要快照。
     history: MemoryHistory,
+    /// UI 线程独占的防抖协调器；它只负责查询代次，不访问 SQLite 或 Slint。
+    search: SearchCoordinator,
+    /// 当前搜索框原始输入；结果匹配时使用去除首尾空白后的副本。
+    search_text: String,
+    /// 当前基础筛选标签；图片筛选在后续图片原子启用。
+    search_filter: SearchFilter,
+    /// 当前搜索结果状态，供 UI 区分加载中、空结果和错误。
+    search_status: SearchStatus,
+    /// 最近一次搜索提交代次；用于验证迟到计时器身份。
+    search_generation: Option<u64>,
     panel_visible: bool,
     /// 每次成功处理打开请求都会递增，用来隔离旧的 Esc/失焦事件。
     panel_generation: u64,
@@ -95,6 +112,11 @@ impl Default for UiState {
         Self {
             snapshot: UiSnapshot::default(),
             history: MemoryHistory::new(UI_HISTORY_MEMORY_CAPACITY),
+            search: SearchCoordinator::default(),
+            search_text: String::new(),
+            search_filter: SearchFilter::All,
+            search_status: SearchStatus::Idle,
+            search_generation: None,
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
@@ -116,6 +138,11 @@ impl Default for UiState {
 impl UiState {
     /// 在 UI 事件循环线程内应用一个事件并记录线程证据。
     fn apply(&mut self, event: UiEvent) -> UiAction {
+        self.apply_at(event, Instant::now())
+    }
+
+    /// 在指定时间点应用 UI 事件；测试可注入时间而不真实等待防抖窗口。
+    fn apply_at(&mut self, event: UiEvent, now: Instant) -> UiAction {
         self.applied_event_count += 1;
         self.applied_on_thread = Some(thread::current().id());
 
@@ -129,6 +156,7 @@ impl UiState {
                 if self.panel_visible {
                     self.panel_visible = false;
                     self.paste_notice = None;
+                    self.search.cancel();
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
@@ -141,6 +169,7 @@ impl UiState {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
                     self.paste_notice = None;
+                    self.reset_search_state();
                     #[cfg(windows)]
                     {
                         self.paste_pending = false;
@@ -157,6 +186,7 @@ impl UiState {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
                     self.paste_notice = None;
+                    self.reset_search_state();
                     #[cfg(windows)]
                     {
                         self.paste_pending = false;
@@ -170,6 +200,7 @@ impl UiState {
                 self.quitting = true;
                 self.panel_visible = false;
                 self.paste_notice = None;
+                self.search.cancel();
                 #[cfg(windows)]
                 {
                     self.panel_target = None;
@@ -182,6 +213,7 @@ impl UiState {
                 if self.panel_visible && generation == self.panel_generation {
                     self.panel_visible = false;
                     self.paste_notice = None;
+                    self.search.cancel();
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
@@ -203,8 +235,7 @@ impl UiState {
                     .map(|item| item.content_hash);
                 self.history.replace(snapshot.items.clone());
                 self.snapshot = snapshot;
-                self.snapshot.items = self.history.items().to_vec();
-                restore_selected_index(&mut self.snapshot, selected_hash);
+                self.rebuild_visible_snapshot(selected_hash);
                 UiAction::None
             }
             UiEvent::ClipboardCaptured(item) => {
@@ -217,9 +248,15 @@ impl UiState {
                     .map(|item| item.content_hash);
                 // 捕获事件已经由 SQLite 返回最终快照，不能再走本地“旧值加一”的兼容路径。
                 self.history.record_persisted(item);
-                self.snapshot.items = self.history.items().to_vec();
-                restore_selected_index(&mut self.snapshot, selected_hash);
+                self.rebuild_visible_snapshot(selected_hash);
                 UiAction::None
+            }
+            UiEvent::SearchTextChanged(text) => self.begin_search(text, self.search_filter, now),
+            UiEvent::SearchFilterChanged(filter) => {
+                self.begin_search(self.search_text.clone(), filter, now)
+            }
+            UiEvent::SearchDebounceElapsed { generation } => {
+                self.apply_search_if_current(generation, now)
             }
             UiEvent::MoveSelection { delta } => {
                 // 面板隐藏后拒绝迟到的键盘事件，避免旧事件改变下一轮打开时的选择状态。
@@ -359,6 +396,113 @@ impl UiState {
         }
     }
 
+    /// 清空当前搜索接缝并恢复完整内存历史；每次新一轮面板打开都从此状态开始。
+    fn reset_search_state(&mut self) {
+        self.search.cancel();
+        self.search_text.clear();
+        self.search_filter = SearchFilter::All;
+        self.search_status = SearchStatus::Idle;
+        self.search_generation = None;
+        self.snapshot.selected_index = None;
+        self.rebuild_visible_snapshot(None);
+    }
+
+    /// 提交一次关键词或标签变化；保留旧可见结果并等待当前代次到期，避免内容跳闪。
+    fn begin_search(&mut self, text: String, filter: SearchFilter, now: Instant) -> UiAction {
+        if !self.panel_visible {
+            return UiAction::None;
+        }
+
+        self.search_text = text;
+        self.search_filter = filter;
+        // 防抖期间保留上一批结果，让“搜索中”提示不会造成内容跳闪；当前代次完成后
+        // `apply_search_if_current` 才会以新筛选集合替换卡片。
+        self.snapshot.selected_index = None;
+        self.search_status = SearchStatus::Loading;
+
+        match self.search.submit(self.build_search_query(), now) {
+            Ok(generation) => {
+                self.search_generation = Some(generation.as_u64());
+                UiAction::ScheduleSearch {
+                    generation: generation.as_u64(),
+                }
+            }
+            Err(SearchCoordinatorError::GenerationExhausted) => {
+                // 代次耗尽是唯一可观察的协调器错误；不把内部错误对象或查询正文透传给 UI。
+                self.search_generation = None;
+                self.search_status = SearchStatus::Error;
+                UiAction::None
+            }
+        }
+    }
+
+    /// 仅应用仍属于当前搜索代次的防抖事件；旧计时器不得 poll 新请求。
+    fn apply_search_if_current(&mut self, generation: u64, now: Instant) -> UiAction {
+        if !self.panel_visible
+            || self.search.latest_generation().map(|value| value.as_u64()) != Some(generation)
+        {
+            return UiAction::None;
+        }
+
+        let Some(request) = self.search.poll(now) else {
+            return UiAction::None;
+        };
+        if request.generation.as_u64() != generation
+            || !self.search.accept_result(request.generation)
+        {
+            return UiAction::None;
+        }
+
+        self.rebuild_visible_snapshot(None);
+        self.select_first_if_needed();
+        self.search_status = if self.snapshot.items.is_empty() {
+            SearchStatus::Empty
+        } else {
+            SearchStatus::Results
+        };
+        UiAction::None
+    }
+
+    /// 将当前输入和标签转换成 ATOM-23 可接受的拥有型查询；本原子不访问存储线程。
+    fn build_search_query(&self) -> HistoryQuery {
+        let keyword = self.search_text.trim();
+        HistoryQuery {
+            keyword: (!keyword.is_empty()).then(|| keyword.to_owned()),
+            item_type: match self.search_filter {
+                SearchFilter::Text => Some("text".to_owned()),
+                SearchFilter::All | SearchFilter::Pinned => None,
+            },
+            is_pinned: match self.search_filter {
+                SearchFilter::Pinned => Some(true),
+                SearchFilter::All | SearchFilter::Text => None,
+            },
+            limit: UI_HISTORY_MEMORY_CAPACITY as u32,
+            ..HistoryQuery::default()
+        }
+    }
+
+    /// 按当前关键词和标签在有界内存历史中重建可见列表，避免改变完整缓存顺序。
+    fn rebuild_visible_snapshot(&mut self, selected_hash: Option<[u8; 32]>) {
+        let query = self.search_text.trim().to_lowercase();
+        self.snapshot.items = self
+            .history
+            .items()
+            .iter()
+            .filter(|item| {
+                if self.search_filter == SearchFilter::Pinned && !item.is_pinned {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                item.preview.to_lowercase().contains(&query)
+                    || item.source.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+        restore_selected_index(&mut self.snapshot, selected_hash);
+    }
+
     #[cfg(windows)]
     /// 记录当前选中项和打开代次；目标快照不跨 UI 状态直接暴露给后台正文读取线程。
     fn apply_paste_selection(
@@ -488,6 +632,10 @@ impl UiState {
     fn snapshot(&self) -> UiStateSnapshot {
         UiStateSnapshot {
             snapshot: self.snapshot.clone(),
+            search_text: self.search_text.clone(),
+            search_filter: self.search_filter,
+            search_status: self.search_status,
+            search_generation: self.search_generation,
             panel_visible: self.panel_visible,
             panel_generation: self.panel_generation,
             quitting: self.quitting,
@@ -513,6 +661,14 @@ thread_local! {
 pub struct UiStateSnapshot {
     /// 当前历史展示快照。
     pub snapshot: UiSnapshot,
+    /// 当前搜索框输入；只保存用户主动输入的查询词，不保存剪贴板正文。
+    pub search_text: String,
+    /// 当前搜索标签。
+    pub search_filter: SearchFilter,
+    /// 当前搜索结果状态。
+    pub search_status: SearchStatus,
+    /// 当前搜索代次；旧计时器测试使用它证明结果没有闪回。
+    pub search_generation: Option<u64>,
     /// 当前看板可见性。
     pub panel_visible: bool,
     /// 当前面板打开代次；只用于验证关闭事件是否仍属于当前实例。
@@ -564,6 +720,20 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
+    window.on_search_text_changed(|text| {
+        if let Err(error) = post_ui_event(UiEvent::SearchTextChanged(text.to_string())) {
+            eprintln!("搜索文本事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_search_filter_requested(|filter| {
+        if let Err(error) = post_ui_event(UiEvent::SearchFilterChanged(SearchFilter::from_index(
+            filter,
+        ))) {
+            eprintln!("搜索筛选事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
     window.on_paste_selection_requested(|| {
         let Some(event) = current_paste_selection_event() else {
             return;
@@ -599,11 +769,19 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 | UiEvent::PasteSucceeded { .. }
                 | UiEvent::PasteFailed { .. }
         );
-        let (action, snapshot, paste_notice) = UI_STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            let action = state.apply(event);
-            (action, state.snapshot.clone(), state.paste_notice)
-        });
+        let (action, snapshot, paste_notice, search_text, search_filter, search_status) = UI_STATE
+            .with(|state| {
+                let mut state = state.borrow_mut();
+                let action = state.apply(event);
+                (
+                    action,
+                    state.snapshot.clone(),
+                    state.paste_notice,
+                    state.search_text.clone(),
+                    state.search_filter,
+                    state.search_status,
+                )
+            });
 
         if action == UiAction::Quit {
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
@@ -611,6 +789,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 eprintln!("退出 Slint 事件循环失败：{error}");
             }
             return;
+        }
+
+        if let UiAction::ScheduleSearch { generation } = action {
+            schedule_search_debounce(generation);
         }
 
         UI_WINDOW.with(|target| {
@@ -621,6 +803,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
             // 提示属性独立于卡片模型同步；PasteFailed 等事件不重建 ListView，也必须立即可见。
             set_window_paste_notice(&window, paste_notice);
+            set_window_search_state(&window, &search_text, search_filter, search_status);
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
@@ -713,6 +896,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 }
                 UiAction::ScrollSelection => {}
                 UiAction::CopySelection { .. } => {}
+                UiAction::ScheduleSearch { .. } => {}
                 UiAction::RequestPaste { .. } => {}
                 UiAction::ShowPasteNotice(_) => {
                     // 目标执行失败后面板可能已退到原目标窗口后方；重新 show 只恢复面板可见性，
@@ -832,6 +1016,18 @@ fn set_window_paste_notice(window: &AppWindow, reason: Option<PasteFailureReason
     ));
 }
 
+/// 将搜索框、标签和结果状态同步到 Slint；状态文案不携带查询正文之外的内部错误。
+fn set_window_search_state(
+    window: &AppWindow,
+    search_text: &str,
+    search_filter: SearchFilter,
+    search_status: SearchStatus,
+) {
+    window.set_search_text(SharedString::from(search_text));
+    window.set_search_filter(search_filter.as_index());
+    window.set_search_status(SharedString::from(search_status.as_str()));
+}
+
 #[cfg(windows)]
 /// 将 Win32 目标执行错误映射为固定的用户提示类别；不透传原生错误对象。
 fn paste_failure_reason(error: PasteExecutionError) -> PasteFailureReason {
@@ -887,6 +1083,15 @@ fn ensure_selection_visible(window: &AppWindow, selected_index: Option<usize>) {
         window.get_history_viewport_height(),
     );
     window.set_history_viewport_y(target);
+}
+
+/// 为当前搜索代次安排一次 120 ms 防抖事件；计时器回调只投递事件，不直接触碰 reducer。
+fn schedule_search_debounce(generation: u64) {
+    slint::Timer::single_shot(crate::search::DEFAULT_SEARCH_DEBOUNCE, move || {
+        if let Err(error) = post_ui_event(UiEvent::SearchDebounceElapsed { generation }) {
+            eprintln!("搜索防抖事件无法进入 UI 事件队列：{error}");
+        }
+    });
 }
 
 /// 读取当前面板代次；Slint 回调在 UI 线程运行，因此不需要跨线程锁。
@@ -956,9 +1161,12 @@ mod tests {
         selection_viewport_y, visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE,
         UI_HISTORY_MEMORY_CAPACITY,
     };
-    use crate::command::{PasteFailureReason, UiClipboardItem, UiEvent, UiSnapshot};
+    use crate::command::{
+        PasteFailureReason, SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot,
+    };
     #[cfg(windows)]
     use crate::platform::windows::window::{IntegrityLevel, PanelTarget};
+    use std::time::{Duration, Instant};
 
     /// 构造具有稳定哈希的测试卡片，便于验证首批边界而不混入重复去重行为。
     fn test_item(index: usize) -> UiClipboardItem {
@@ -1188,6 +1396,138 @@ mod tests {
 
         assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
         assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 关键词必须在防抖截止后应用，并把结果状态从 loading 转为 results。
+    #[test]
+    fn 搜索关键词在防抖后只保留匹配卡片() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![
+                UiClipboardItem {
+                    preview: "Rust 代码".to_owned(),
+                    ..test_item(0)
+                },
+                UiClipboardItem {
+                    preview: "Slint 界面".to_owned(),
+                    ..test_item(1)
+                },
+            ],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+
+        assert!(matches!(
+            state.apply_at(UiEvent::SearchTextChanged("rust".to_owned()), start),
+            UiAction::ScheduleSearch { generation: 1 }
+        ));
+        assert_eq!(state.search_status, SearchStatus::Loading);
+        assert_eq!(state.snapshot.items.len(), 2);
+
+        state.apply_at(
+            UiEvent::SearchDebounceElapsed { generation: 1 },
+            start + Duration::from_millis(120),
+        );
+        assert_eq!(state.search_status, SearchStatus::Results);
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(state.snapshot.items[0].preview, "Rust 代码");
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 旧计时器到期时不能 poll 后续代次，只有最新输入的计时器可以恢复结果。
+    #[test]
+    fn 搜索旧计时器不会闪回新代次结果() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![
+                UiClipboardItem {
+                    preview: "旧关键词".to_owned(),
+                    ..test_item(0)
+                },
+                UiClipboardItem {
+                    preview: "新关键词".to_owned(),
+                    ..test_item(1)
+                },
+            ],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+
+        state.apply_at(UiEvent::SearchTextChanged("旧".to_owned()), start);
+        state.apply_at(
+            UiEvent::SearchTextChanged("新".to_owned()),
+            start + Duration::from_millis(30),
+        );
+        assert_eq!(
+            state.apply_at(
+                UiEvent::SearchDebounceElapsed { generation: 1 },
+                start + Duration::from_millis(120),
+            ),
+            UiAction::None
+        );
+        assert_eq!(state.search_status, SearchStatus::Loading);
+        assert_eq!(state.snapshot.items.len(), 2);
+
+        state.apply_at(
+            UiEvent::SearchDebounceElapsed { generation: 2 },
+            start + Duration::from_millis(150),
+        );
+        assert_eq!(state.search_status, SearchStatus::Results);
+        assert_eq!(state.snapshot.items[0].preview, "新关键词");
+    }
+
+    /// 收藏标签必须清空旧选择并只展示已收藏记录；文本标签仍保留当前文本历史语义。
+    #[test]
+    fn 收藏筛选重置选择并只保留收藏记录() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        let mut pinned = test_item(0);
+        pinned.is_pinned = true;
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![pinned, test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.apply(UiEvent::MoveSelection { delta: 1 });
+
+        assert!(matches!(
+            state.apply_at(UiEvent::SearchFilterChanged(SearchFilter::Pinned), start,),
+            UiAction::ScheduleSearch { generation: 1 }
+        ));
+        assert_eq!(state.snapshot.selected_index, None);
+        state.apply_at(
+            UiEvent::SearchDebounceElapsed { generation: 1 },
+            start + Duration::from_millis(120),
+        );
+        assert_eq!(state.search_filter, SearchFilter::Pinned);
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert!(state.snapshot.items[0].is_pinned);
+        assert_eq!(state.snapshot.selected_index, Some(0));
+        assert_eq!(state.history.items().len(), 2);
+    }
+
+    /// 面板关闭后到达的旧搜索事件不能重新显示结果或改变已取消的查询状态。
+    #[test]
+    fn 面板关闭后迟到搜索事件被丢弃() {
+        let start = Instant::now();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.apply_at(UiEvent::SearchTextChanged("条目".to_owned()), start);
+        let generation = state.panel_generation();
+        state.apply(UiEvent::HidePanel { generation });
+        let before = state.snapshot.clone();
+        state.apply_at(
+            UiEvent::SearchDebounceElapsed { generation: 1 },
+            start + Duration::from_millis(120),
+        );
+        assert_eq!(state.snapshot, before);
+        assert!(!state.panel_visible);
     }
 
     /// Ctrl+Enter 只产生当前选中项的 ID/哈希动作，不携带正文也不改变面板可见性。

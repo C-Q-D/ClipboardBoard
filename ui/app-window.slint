@@ -1,6 +1,8 @@
-// 此文件定义 ClipboardBoard 的黑色浮动看板、文本摘要卡片和面板关闭回调。
+// 此文件定义 ClipboardBoard 的黑色浮动看板、搜索筛选、文本摘要卡片和面板关闭回调。
 // 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
 // 历史内容区使用 Slint ListView 的窗口化 repeater，避免为不可见历史创建完整组件树。
+
+import { LineEdit } from "std-widgets.slint";
 
 // ClipboardCard 是 UI 卡片的最小展示 DTO，只允许摘要、来源和相对时间进入组件树。
 export struct ClipboardCard {
@@ -33,6 +35,10 @@ export component AppWindow inherits Window {
     callback copy-selection-requested();
     // 普通 Enter 只发出按当前选中项自动粘贴的请求，正文由后台按 ID 从存储读取。
     callback paste-selection-requested();
+    // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
+    callback search-text-changed(text: string);
+    // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
+    callback search-filter-requested(filter: int);
     forward-focus: panel-focus;
 
     title: "ClipboardBoard";
@@ -44,6 +50,10 @@ export component AppWindow inherits Window {
     // 自动粘贴失败时只显示 Rust 侧选择的固定安全文案，不显示正文或原生错误详情。
     in property <bool> paste-notice-visible: false;
     in property <string> paste-notice-text: "";
+    // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
+    in-out property <string> search-text: "";
+    in-out property <int> search-filter: 0;
+    in property <string> search-status: "idle";
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -102,6 +112,70 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 1px;
                     background: #2a2a2a;
+                }
+
+                // LineEdit 使用标准文本输入控件；防抖和结果代次由 Rust reducer 统一管理。
+                search-input := LineEdit {
+                    height: 38px;
+                    placeholder-text: "搜索剪贴内容…";
+                    text: search-text;
+                    edited(text) => {
+                        search-text-changed(text);
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 64px;
+                        border-radius: 6px;
+                        background: search-filter == 0 ? #f5f5f5 : #141414;
+                        TouchArea {
+                            clicked => { search-filter-requested(0); }
+                        }
+                        Text {
+                            text: "全部";
+                            color: search-filter == 0 ? #080808 : #8c8c8c;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 64px;
+                        border-radius: 6px;
+                        background: search-filter == 1 ? #f5f5f5 : #141414;
+                        TouchArea {
+                            clicked => { search-filter-requested(1); }
+                        }
+                        Text {
+                            text: "文本";
+                            color: search-filter == 1 ? #080808 : #8c8c8c;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 64px;
+                        border-radius: 6px;
+                        background: search-filter == 2 ? #f5f5f5 : #141414;
+                        TouchArea {
+                            clicked => { search-filter-requested(2); }
+                        }
+                        Text {
+                            text: "收藏";
+                            color: search-filter == 2 ? #080808 : #8c8c8c;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
                 }
 
                 Text {
@@ -167,9 +241,30 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if cards.length == 0: Text {
+                if search-status == "loading": Text {
+                    text: "搜索中…";
+                    color: #8c8c8c;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                if cards.length == 0 && search-status == "idle": Text {
                     text: "复制一段文本，最新内容会出现在这里";
                     color: #666666;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                if cards.length == 0 && search-status == "empty": Text {
+                    text: "没有匹配的剪贴内容";
+                    color: #666666;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                if search-status == "error": Text {
+                    text: "搜索暂不可用，请稍后重试";
+                    color: #d99b6c;
                     font-size: 13px;
                     horizontal-alignment: center;
                 }

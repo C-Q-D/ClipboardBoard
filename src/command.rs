@@ -188,6 +188,17 @@ pub enum UiEvent {
     SearchDebounceElapsed { generation: u64 },
     /// SQLite 查询 worker 的无正文唤醒；UI 从绑定的 latest 结果槽提取真实结果。
     HistoryQueryWake,
+    /// 历史列表真实视口几何变化；reducer 只在进入底部阈值的边沿请求续页。
+    HistoryViewportChanged {
+        /// Flickable 的负向纵向视口坐标。
+        viewport_y: i32,
+        /// 当前可见区域高度。
+        visible_height: i32,
+        /// 全部已加载卡片对应的内容高度。
+        content_height: i32,
+    },
+    /// 用户点击固定失败提示后显式重试当前游标。
+    RetryHistoryPage,
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
     MoveSelection { delta: i32 },
     /// 请求选中一次点击时解析出的稳定记录身份；异步应用时必须重新校验面板代次和内容身份。

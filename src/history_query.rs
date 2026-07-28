@@ -14,8 +14,12 @@ use crate::{
     storage::{HistoryCursor, HistoryPage, HistoryQuery, HistorySummary, StorageClient},
 };
 
-/// SQLite 首页固定请求数量；滚动续页在 WCB-INT-10 使用 50 条。
+/// SQLite 首页固定请求数量。
 pub const FIRST_PAGE_LIMIT: u32 = 30;
+/// 滚动续页的标准批量。
+pub const NEXT_PAGE_LIMIT: u32 = 50;
+/// 单个 UI 数据集允许保留的最大摘要数，防止无限滚动持续增长内存。
+pub const MAX_LOADED_ITEMS: usize = 2_000;
 
 /// 数据集代次；搜索、捕获、隐藏或重新打开都会使旧代次失效。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +94,10 @@ pub enum HistoryPageCoordinatorError {
     TokenExhausted,
     /// 尚未建立活动数据集。
     NoActiveDataset,
+    /// 当前数据集已有一个尚未结束的请求，禁止覆盖其身份。
+    RequestAlreadyActive,
+    /// 当前数据集已经到达内存上限或没有下一页游标。
+    DatasetExhausted,
 }
 
 /// 当前唯一活动请求的三元身份。
@@ -157,6 +165,9 @@ impl HistoryPageCoordinator {
         let generation = self
             .current_generation
             .ok_or(HistoryPageCoordinatorError::NoActiveDataset)?;
+        if self.active.is_some() {
+            return Err(HistoryPageCoordinatorError::RequestAlreadyActive);
+        }
         let next = self
             .next_token
             .checked_add(1)
@@ -177,15 +188,52 @@ impl HistoryPageCoordinator {
         })
     }
 
-    /// 接受当前可见数据集的一次首页响应；成功和失败都会消费活动 token。
-    pub fn accept_first_page(&mut self, visible: bool, result: &HistoryPageResult) -> bool {
+    /// 为当前数据集分配滚动续页请求；同一数据集只允许一个活动 token。
+    pub fn request_next_page(
+        &mut self,
+        mut query: HistoryQuery,
+        cursor: Option<HistoryCursor>,
+        loaded_count: usize,
+    ) -> Result<HistoryPageRequest, HistoryPageCoordinatorError> {
+        let generation = self
+            .current_generation
+            .ok_or(HistoryPageCoordinatorError::NoActiveDataset)?;
+        if self.active.is_some() {
+            return Err(HistoryPageCoordinatorError::RequestAlreadyActive);
+        }
+        let cursor = cursor.ok_or(HistoryPageCoordinatorError::DatasetExhausted)?;
+        let remaining = MAX_LOADED_ITEMS.saturating_sub(loaded_count);
+        if remaining == 0 {
+            return Err(HistoryPageCoordinatorError::DatasetExhausted);
+        }
+        let next = self
+            .next_token
+            .checked_add(1)
+            .ok_or(HistoryPageCoordinatorError::TokenExhausted)?;
+        let token = HistoryRequestToken(next);
+        query.cursor = Some(cursor);
+        query.limit = NEXT_PAGE_LIMIT.min(u32::try_from(remaining).unwrap_or(u32::MAX));
+        self.next_token = next;
+        self.active = Some(ActiveRequest {
+            generation,
+            token,
+            requested_cursor: Some(cursor),
+        });
+        Ok(HistoryPageRequest {
+            generation,
+            token,
+            query,
+        })
+    }
+
+    /// 接受当前可见数据集的一次精确身份响应；成功和失败都会消费活动 token。
+    pub fn accept_page(&mut self, visible: bool, result: &HistoryPageResult) -> bool {
         let identity = ActiveRequest {
             generation: result.generation,
             token: result.token,
             requested_cursor: result.requested_cursor,
         };
         if visible
-            && result.requested_cursor.is_none()
             && self.current_generation == Some(result.generation)
             && self.active == Some(identity)
         {
@@ -194,6 +242,29 @@ impl HistoryPageCoordinator {
         } else {
             false
         }
+    }
+
+    /// 当请求无法提交到 worker 时，按原三元身份消费活动 token。
+    pub fn fail_submission(&mut self, visible: bool, request: &HistoryPageRequest) -> bool {
+        let identity = ActiveRequest {
+            generation: request.generation,
+            token: request.token,
+            requested_cursor: request.query.cursor,
+        };
+        if visible
+            && self.current_generation == Some(request.generation)
+            && self.active == Some(identity)
+        {
+            self.active = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 返回是否存在尚未结束的请求，供底部边沿状态机抑制重复派发。
+    pub const fn has_active_request(&self) -> bool {
+        self.active.is_some()
     }
 
     /// 返回当前数据集 generation，供确定性测试和捕获刷新门禁使用。
@@ -595,16 +666,70 @@ mod tests {
             .expect("创建首页请求失败");
         let mut wrong = empty_result(&request);
         wrong.token = HistoryRequestToken(request.token.as_u64() + 1);
-        assert!(!coordinator.accept_first_page(true, &wrong));
+        assert!(!coordinator.accept_page(true, &wrong));
         wrong = empty_result(&request);
         wrong.requested_cursor = Some(HistoryCursor {
             copied_at: 1,
             id: 1,
         });
-        assert!(!coordinator.accept_first_page(true, &wrong));
+        assert!(!coordinator.accept_page(true, &wrong));
         let result = empty_result(&request);
-        assert!(coordinator.accept_first_page(true, &result));
-        assert!(!coordinator.accept_first_page(true, &result));
+        assert!(coordinator.accept_page(true, &result));
+        assert!(!coordinator.accept_page(true, &result));
+    }
+
+    /// 续页批量必须按 2,000 上限收缩，并拒绝覆盖同代次活动请求。
+    #[test]
+    fn 续页请求遵守单活动身份和容量边界() {
+        let cursor = HistoryCursor {
+            copied_at: 42,
+            id: 7,
+        };
+        for (loaded, expected) in [(1_950, 50), (1_980, 20), (1_999, 1)] {
+            let mut coordinator = HistoryPageCoordinator::default();
+            coordinator.begin_dataset().unwrap();
+            let request = coordinator
+                .request_next_page(query("page"), Some(cursor), loaded)
+                .unwrap();
+            assert_eq!(request.query.cursor, Some(cursor));
+            assert_eq!(request.query.limit, expected);
+            assert_eq!(
+                coordinator.request_next_page(query("duplicate"), Some(cursor), loaded),
+                Err(HistoryPageCoordinatorError::RequestAlreadyActive)
+            );
+        }
+
+        for loaded in [2_000, 2_001] {
+            let mut coordinator = HistoryPageCoordinator::default();
+            coordinator.begin_dataset().unwrap();
+            assert_eq!(
+                coordinator.request_next_page(query("full"), Some(cursor), loaded),
+                Err(HistoryPageCoordinatorError::DatasetExhausted)
+            );
+        }
+    }
+
+    /// 续页结果和提交失败都必须精确匹配 generation、token 与 requested_cursor。
+    #[test]
+    fn 续页身份严格匹配且提交失败释放活动请求() {
+        let cursor = HistoryCursor {
+            copied_at: 100,
+            id: 10,
+        };
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().unwrap();
+        let request = coordinator
+            .request_next_page(query("page"), Some(cursor), 30)
+            .unwrap();
+        let mut wrong = empty_result(&request);
+        wrong.requested_cursor = Some(HistoryCursor {
+            copied_at: 99,
+            id: 9,
+        });
+        assert!(!coordinator.accept_page(true, &wrong));
+        assert!(coordinator.fail_submission(true, &request));
+        assert!(!coordinator.fail_submission(true, &request));
+        assert!(!coordinator.has_active_request());
     }
 
     /// worker 取槽前连续提交只保留最后一个请求。
@@ -614,7 +739,9 @@ mod tests {
         let mut coordinator = HistoryPageCoordinator::default();
         coordinator.begin_dataset().expect("建立数据集失败");
         let first = coordinator.request_first_page(query("a")).unwrap();
+        coordinator.begin_dataset().expect("推进数据集失败");
         let second = coordinator.request_first_page(query("ab")).unwrap();
+        coordinator.begin_dataset().expect("推进数据集失败");
         let third = coordinator.request_first_page(query("abc")).unwrap();
         sender.submit(first).unwrap();
         sender.submit(second).unwrap();
@@ -658,9 +785,11 @@ mod tests {
             .submit(coordinator.request_first_page(query("q1")).unwrap())
             .unwrap();
         assert_eq!(executed_receiver.recv().unwrap(), "q1");
+        coordinator.begin_dataset().unwrap();
         sender
             .submit(coordinator.request_first_page(query("q2")).unwrap())
             .unwrap();
+        coordinator.begin_dataset().unwrap();
         sender
             .submit(coordinator.request_first_page(query("q3")).unwrap())
             .unwrap();
@@ -678,6 +807,7 @@ mod tests {
         let mut coordinator = HistoryPageCoordinator::default();
         coordinator.begin_dataset().unwrap();
         let first = coordinator.request_first_page(query("a")).unwrap();
+        coordinator.begin_dataset().unwrap();
         let second = coordinator.request_first_page(query("b")).unwrap();
         assert_eq!(sender.publish(empty_result(&first)), PublishOutcome::Wake);
         assert_eq!(

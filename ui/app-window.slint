@@ -1,12 +1,27 @@
 // 此文件定义 ClipboardBoard 的黑色浮动看板、文本摘要卡片和面板关闭回调。
 // 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
+// 历史内容区使用 Slint ListView 的窗口化 repeater，避免为不可见历史创建完整组件树。
 
+// ClipboardCard 是 UI 卡片的最小展示 DTO，只允许摘要、来源和相对时间进入组件树。
 export struct ClipboardCard {
+    // 已按领域规则截断的预览文本，不是完整剪贴板正文。
     preview: string,
+    // 来源程序的安全展示名称；缺失时由 Rust 侧提供稳定回退文案。
     source: string,
+    // 由应用状态层格式化的相对时间文本。
     relative_time: string,
 }
 
+// ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
+// visible-* 属性是编译器进行固定高度布局和虚拟化所需的契约，不能删除或改名。
+component ListView inherits Flickable {
+    // 编译器用这两个输出属性计算视口尺寸和重复器可见范围。
+    out property <length> visible-width <=> self.width;
+    out property <length> visible-height <=> self.height;
+    @children
+}
+
+// AppWindow 是快捷键呼出的临时黑色看板，Rust 侧负责生命周期和事件代次。
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次处理 Esc/失焦竞态。
     callback panel-dismiss-requested();
@@ -16,7 +31,14 @@ export component AppWindow inherits Window {
     width: 560px;
     height: 640px;
     background: #080808;
+    // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
+    // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
+    in-out property <length> history-viewport-y <=> history-list.viewport-y;
+    // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
+    out property <int> history-model-length: cards.length;
+    out property <length> history-visible-height: history-list.visible-height;
+    out property <length> history-viewport-height: history-list.viewport-height;
 
     panel-focus := FocusScope {
         // Esc 和失去焦点都只发出请求，是否真的隐藏由 Rust reducer 的代次判断决定。
@@ -67,43 +89,51 @@ export component AppWindow inherits Window {
                     font-size: 14px;
                 }
 
-                VerticalLayout {
+                // ListView 由 Slint 负责滚动和窗口化，Rust 侧只提供 ModelRc 数据。
+                // 固定卡片高度让大列表无需测量每个正文的真实高度。
+                history-list := ListView {
                     vertical-stretch: 1;
-                    spacing: 10px;
 
                     for card in cards: Rectangle {
-                        height: 96px;
-                        background: #141414;
-                        border-radius: 10px;
+                        // 106px delegate = 96px 卡片 + 10px 透明间隔，保持原有视觉密度。
+                        height: 106px;
+                        background: transparent;
 
-                        VerticalLayout {
-                            padding: 14px;
-                            spacing: 8px;
+                        Rectangle {
+                            height: 96px;
+                            width: parent.width;
+                            background: #141414;
+                            border-radius: 10px;
 
-                            Text {
-                                text: card.preview;
-                                color: #f5f5f5;
-                                font-size: 14px;
-                                wrap: word-wrap;
-                                overflow: elide;
-                                vertical-stretch: 1;
-                            }
-
-                            HorizontalLayout {
+                            VerticalLayout {
+                                padding: 14px;
                                 spacing: 8px;
 
                                 Text {
-                                    text: card.source;
-                                    color: #8c8c8c;
-                                    font-size: 11px;
+                                    text: card.preview;
+                                    color: #f5f5f5;
+                                    font-size: 14px;
+                                    wrap: word-wrap;
+                                    overflow: elide;
+                                    vertical-stretch: 1;
                                 }
 
-                                Text {
-                                    text: card.relative_time;
-                                    color: #666666;
-                                    font-size: 11px;
-                                    horizontal-alignment: right;
-                                    horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: card.source;
+                                        color: #8c8c8c;
+                                        font-size: 11px;
+                                    }
+
+                                    Text {
+                                        text: card.relative_time;
+                                        color: #666666;
+                                        font-size: 11px;
+                                        horizontal-alignment: right;
+                                        horizontal-stretch: 1;
+                                    }
                                 }
                             }
                         }

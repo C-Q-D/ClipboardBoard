@@ -34,6 +34,7 @@ fn 核心源码包含中文文件级职责说明() {
         "src/domain/clipboard_item.rs",
         "src/domain/hash.rs",
         "src/history.rs",
+        "tests/list_performance.rs",
         "src/clipboard/mod.rs",
         "src/clipboard/io_worker.rs",
         "src/clipboard/reader.rs",

@@ -21,6 +21,7 @@ $requiredFiles = @(
     'src/domain/clipboard_item.rs',
     'src/domain/hash.rs',
     'src/history.rs',
+    'tests/list_performance.rs',
     'src/clipboard/mod.rs',
     'src/clipboard/io_worker.rs',
     'src/clipboard/reader.rs',

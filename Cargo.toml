@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 blake3 = "1.8.2"
 slint = "1.16.0"
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
 
 [build-dependencies]
 slint-build = "1.16.0"

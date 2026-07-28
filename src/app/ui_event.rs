@@ -29,6 +29,8 @@ enum UiAction {
     Hide,
     /// 该事件只改变数据或已经过期，不触发窗口副作用。
     None,
+    /// 退出 Slint 事件循环；只允许第一次 Quit 事件触发。
+    Quit,
 }
 
 /// UI 线程独占的内部状态，外部线程不能直接取得其实例或引用。
@@ -38,6 +40,8 @@ struct UiState {
     panel_visible: bool,
     /// 每次成功处理打开请求都会递增，用来隔离旧的 Esc/失焦事件。
     panel_generation: u64,
+    /// 退出请求的一次性闩锁；置位后拒绝所有后续 UI 事件。
+    quitting: bool,
     #[cfg(windows)]
     /// 仅在 UI 线程持有的目标身份；后续粘贴前必须重新查询并比较。
     panel_target: Option<PanelTarget>,
@@ -50,6 +54,11 @@ impl UiState {
     fn apply(&mut self, event: UiEvent) -> UiAction {
         self.applied_event_count += 1;
         self.applied_on_thread = Some(thread::current().id());
+
+        // 退出后不再允许旧热键、托盘或后台结果改变 UI 状态，避免清理阶段重新打开窗口。
+        if self.quitting {
+            return UiAction::None;
+        }
 
         match event {
             UiEvent::OpenPanel => {
@@ -66,6 +75,24 @@ impl UiState {
                     self.panel_visible = true;
                     UiAction::Show
                 }
+            }
+            UiEvent::ShowPanel => {
+                if self.panel_visible {
+                    UiAction::None
+                } else {
+                    self.panel_generation = self.panel_generation.saturating_add(1).max(1);
+                    self.panel_visible = true;
+                    UiAction::Show
+                }
+            }
+            UiEvent::Quit => {
+                self.quitting = true;
+                self.panel_visible = false;
+                #[cfg(windows)]
+                {
+                    self.panel_target = None;
+                }
+                UiAction::Quit
             }
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
@@ -115,6 +142,7 @@ impl UiState {
             snapshot: self.snapshot.clone(),
             panel_visible: self.panel_visible,
             panel_generation: self.panel_generation,
+            quitting: self.quitting,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -137,6 +165,8 @@ pub struct UiStateSnapshot {
     pub panel_visible: bool,
     /// 当前面板打开代次；只用于验证关闭事件是否仍属于当前实例。
     pub panel_generation: u64,
+    /// 是否已经接受退出请求；用于验证退出闩锁拒绝迟到事件。
+    pub quitting: bool,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
@@ -164,6 +194,14 @@ pub fn bind_app_window(window: &AppWindow) {
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
         let action = UI_STATE.with(|state| state.borrow_mut().apply(event));
+
+        if action == UiAction::Quit {
+            // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
+            if let Err(error) = slint::quit_event_loop() {
+                eprintln!("退出 Slint 事件循环失败：{error}");
+            }
+            return;
+        }
 
         UI_WINDOW.with(|target| {
             let weak_window = target.borrow().clone();
@@ -193,6 +231,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     }
                 }
                 UiAction::None => {}
+                // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
+                UiAction::Quit => unreachable!("退出动作必须在窗口副作用前处理"),
             }
         });
     })
@@ -293,6 +333,35 @@ mod tests {
                 generation: second_generation,
             }),
             UiAction::Hide
+        );
+        assert!(!state.panel_visible);
+    }
+
+    /// 托盘打开必须是幂等显示，不能像热键一样把已显示面板再次隐藏。
+    #[test]
+    fn 托盘打开幂等显示面板() {
+        let mut state = UiState::default();
+
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::Show);
+        let generation = state.panel_generation();
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::None);
+        assert!(state.panel_visible);
+        assert_eq!(state.panel_generation(), generation);
+    }
+
+    /// 第一次退出后，迟到的打开和关闭事件都必须被 reducer 拒绝。
+    #[test]
+    fn 退出闩锁拒绝后续事件() {
+        let mut state = UiState::default();
+
+        assert_eq!(state.apply(UiEvent::Quit), UiAction::Quit);
+        assert!(state.quitting);
+        assert!(!state.panel_visible);
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::None);
+        assert_eq!(state.apply(UiEvent::Quit), UiAction::None);
+        assert_eq!(
+            state.apply(UiEvent::HidePanel { generation: 1 }),
+            UiAction::None
         );
         assert!(!state.panel_visible);
     }

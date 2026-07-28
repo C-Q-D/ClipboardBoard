@@ -1,9 +1,10 @@
-//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键及单实例唤起消息。
+//! 此模块创建 message-only HWND，并在其所属线程注册和处理 Alt+V 热键、单实例唤起及托盘消息。
 //!
-//! Win32 回调只负责把匹配的 WM_HOTKEY 转成 `UiEvent::OpenPanel` 并排入 UI 事件队列；
-//! 它不会直接访问 Slint 对象、剪贴板或其他业务状态。
+//! Win32 回调只负责把匹配的消息转成 UI 事件并排入 UI 事件队列；它不会直接访问
+//! Slint 对象、剪贴板或其他业务状态。
 
 use super::hotkey::{HotkeyError, HotkeySpec};
+use super::tray::{handle_callback, TrayGuard, TRAY_CALLBACK_MESSAGE};
 use crate::app::post_ui_event;
 use crate::command::UiEvent;
 use std::ptr::{null, null_mut};
@@ -98,7 +99,23 @@ pub(crate) fn run(
         return Err(error);
     }
 
+    // 托盘图标必须绑定到同一个 message-only HWND，确保回调和热键共享消息线程。
+    let mut tray = match TrayGuard::create(window) {
+        Ok(tray) => tray,
+        Err(error) => {
+            unsafe {
+                let _ = UnregisterHotKey(window, hotkey.id);
+                let _ = DestroyWindow(window);
+            }
+            let _ = ready_sender.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+
     if ready_sender.send(Ok(thread_id)).is_err() {
+        let _ = tray.remove();
+        // 若第一次 NIM_DELETE 失败，Drop 会在 DestroyWindow 前再尝试一次。
+        drop(tray);
         unsafe {
             let _ = UnregisterHotKey(window, hotkey.id);
             let _ = DestroyWindow(window);
@@ -107,11 +124,15 @@ pub(crate) fn run(
     }
 
     let message_loop_result = message_loop();
+    // NIM_DELETE 必须发生在 DestroyWindow 之前；即使删除失败也继续注销热键和销毁窗口。
+    let tray_result = tray.remove();
+    // Drop 的兜底重试仍发生在 DestroyWindow 前，避免把通知数据绑定到已销毁 HWND。
+    drop(tray);
     unsafe {
         let _ = UnregisterHotKey(window, hotkey.id);
         let _ = DestroyWindow(window);
     }
-    message_loop_result
+    message_loop_result.and(tray_result)
 }
 
 /// 注册窗口类；类已存在时复用它，避免重复启动测试造成无意义失败。
@@ -143,6 +164,10 @@ unsafe extern "system" fn window_proc(
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
+    if is_tray_callback_message(message) && handle_callback(window, wparam, lparam) {
+        return 0;
+    }
+
     if is_open_panel_message(message) || is_default_hotkey_message(message, wparam) {
         if let Err(error) = post_ui_event(UiEvent::OpenPanel) {
             eprintln!("打开面板事件无法进入 UI 事件队列：{error}");
@@ -151,6 +176,11 @@ unsafe extern "system" fn window_proc(
     }
 
     DefWindowProcW(window, message, wparam, lparam)
+}
+
+/// 只接受固定托盘回调编号，避免把任意 WM_APP 消息当作 Shell 通知。
+fn is_tray_callback_message(message: u32) -> bool {
+    message == TRAY_CALLBACK_MESSAGE
 }
 
 /// 将 RegisterHotKey 的错误码转换为不会被静默吞掉的领域错误。
@@ -201,9 +231,10 @@ fn message_loop() -> Result<(), HotkeyError> {
 mod tests {
     //! 此测试模块验证热键 ID 过滤和冲突错误映射，不依赖桌面上的其他热键占用者。
 
+    use super::TRAY_CALLBACK_MESSAGE;
     use super::{
         classify_registration_error, is_default_hotkey_message, is_open_panel_message,
-        OPEN_PANEL_MESSAGE,
+        is_tray_callback_message, OPEN_PANEL_MESSAGE,
     };
     use crate::platform::windows::hotkey::HotkeyError;
     use windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED;
@@ -222,6 +253,13 @@ mod tests {
     fn 只接受固定打开消息() {
         assert!(is_open_panel_message(OPEN_PANEL_MESSAGE));
         assert!(!is_open_panel_message(OPEN_PANEL_MESSAGE + 1));
+    }
+
+    /// 只有固定托盘回调消息才进入托盘处理器。
+    #[test]
+    fn 只接受固定托盘消息() {
+        assert!(is_tray_callback_message(TRAY_CALLBACK_MESSAGE));
+        assert!(!is_tray_callback_message(TRAY_CALLBACK_MESSAGE + 1));
     }
 
     /// Win32 的热键占用错误必须转换成带快捷键名称的明确错误。

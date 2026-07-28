@@ -42,6 +42,8 @@ pub enum HotkeyError {
     StartupChannelClosed,
     /// 热键线程异常退出。
     ThreadPanicked,
+    /// 托盘注册、菜单或托盘到 UI 的事件投递失败。
+    Tray(String),
 }
 
 impl Display for HotkeyError {
@@ -57,6 +59,7 @@ impl Display for HotkeyError {
             }
             Self::StartupChannelClosed => write!(formatter, "全局热键线程未返回启动结果"),
             Self::ThreadPanicked => write!(formatter, "全局热键线程异常退出"),
+            Self::Tray(error) => write!(formatter, "系统托盘操作失败：{error}"),
         }
     }
 }

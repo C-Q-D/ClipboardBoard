@@ -23,6 +23,7 @@ $requiredFiles = @(
     'src/platform/windows/mod.rs',
     'src/platform/windows/hotkey.rs',
     'src/platform/windows/system_window.rs',
+    'src/platform/windows/tray.rs',
     'src/platform/windows/single_instance.rs',
     'src/platform/windows/window/mod.rs',
     'src/platform/windows/window/lifecycle.rs'

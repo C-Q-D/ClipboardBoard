@@ -18,7 +18,11 @@ $requiredFiles = @(
     'src/command.rs',
     'src/app/mod.rs',
     'src/app/ui_event.rs',
-    'tests/ui_event.rs'
+    'tests/ui_event.rs',
+    'src/platform/mod.rs',
+    'src/platform/windows/mod.rs',
+    'src/platform/windows/hotkey.rs',
+    'src/platform/windows/system_window.rs'
 )
 
 foreach ($relativePath in $requiredFiles) {

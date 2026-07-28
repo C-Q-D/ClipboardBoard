@@ -795,6 +795,7 @@ dependencies = [
  "i-slint-backend-testing",
  "slint",
  "slint-build",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

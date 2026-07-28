@@ -2,4 +2,4 @@
 
 mod ui_event;
 
-pub use ui_event::{post_ui_event, ui_state_snapshot, UiStateSnapshot};
+pub use ui_event::{bind_app_window, post_ui_event, ui_state_snapshot, UiStateSnapshot};

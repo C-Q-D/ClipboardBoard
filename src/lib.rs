@@ -8,6 +8,10 @@ slint::include_modules!();
 pub mod app;
 pub mod command;
 
+// Windows 平台模块只在目标平台编译，避免把原生 API 泄漏到业务层公共接口。
+#[cfg(windows)]
+pub mod platform;
+
 /// 创建主窗口实例。
 ///
 /// 调用方负责启动 Slint 事件循环；创建失败时返回平台初始化错误，不在此处吞掉错误。

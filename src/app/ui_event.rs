@@ -5,6 +5,8 @@
 //! 时，Slint 属性和模型更新也必须继续放在这个闭包内。
 
 use crate::command::{UiEvent, UiSnapshot};
+use crate::AppWindow;
+use slint::ComponentHandle;
 use std::cell::RefCell;
 use std::thread::{self, ThreadId};
 
@@ -24,6 +26,7 @@ impl UiState {
         self.applied_on_thread = Some(thread::current().id());
 
         match event {
+            UiEvent::OpenPanel => self.panel_visible = true,
             UiEvent::ReplaceSnapshot(snapshot) => self.snapshot = snapshot,
             UiEvent::SetPanelVisible(visible) => self.panel_visible = visible,
         }
@@ -43,6 +46,8 @@ impl UiState {
 thread_local! {
     /// 每个线程各自持有状态；只有运行 Slint 事件循环的线程会收到后台提交的事件。
     static UI_STATE: RefCell<UiState> = RefCell::new(UiState::default());
+    /// UI 线程持有的弱窗口引用，避免事件入口形成窗口强引用环。
+    static UI_WINDOW: RefCell<Option<slint::Weak<AppWindow>>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -58,13 +63,32 @@ pub struct UiStateSnapshot {
     pub applied_on_thread: Option<ThreadId>,
 }
 
+/// 在 UI 线程登记主窗口弱引用，后续 `OpenPanel` 事件只在 UI 闭包内升级它。
+pub fn bind_app_window(window: &AppWindow) {
+    UI_WINDOW.with(|target| {
+        *target.borrow_mut() = Some(window.as_weak());
+    });
+}
+
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
 ///
 /// 该函数只接受拥有型 `UiEvent`，不会同步执行 reducer。返回 `Ok(())` 只代表事件
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
+        let should_open_panel = matches!(&event, UiEvent::OpenPanel);
         UI_STATE.with(|state| state.borrow_mut().apply(event));
+
+        if should_open_panel {
+            UI_WINDOW.with(|target| {
+                let weak_window = target.borrow().clone();
+                if let Some(window) = weak_window.and_then(|weak| weak.upgrade()) {
+                    if let Err(error) = window.show() {
+                        eprintln!("无法显示剪贴板看板：{error}");
+                    }
+                }
+            });
+        }
     })
 }
 

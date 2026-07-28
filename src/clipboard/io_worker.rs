@@ -4,7 +4,8 @@
 //! 读取 API 的线程。队列在锁内替换尚未开始的旧请求，快速复制时不会阻塞消息泵或无界
 //! 堆积；请求响应通过拥有型 DTO 返回，后续业务层可以继续在 UI 线程外处理正文。
 
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -20,8 +21,6 @@ use crate::platform::windows::ProcessSource;
 pub enum ClipboardWorkerError {
     /// worker 线程无法创建。
     ThreadStart,
-    /// 保留给旧调用方的队列错误；latest-wins 队列不会返回该分支。
-    QueueFull,
     /// worker 已停止或响应通道已断开。
     Disconnected,
     /// worker 线程退出时发生 panic；调用方只能重新创建 worker。
@@ -88,30 +87,128 @@ pub enum ClipboardWorkItem {
 pub struct ClipboardCaptureInbox {
     /// 结果状态由共享互斥锁保护，以便 worker 和消费者跨线程安全交接拥有型数据。
     state: Arc<Mutex<CaptureInboxState>>,
-    /// 新结果或关闭动作唤醒阻塞消费者。
-    wake: Arc<Condvar>,
+    /// 复制请求使用独立锁自由槽，避免 UI 等待捕获结果的互斥临界区。
+    copy_slot: Arc<CopyRequestSlot>,
+    /// 容量一唤醒令牌发送端；满槽代表消费者已经有一次待处理唤醒。
+    wake_sender: SyncSender<()>,
+    /// 唯一消费者通过共享接收端阻塞等待，克隆 inbox 不会复制令牌队列。
+    wake_receiver: Arc<Mutex<Receiver<()>>>,
 }
 
 /// 捕获结果桥的内部状态。
 struct CaptureInboxState {
     /// 尚未消费的唯一最新结果；成功和 sequence 失配错误都占用同一槽位。
     pending: Option<Result<ClipboardCaptureResult, ClipboardReadError>>,
-    /// 尚未处理的最新仅复制请求；快速重复按键只保留最后一次选择。
-    pending_copy: Option<ClipboardCopyRequest>,
     /// 关闭闩锁；worker 停止后消费者不再等待。
     closed: bool,
+}
+
+/// 容量一的锁自由复制请求槽；关闭哨兵把发布、取出和关闭线性化在同一原子指针上。
+struct CopyRequestSlot {
+    /// 空指针表示无请求，悬空哨兵表示永久关闭，其余指针独占一个堆分配请求。
+    pointer: AtomicPtr<ClipboardCopyRequest>,
+}
+
+impl CopyRequestSlot {
+    /// 创建开放且为空的复制槽。
+    fn new() -> Self {
+        Self {
+            pointer: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// 返回地址为 1 的失配指针作为关闭哨兵；真实 Box 指针满足类型对齐，不会与其相等。
+    fn closed_pointer() -> *mut ClipboardCopyRequest {
+        std::ptr::without_provenance_mut(1)
+    }
+
+    /// 锁自由发布最新请求；成功 CAS 后调用方取得旧指针的唯一释放权。
+    fn publish(&self, request: ClipboardCopyRequest) -> Result<(), ClipboardWorkerError> {
+        let next = Box::into_raw(Box::new(request));
+        loop {
+            let current = self.pointer.load(Ordering::Acquire);
+            if current == Self::closed_pointer() {
+                // SAFETY: `next` 尚未进入原子槽，仍由当前调用独占。
+                unsafe { drop(Box::from_raw(next)) };
+                return Err(ClipboardWorkerError::Disconnected);
+            }
+            match self.pointer.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => {
+                    if !previous.is_null() {
+                        // SAFETY: CAS 已把 previous 移出槽，且关闭哨兵在上方被排除。
+                        unsafe { drop(Box::from_raw(previous)) };
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    // 其他发布、取出或关闭赢得本轮；重读状态，不等待任何互斥锁。
+                }
+            }
+        }
+    }
+
+    /// 锁自由取出当前请求；关闭或空槽都返回 `None`。
+    fn take(&self) -> Option<ClipboardCopyRequest> {
+        loop {
+            let current = self.pointer.load(Ordering::Acquire);
+            if current.is_null() || current == Self::closed_pointer() {
+                return None;
+            }
+            match self.pointer.compare_exchange_weak(
+                current,
+                std::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => {
+                    // SAFETY: CAS 已把 previous 从槽中唯一取出，且它不是空或关闭哨兵。
+                    return Some(unsafe { *Box::from_raw(previous) });
+                }
+                Err(_) => {
+                    // 与发布或关闭竞争失败时只重试原子操作，不阻塞生产者或消费者。
+                }
+            }
+        }
+    }
+
+    /// 永久关闭复制槽并丢弃尚未取出的请求；关闭前已取出的请求仍由消费者独占完成。
+    fn close(&self) {
+        let previous = self.pointer.swap(Self::closed_pointer(), Ordering::AcqRel);
+        if !previous.is_null() && previous != Self::closed_pointer() {
+            // SAFETY: swap 已把 previous 唯一移出槽，消费者不再能取得它。
+            unsafe { drop(Box::from_raw(previous)) };
+        }
+    }
+}
+
+impl Drop for CopyRequestSlot {
+    /// 释放最后一个 inbox 被丢弃时仍留在槽中的请求。
+    fn drop(&mut self) {
+        let pointer = *self.pointer.get_mut();
+        if !pointer.is_null() && pointer != Self::closed_pointer() {
+            // SAFETY: Drop 持有 CopyRequestSlot 独占引用，不存在并发原子访问。
+            unsafe { drop(Box::from_raw(pointer)) };
+        }
+    }
 }
 
 impl ClipboardCaptureInbox {
     /// 创建开放的空结果桥。
     pub fn new() -> Self {
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
         Self {
             state: Arc::new(Mutex::new(CaptureInboxState {
                 pending: None,
-                pending_copy: None,
                 closed: false,
             })),
-            wake: Arc::new(Condvar::new()),
+            copy_slot: Arc::new(CopyRequestSlot::new()),
+            wake_sender,
+            wake_receiver: Arc::new(Mutex::new(wake_receiver)),
         }
     }
 
@@ -132,35 +229,44 @@ impl ClipboardCaptureInbox {
         }
     }
 
-    /// 投递最新仅复制请求；队列关闭后立即拒绝，UI 线程不等待数据库或系统剪贴板。
+    /// 通过锁自由原子槽非阻塞发布最新复制请求；永久关闭后立即返回 `Disconnected`。
     pub fn request_copy(&self, request: ClipboardCopyRequest) -> Result<(), ClipboardWorkerError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ClipboardWorkerError::Disconnected)?;
-        if state.closed {
-            return Err(ClipboardWorkerError::Disconnected);
-        }
-        state.pending_copy = Some(request);
-        self.wake.notify_one();
+        self.copy_slot.publish(request)?;
+        self.signal_work();
         Ok(())
     }
 
     /// 阻塞取得最新捕获或写回命令；最新复制动作优先，避免用户操作被捕获高峰饿死。
     pub fn wait_take_work(&self) -> Option<ClipboardWorkItem> {
-        let mut state = self.state.lock().ok()?;
         loop {
-            if let Some(request) = state.pending_copy.take() {
+            if let Some(request) = self.copy_slot.take() {
                 return Some(ClipboardWorkItem::Copy(request));
             }
-            if let Some(result) = state.pending.take() {
-                return Some(ClipboardWorkItem::Capture(result));
+            {
+                let mut state = self.state.lock().ok()?;
+                // 获取捕获锁后再次检查复制槽，缩小复制与捕获同时到达时的优先级竞态。
+                if let Some(request) = self.copy_slot.take() {
+                    return Some(ClipboardWorkItem::Copy(request));
+                }
+                if let Some(result) = state.pending.take() {
+                    return Some(ClipboardWorkItem::Capture(result));
+                }
+                if state.closed {
+                    return None;
+                }
             }
-            if state.closed {
-                return None;
-            }
-            state = self.wake.wait(state).ok()?;
+            // 容量一令牌不会丢失“检查后、等待前”到达的唤醒，且生产者只调用 try_send。
+            self.wake_receiver.lock().ok()?.recv().ok()?;
         }
+    }
+
+    /// UI 接受退出事件时立即关闭复制入口；该方法只执行原子交换和非阻塞唤醒。
+    ///
+    /// 关闭线性化点之前已经由消费者取出的请求属于允许完成的在途工作，主线程会在
+    /// 进程退出前 join 结果泵；线性化点之后的新请求一律返回 `Disconnected`。
+    pub fn close_copy_requests(&self) {
+        self.copy_slot.close();
+        self.signal_work();
     }
 
     /// 标记结果桥关闭；保留已经发布的捕获结果，但丢弃尚未执行的复制命令。
@@ -168,11 +274,11 @@ impl ClipboardCaptureInbox {
     /// 该方法只由 worker 在 `join` 完成后调用；这样在途读取仍有机会发布最终结果，
     /// 关闭不会把已经交接给桥的正文静默丢弃，也不会在 UI 已退出后启动新的 Win32 写回。
     pub(crate) fn close(&self) {
+        self.close_copy_requests();
         if let Ok(mut state) = self.state.lock() {
-            state.pending_copy = None;
             state.closed = true;
-            self.wake.notify_all();
         }
+        self.signal_work();
     }
 
     /// 从 worker 发布最新结果；桥关闭或锁中毒时安全丢弃，不阻塞剪贴板读取线程。
@@ -182,8 +288,13 @@ impl ClipboardCaptureInbox {
                 return;
             }
             state.pending = Some(result);
-            self.wake.notify_one();
+            self.signal_work();
         }
+    }
+
+    /// 非阻塞发布容量一唤醒令牌；Full 表示已有令牌，Disconnected 表示消费者已结束。
+    fn signal_work(&self) {
+        let _ = self.wake_sender.try_send(());
     }
 }
 
@@ -674,6 +785,27 @@ mod tests {
         }
     }
 
+    /// 复制槽不依赖捕获状态锁，持锁期间连续发布仍必须成功并保留最新请求。
+    #[test]
+    fn 仅复制槽不受捕获锁竞争并保留最新() {
+        let inbox = ClipboardCaptureInbox::new();
+        let _held = inbox.state.lock().expect("测试应持有结果桥锁");
+
+        inbox
+            .request_copy(ClipboardCopyRequest::new(7, [7; 32]))
+            .expect("锁自由复制槽不应等待捕获锁");
+        inbox
+            .request_copy(ClipboardCopyRequest::new(8, [8; 32]))
+            .expect("第二次发布应原子替换旧请求");
+        drop(_held);
+
+        assert!(matches!(
+            inbox.wait_take_work(),
+            Some(ClipboardWorkItem::Copy(request))
+                if request.id == 8 && request.content_hash == [8; 32]
+        ));
+    }
+
     /// 同时存在复制和捕获时必须先交付复制，再保留已发布捕获供下一次消费。
     #[test]
     fn 仅复制优先于已发布捕获() {
@@ -704,6 +836,31 @@ mod tests {
         inbox.close();
         assert_eq!(
             inbox.request_copy(ClipboardCopyRequest::new(1, [1; 32])),
+            Err(ClipboardWorkerError::Disconnected)
+        );
+    }
+
+    /// 关闭线性化点前已取出的请求允许完成，关闭后尚未取出和新发布的请求都必须被拒绝。
+    #[test]
+    fn 复制关闭门禁区分在途和待处理请求() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox
+            .request_copy(ClipboardCopyRequest::new(1, [1; 32]))
+            .expect("首个请求应成功发布");
+        let in_flight = match inbox.wait_take_work() {
+            Some(ClipboardWorkItem::Copy(request)) => request,
+            _ => panic!("关闭前请求应成为消费者独占的在途工作"),
+        };
+        inbox
+            .request_copy(ClipboardCopyRequest::new(2, [2; 32]))
+            .expect("第二个请求应等待消费");
+
+        inbox.close_copy_requests();
+
+        assert_eq!(in_flight.id, 1);
+        assert!(inbox.copy_slot.take().is_none());
+        assert_eq!(
+            inbox.request_copy(ClipboardCopyRequest::new(3, [3; 32])),
             Err(ClipboardWorkerError::Disconnected)
         );
     }

@@ -31,6 +31,8 @@ export component AppWindow inherits Window {
     callback selection-move-requested(delta: int);
     // 点击卡片只把当前可见索引交给 Rust；Rust 必须在 UI 线程同步解析稳定记录身份。
     callback card-selection-requested(index: int);
+    // 复制按钮只发送当前可见索引；正文读取和系统剪贴板写回只能在后台执行。
+    callback copy-item-requested(index: int);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -198,6 +200,7 @@ export component AppWindow inherits Window {
                             border-radius: 10px;
 
                             VerticalLayout {
+                                width: parent.width - 56px;
                                 padding: 14px;
                                 spacing: 8px;
 
@@ -230,10 +233,37 @@ export component AppWindow inherits Window {
                             }
 
                             card-touch := TouchArea {
-                                // 右侧 56px 是后续复制按钮的独立操作区；本原子只固定边界，不提前实现按钮。
+                                // 右侧 56px 属于复制按钮，主体选择区与操作区不重叠。
                                 width: parent.width - 56px;
                                 clicked => {
                                     card-selection-requested(index);
+                                }
+                            }
+
+                            copy-button := Rectangle {
+                                x: parent.width - 50px;
+                                y: 30px;
+                                width: 44px;
+                                height: 36px;
+                                border-radius: 6px;
+                                background: copy-touch.pressed
+                                    ? #f5f5f5
+                                    : copy-touch.has-hover ? #303030 : #242424;
+                                border-width: 1px;
+                                border-color: #4a4a4a;
+
+                                Text {
+                                    text: "复制";
+                                    color: copy-touch.pressed ? #080808 : #f5f5f5;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                copy-touch := TouchArea {
+                                    clicked => {
+                                        copy-item-requested(index);
+                                    }
                                 }
                             }
                         }

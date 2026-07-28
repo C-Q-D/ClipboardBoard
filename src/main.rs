@@ -1,8 +1,8 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
 //! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板
-//! 结果泵和托盘消息线程。应用只负责显式写回系统剪贴板，不注入粘贴按键；鼠标复制
-//! 按钮、图片历史和完整设置能力仍由后续原子接入。
+//! 结果泵和托盘消息线程。应用通过鼠标按钮显式写回系统剪贴板，不注入粘贴按键；
+//! 图片历史和完整设置能力仍由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
@@ -67,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
     let hotkey_result = hotkey_manager.stop();
+    // UI Quit 已先关闭复制入口；关闭线性化点前取出的在途请求在此 join 前完成，
+    // 因此进程真正退出后不会继续写回系统剪贴板。
     let capture_pump_result = capture_pump
         .join()
         .map_err(|_| "剪贴板结果泵线程异常退出")

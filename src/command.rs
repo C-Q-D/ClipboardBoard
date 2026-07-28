@@ -197,8 +197,15 @@ pub enum UiEvent {
         /// 点击发生时对应的内容哈希，用于防止同一 ID 或索引被迟到事件误用。
         content_hash: [u8; 32],
     },
-    /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。
-    CopySelection,
+    /// 请求显式复制按钮按稳定身份写回某条记录；正文不进入事件。
+    CopyItem {
+        /// 按钮点击发生时的面板打开代次，旧会话事件必须被拒绝。
+        panel_generation: u64,
+        /// 按钮点击时对应的持久化记录 ID。
+        id: u64,
+        /// 按钮点击时对应的内容哈希，后台读取正文后还会再次复核。
+        content_hash: [u8; 32],
+    },
 }
 
 #[cfg(all(test, windows))]

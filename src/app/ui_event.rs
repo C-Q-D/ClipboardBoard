@@ -42,8 +42,8 @@ enum UiAction {
     ScrollSelection,
     /// 鼠标已经选择一张当前卡片，只同步选中视觉，不改变列表视口。
     SelectItem,
-    /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
-    CopySelection { id: u64, content_hash: [u8; 32] },
+    /// 请求将按钮身份对应的记录排入后台复制邮箱；不隐藏面板也不重建模型。
+    QueueCopy { id: u64, content_hash: [u8; 32] },
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
     ScheduleSearch { generation: u64 },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
@@ -261,23 +261,26 @@ impl UiState {
                 self.snapshot.selected_index = Some(index);
                 UiAction::SelectItem
             }
-            UiEvent::CopySelection => {
-                if !self.panel_visible {
+            UiEvent::CopyItem {
+                panel_generation,
+                id,
+                content_hash,
+            } => {
+                // 按钮事件与选择事件使用相同身份门禁，但复制还会在后台按存储正文再次复核哈希。
+                if !self.panel_visible || panel_generation != self.panel_generation {
                     return UiAction::None;
                 }
-                let Some(index) = self.snapshot.selected_index else {
+                let Some(index) = self
+                    .snapshot
+                    .items
+                    .iter()
+                    .take(selection_limit(&self.snapshot))
+                    .position(|item| item.id == id && item.content_hash == content_hash)
+                else {
                     return UiAction::None;
                 };
-                let Some(item) = self.snapshot.items.get(index) else {
-                    return UiAction::None;
-                };
-                if index >= selection_limit(&self.snapshot) {
-                    return UiAction::None;
-                }
-                UiAction::CopySelection {
-                    id: item.id,
-                    content_hash: item.content_hash,
-                }
+                self.snapshot.selected_index = Some(index);
+                UiAction::QueueCopy { id, content_hash }
             }
         }
     }
@@ -519,6 +522,16 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
+    window.on_copy_item_requested(|index| {
+        // 按钮点击在 UI 线程同步冻结稳定身份，之后才进入异步 reducer。
+        let Some(event) = resolve_copy_item(index) else {
+            return;
+        };
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("显式复制事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
     window.on_search_text_changed(|text| {
         if let Err(error) = post_ui_event(UiEvent::SearchTextChanged(text.to_string())) {
             eprintln!("搜索文本事件无法进入 UI 事件队列：{error}");
@@ -552,7 +565,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = !matches!(
             &event,
-            UiEvent::MoveSelection { .. } | UiEvent::SelectItem { .. } | UiEvent::CopySelection
+            UiEvent::MoveSelection { .. } | UiEvent::SelectItem { .. } | UiEvent::CopyItem { .. }
         );
         let (action, snapshot, search_text, search_filter, search_status) =
             UI_STATE.with(|state| {
@@ -570,6 +583,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         let refresh_model = may_refresh_model && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
+            #[cfg(windows)]
+            close_copy_request_gate();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");
@@ -604,9 +619,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 ensure_selection_visible(&window, snapshot.selected_index);
             }
 
-            if let UiAction::CopySelection { id, content_hash } = action {
+            if let UiAction::QueueCopy { id, content_hash } = action {
                 #[cfg(windows)]
-                request_copy_selection(id, content_hash);
+                request_copy_item(id, content_hash);
             }
 
             match action {
@@ -650,7 +665,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 }
                 UiAction::ScrollSelection => {}
                 UiAction::SelectItem => {}
-                UiAction::CopySelection { .. } => {}
+                UiAction::QueueCopy { .. } => {}
                 UiAction::ScheduleSearch { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
@@ -662,7 +677,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
 #[cfg(windows)]
 /// 将 UI reducer 产生的 ID/哈希命令投递给有界复制工作桥；不在 UI 线程读取正文或调用 Win32。
-fn request_copy_selection(id: u64, content_hash: [u8; 32]) {
+fn request_copy_item(id: u64, content_hash: [u8; 32]) {
     UI_COPY_INBOX.with(|slot| {
         let binding = slot.borrow();
         let Some(inbox) = binding.as_ref() else {
@@ -671,6 +686,16 @@ fn request_copy_selection(id: u64, content_hash: [u8; 32]) {
         };
         if let Err(error) = inbox.request_copy(ClipboardCopyRequest::new(id, content_hash)) {
             eprintln!("仅复制请求无法进入工作桥：{error:?}");
+        }
+    });
+}
+
+#[cfg(windows)]
+/// UI 接受 Quit 时先线性化关闭复制入口；操作只含原子交换和非阻塞唤醒。
+fn close_copy_request_gate() {
+    UI_COPY_INBOX.with(|slot| {
+        if let Some(inbox) = slot.borrow().as_ref() {
+            inbox.close_copy_requests();
         }
     });
 }
@@ -709,6 +734,23 @@ fn resolve_card_selection(index: i32) -> Option<UiEvent> {
         }
         let item = state.snapshot.items.get(index)?;
         Some(UiEvent::SelectItem {
+            panel_generation: state.panel_generation,
+            id: item.id,
+            content_hash: item.content_hash,
+        })
+    })
+}
+
+/// 将复制按钮索引同步解析为代次绑定的稳定身份；越界或隐藏面板不会产生后台命令。
+fn resolve_copy_item(index: i32) -> Option<UiEvent> {
+    let index = usize::try_from(index).ok()?;
+    UI_STATE.with(|state| {
+        let state = state.borrow();
+        if !state.panel_visible || index >= selection_limit(&state.snapshot) {
+            return None;
+        }
+        let item = state.snapshot.items.get(index)?;
+        Some(UiEvent::CopyItem {
             panel_generation: state.panel_generation,
             id: item.id,
             content_hash: item.content_hash,
@@ -1049,6 +1091,21 @@ mod tests {
             UiAction::None
         );
         assert!(!state.panel_visible);
+    }
+
+    /// UI 接受退出时必须先关闭复制入口，关闭后新按钮事件不能进入后台。
+    #[cfg(windows)]
+    #[test]
+    fn 退出关闭复制请求门禁() {
+        let inbox = crate::clipboard::ClipboardCaptureInbox::new();
+        super::bind_copy_request_inbox(inbox.clone());
+
+        super::close_copy_request_gate();
+
+        assert_eq!(
+            inbox.request_copy(crate::clipboard::ClipboardCopyRequest::new(1, [1; 32])),
+            Err(crate::clipboard::ClipboardWorkerError::Disconnected)
+        );
     }
 
     /// 新捕获事件必须插入列表顶部，并且不能把完整正文带入 UI 状态。
@@ -1465,36 +1522,107 @@ mod tests {
         assert!(!state.panel_visible);
     }
 
-    /// 内部复制事件只产生当前选中项的 ID/哈希动作，不携带正文也不改变面板可见性。
+    /// 显式复制按钮只产生已校验的 ID/哈希动作，并同步选择对应卡片且保持面板可见。
     #[test]
-    fn 仅复制动作使用选中项身份() {
+    fn 显式复制按钮使用点击项稳定身份() {
         let mut state = UiState::default();
         state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
             items: vec![test_item(0), test_item(1)],
             selected_index: None,
         }));
         state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
 
         assert_eq!(
-            state.apply(UiEvent::CopySelection),
-            UiAction::CopySelection {
-                id: 1,
-                content_hash: [0; 32],
+            state.apply(UiEvent::CopyItem {
+                panel_generation: generation,
+                id: 2,
+                content_hash: [1; 32],
+            }),
+            UiAction::QueueCopy {
+                id: 2,
+                content_hash: [1; 32],
             }
         );
+        assert_eq!(state.snapshot.selected_index, Some(1));
         assert!(state.panel_visible);
     }
 
-    /// 没有可见面板时的迟到仅复制事件必须被 reducer 丢弃。
+    /// 没有可见面板时的迟到复制按钮事件必须被 reducer 丢弃。
     #[test]
-    fn 隐藏面板忽略迟到仅复制事件() {
+    fn 隐藏面板忽略迟到复制按钮事件() {
         let mut state = UiState::default();
         state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
             items: vec![test_item(0)],
             selected_index: Some(0),
         }));
 
-        assert_eq!(state.apply(UiEvent::CopySelection), UiAction::None);
+        assert_eq!(
+            state.apply(UiEvent::CopyItem {
+                panel_generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::None
+        );
+    }
+
+    /// 旧代次或当前列表中身份不匹配的按钮事件不能排入后台复制邮箱。
+    #[test]
+    fn 显式复制拒绝旧代次和错误身份() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        for event in [
+            UiEvent::CopyItem {
+                panel_generation: generation.saturating_sub(1),
+                id: 2,
+                content_hash: [1; 32],
+            },
+            UiEvent::CopyItem {
+                panel_generation: generation,
+                id: 2,
+                content_hash: [9; 32],
+            },
+            UiEvent::CopyItem {
+                panel_generation: generation,
+                id: 9,
+                content_hash: [1; 32],
+            },
+        ] {
+            assert_eq!(state.apply(event), UiAction::None);
+            assert_eq!(state.snapshot.selected_index, Some(0));
+        }
+    }
+
+    /// 复制按钮索引必须在排队前同步冻结为代次、ID 和哈希。
+    #[test]
+    fn 复制按钮索引同步解析为稳定身份() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), test_item(1)],
+                selected_index: None,
+            }));
+            state.apply(UiEvent::OpenPanel);
+        });
+
+        assert_eq!(
+            super::resolve_copy_item(1),
+            Some(UiEvent::CopyItem {
+                panel_generation: 1,
+                id: 2,
+                content_hash: [1; 32],
+            })
+        );
+        assert_eq!(super::resolve_copy_item(-1), None);
+        assert_eq!(super::resolve_copy_item(2), None);
     }
 
     /// 空历史不应因为上下键产生伪造的索引。

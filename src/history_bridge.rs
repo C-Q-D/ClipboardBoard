@@ -11,20 +11,20 @@ use std::{
 
 use crate::{
     clipboard::{
-        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWriteError,
-        ClipboardWriteExpectationStore, ClipboardWriter,
+        ClipboardCaptureInbox, ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWorkItem,
+        ClipboardWriteError, ClipboardWriteExpectationStore, ClipboardWriter,
     },
     command::{UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
-    storage::{HistoryPayload, StorageError, StorageExecutor, TextUpsertInput, TextUpsertResult},
+    storage::{HistoryPayload, StorageClient, StorageError, TextUpsertInput, TextUpsertResult},
 };
 
-/// 捕获处理结果的泵控制状态；只有 UI 已停止时才允许结束泵线程。
+/// 单条捕获的 UI 投递状态；结果泵的退出只由 inbox 关闭且排空决定。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureProcessOutcome {
     /// 持久化成功且 UI sink 接收了事件，泵应继续等待下一条捕获。
     Posted,
-    /// UI sink 返回 false，事件循环已经停止，泵应退出并释放执行器。
+    /// UI sink 返回 false；泵应禁用后续 UI 投递，但继续持久化并排空已发布 Capture。
     UiClosed,
     /// 未来非 UI 捕获类型的保留状态；当前有效文本捕获不得返回该状态。
     Skipped,
@@ -116,9 +116,57 @@ pub fn unix_millis_now() -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// 持续消费共享剪贴板邮箱，直到输入关闭且已发布 Capture 全部排空。
+///
+/// UI sink 一旦关闭，后续捕获仍会持久化但不再尝试投递 UI；这样进程退出期间已经被
+/// ClipboardIO 接受的最后一条 Capture 不会因为事件循环先结束而丢失。
+pub fn run_clipboard_pump<F>(
+    inbox: ClipboardCaptureInbox,
+    storage: StorageClient,
+    write_expectations: ClipboardWriteExpectationStore,
+    mut emit: F,
+) where
+    F: FnMut(UiEvent) -> bool,
+{
+    let mut ui_open = true;
+    while let Some(work) = inbox.wait_take_work() {
+        match work {
+            ClipboardWorkItem::Copy(request) => {
+                if let Err(error) = process_copy_request(&storage, request, &write_expectations) {
+                    // 仅复制失败只输出稳定错误，不把正文写入日志或 UI。
+                    eprintln!("仅复制处理失败：{error}");
+                }
+            }
+            ClipboardWorkItem::Capture(event) => {
+                let Ok(capture) = event else {
+                    // sequence 失配或格式错误只丢弃本次结果，不能终止后续复制事件。
+                    continue;
+                };
+                let result = process_capture(&storage, capture, unix_millis_now(), |event| {
+                    ui_open && emit(event)
+                });
+                match result {
+                    Ok(CaptureProcessOutcome::Posted) => {}
+                    Ok(CaptureProcessOutcome::UiClosed) => {
+                        // UI 已停止时只关闭投递侧，存储侧继续排空已接受的 Capture。
+                        ui_open = false;
+                    }
+                    Ok(CaptureProcessOutcome::Skipped) => {
+                        // 当前有效文本不会走此分支，保留分支以兼容未来非 UI 捕获类型。
+                    }
+                    Err(error) => {
+                        // 错误不携带正文；记录后继续处理后续捕获，避免一次失败拖垮常驻工具。
+                        eprintln!("剪贴板捕获处理失败：{error}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 先事务性 upsert，再通过可注入 sink 投递唯一 UI 事件。
 pub fn process_capture<F>(
-    storage: &mut StorageExecutor,
+    storage: &StorageClient,
     capture: ClipboardCaptureResult,
     copied_at: i64,
     emit: F,
@@ -131,7 +179,7 @@ where
 
 /// 按 UI 提供的 ID 读取完整文本，登记自身写回预期后写入系统剪贴板。
 pub fn process_copy_request(
-    storage: &mut StorageExecutor,
+    storage: &StorageClient,
     request: ClipboardCopyRequest,
     expectations: &ClipboardWriteExpectationStore,
 ) -> Result<u32, CopyProcessError> {
@@ -219,16 +267,25 @@ where
 mod tests {
     //! 此测试模块覆盖捕获提交顺序、存储失败续处理、DTO 防伪和 UI sink 生命周期。
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc::sync_channel,
+        },
+        thread,
+    };
 
     use rusqlite::{params, Connection};
 
     use super::{
-        process_capture, process_capture_with_upsert, process_copy_payload, CaptureProcessError,
-        CaptureProcessOutcome, CopyProcessError,
+        process_capture, process_capture_with_upsert, process_copy_payload, run_clipboard_pump,
+        CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
     };
     use crate::{
-        clipboard::{ClipboardCaptureResult, ClipboardWriteError},
+        clipboard::{
+            ClipboardCaptureInbox, ClipboardCaptureResult, ClipboardWriteError,
+            ClipboardWriteExpectationStore,
+        },
         command::UiEvent,
         domain::ClipboardPayload,
         platform::windows::ProcessSource,
@@ -258,14 +315,61 @@ mod tests {
         }
     }
 
+    /// UI 在首条投递时关闭，也必须继续排空停止期间已经发布的后续 Capture。
+    #[test]
+    fn ui_关闭后结果泵仍排空已发布_capture() {
+        let directory = test_directory("drain-after-ui-close");
+        let storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let inbox = ClipboardCaptureInbox::new();
+        inbox.publish(Ok(capture(1, "在途首条")));
+        let pump_inbox = inbox.clone();
+        let pump_storage = storage.client();
+        let (sink_entered_sender, sink_entered_receiver) = sync_channel(1);
+        let (sink_release_sender, sink_release_receiver) = sync_channel(1);
+
+        let pump = thread::spawn(move || {
+            run_clipboard_pump(
+                pump_inbox,
+                pump_storage,
+                ClipboardWriteExpectationStore::new(),
+                |_event| {
+                    sink_entered_sender.send(()).expect("通知 UI sink 进入失败");
+                    sink_release_receiver.recv().expect("等待 UI sink 释放失败");
+                    false
+                },
+            );
+        });
+
+        sink_entered_receiver.recv().expect("首条未进入 UI sink");
+        inbox.publish(Ok(capture(2, "停止期尾条")));
+        inbox.close();
+        sink_release_sender.send(()).expect("释放 UI sink 失败");
+        pump.join().expect("结果泵线程异常退出");
+
+        let page = storage
+            .list_history_summaries(None, 30)
+            .expect("读取排空后的历史失败");
+        let previews = page
+            .items
+            .iter()
+            .map(|item| item.preview_text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(previews.len(), 2);
+        assert!(previews.contains(&"在途首条"));
+        assert!(previews.contains(&"停止期尾条"));
+
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理排空测试目录失败");
+    }
+
     /// 成功路径必须先观察数据库记录，再收到带持久化 ID 的 UI 事件。
     #[test]
     fn 成功路径先提交再投递() {
         let directory = test_directory("success");
-        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
         let mut events = Vec::new();
 
-        let outcome = process_capture(&mut storage, capture(1, "首条文本"), 123, |event| {
+        let outcome = process_capture(&storage.client(), capture(1, "首条文本"), 123, |event| {
             events.push(event);
             true
         })
@@ -293,7 +397,7 @@ mod tests {
     #[test]
     fn 存储失败后同一执行器继续处理新哈希() {
         let directory = test_directory("storage-error");
-        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
         let hash = ClipboardPayload::from_text("旧正文").summary().content_hash;
         {
             let connection = Connection::open(storage.database_path()).expect("打开注入连接失败");
@@ -312,7 +416,7 @@ mod tests {
         }
 
         let mut events = Vec::new();
-        let failed = process_capture(&mut storage, capture(2, "旧正文"), 2, |event| {
+        let failed = process_capture(&storage.client(), capture(2, "旧正文"), 2, |event| {
             events.push(event);
             true
         });
@@ -320,7 +424,7 @@ mod tests {
         assert!(events.is_empty());
         assert!(storage.status().is_ok());
 
-        let succeeded = process_capture(&mut storage, capture(3, "新正文"), 3, |event| {
+        let succeeded = process_capture(&storage.client(), capture(3, "新正文"), 3, |event| {
             events.push(event);
             true
         })
@@ -363,13 +467,15 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    /// sink 返回 false 时必须返回 UiClosed，调用方据此退出泵并释放执行器。
+    /// sink 返回 false 时必须返回 UiClosed，结果泵据此只关闭 UI 投递侧。
     #[test]
     fn sink_关闭返回_ui_closed() {
         let directory = test_directory("ui-closed");
-        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
-        let outcome = process_capture(&mut storage, capture(5, "UI 关闭"), 5, |_event| false)
-            .expect("sink 关闭不是存储错误");
+        let storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let outcome = process_capture(&storage.client(), capture(5, "UI 关闭"), 5, |_event| {
+            false
+        })
+        .expect("sink 关闭不是存储错误");
 
         assert_eq!(outcome, CaptureProcessOutcome::UiClosed);
     }
@@ -378,9 +484,11 @@ mod tests {
     #[test]
     fn 有效文本不会返回_skipped() {
         let directory = test_directory("not-skipped");
-        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
-        let outcome = process_capture(&mut storage, capture(6, "不可跳过"), 6, |_event| true)
-            .expect("有效文本应成功处理");
+        let storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let outcome = process_capture(&storage.client(), capture(6, "不可跳过"), 6, |_event| {
+            true
+        })
+        .expect("有效文本应成功处理");
 
         assert_eq!(outcome, CaptureProcessOutcome::Posted);
         assert_ne!(outcome, CaptureProcessOutcome::Skipped);

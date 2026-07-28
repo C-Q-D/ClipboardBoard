@@ -9,8 +9,8 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, StorageExecutor,
-    StorageStatus, TextUpsertInput, TextUpsertResult,
+    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, StorageClient,
+    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -30,6 +30,12 @@ pub enum StorageError {
     InitializationChannelClosed,
     /// 存储线程运行期间命令通道已经关闭。
     ChannelClosed,
+    /// 所有者已建立关闭线性化点，客户端不得再提交新命令。
+    StorageClosing,
+    /// 存储 worker 已关闭并回收。
+    StorageClosed,
+    /// 调用 finish_shutdown 前没有先建立关闭线性化点。
+    ShutdownNotBegun,
     /// 查询请求超过固定页大小上限，避免一次性加载无界历史记录。
     InvalidPageSize {
         /// 调用方请求的页大小。
@@ -63,6 +69,9 @@ impl fmt::Display for StorageError {
             }
             Self::InitializationChannelClosed => write!(formatter, "存储线程未返回初始化结果"),
             Self::ChannelClosed => write!(formatter, "存储线程命令通道已关闭"),
+            Self::StorageClosing => write!(formatter, "存储执行器正在关闭"),
+            Self::StorageClosed => write!(formatter, "存储执行器已经关闭"),
+            Self::ShutdownNotBegun => write!(formatter, "尚未开始存储关闭流程"),
             Self::InvalidPageSize { requested, max } => {
                 write!(formatter, "历史查询页大小 {requested} 超过上限 {max}")
             }

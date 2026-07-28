@@ -282,7 +282,7 @@ impl ClipboardCaptureInbox {
     }
 
     /// 从 worker 发布最新结果；桥关闭或锁中毒时安全丢弃，不阻塞剪贴板读取线程。
-    fn publish(&self, result: Result<ClipboardCaptureResult, ClipboardReadError>) {
+    pub(crate) fn publish(&self, result: Result<ClipboardCaptureResult, ClipboardReadError>) {
         if let Ok(mut state) = self.state.lock() {
             if state.closed {
                 return;

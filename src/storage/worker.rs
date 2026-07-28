@@ -5,7 +5,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{sync_channel, Receiver, SyncSender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, Receiver, SyncSender},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle, ThreadId},
     time::Duration,
 };
@@ -247,6 +251,22 @@ enum StorageCommand {
         /// 返回关闭命令是否已经被 worker 接收。
         reply: SyncSender<Result<(), StorageError>>,
     },
+    /// 测试专用栅栏：证明客户端等待回执时不会持有生命周期门禁。
+    #[cfg(test)]
+    TestBlock {
+        /// 通知测试线程 worker 已经开始处理命令。
+        entered: SyncSender<()>,
+        /// 由测试线程控制 worker 何时继续。
+        release: Receiver<()>,
+        /// 解除栅栏后返回成功回执。
+        reply: SyncSender<Result<(), StorageError>>,
+    },
+    /// 测试专用故障注入：验证 panic 后所有权和错误优先级。
+    #[cfg(test)]
+    TestPanic {
+        /// panic 会丢弃回执发送端，使等待客户端稳定解除阻塞。
+        reply: SyncSender<Result<(), StorageError>>,
+    },
 }
 
 /// 在线程内部持有 SQLite 连接和迁移后的不可变元数据。
@@ -259,10 +279,38 @@ struct StorageState {
     schema_version: i64,
 }
 
+/// 共享命令入口的生命周期；所有克隆客户端必须经过同一把门禁检查。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageLifecycle {
+    /// 接受新的业务命令。
+    Open,
+    /// 已拒绝新命令，所有者正在完成唯一关闭流程。
+    Closing,
+    /// worker 已被回收，存储执行器不可再使用。
+    Closed,
+}
+
+/// 所有客户端共享的有界命令入口；SQLite 连接和线程句柄不在此结构中。
+struct StorageShared {
+    /// 唯一 worker 的有界命令发送端。
+    command_sender: SyncSender<StorageCommand>,
+    /// 提交门禁同时保护生命周期检查和入队，建立明确的关闭线性化点。
+    lifecycle: Mutex<StorageLifecycle>,
+    /// 关闭意图先于互斥锁竞争发布，阻止逃逸客户端持续抢占 Open 门禁。
+    closing_intent: AtomicBool,
+}
+
+/// 可克隆的受控存储客户端；只能提交业务命令，不能关闭或回收 worker。
+#[derive(Clone)]
+pub struct StorageClient {
+    /// 共享入口只包含发送端和生命周期门禁，不包含 SQLite 连接或 join 句柄。
+    shared: Arc<StorageShared>,
+}
+
 /// 本地 SQLite 单线程执行器；实例不可 Clone，连接所有权始终留在 worker。
 pub struct StorageExecutor {
-    /// 唯一命令发送端；不复制该发送端，避免绕过生命周期管理。
-    command_sender: SyncSender<StorageCommand>,
+    /// 可向业务线程签发受控客户端的共享入口。
+    shared: Arc<StorageShared>,
     /// worker 的 RAII 句柄；关闭时必须先发送 Shutdown 再 join。
     worker: Option<JoinHandle<()>>,
     /// 解析后的数据库路径，仅用于诊断和测试，不代表打开了第二个连接。
@@ -290,7 +338,11 @@ impl StorageExecutor {
 
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
-                command_sender,
+                shared: Arc::new(StorageShared {
+                    command_sender,
+                    lifecycle: Mutex::new(StorageLifecycle::Open),
+                    closing_intent: AtomicBool::new(false),
+                }),
                 worker: Some(worker),
                 database_path,
             }),
@@ -317,51 +369,26 @@ impl StorageExecutor {
         &self.database_path
     }
 
-    /// 在存储线程的实际连接上执行只读探针并等待结果。
-    pub fn status(&mut self) -> Result<StorageStatus, StorageError> {
-        let (reply_sender, reply_receiver) = sync_channel(1);
-        if self
-            .command_sender
-            .send(StorageCommand::Inspect {
-                reply: reply_sender,
-            })
-            .is_err()
-        {
-            return Err(self.worker_failure_error());
-        }
-
-        match reply_receiver.recv() {
-            Ok(result) => result,
-            Err(_) => Err(self.worker_failure_error()),
+    /// 签发共享同一 worker 的受控客户端；客户端没有关闭和 join 权限。
+    pub fn client(&self) -> StorageClient {
+        StorageClient {
+            shared: Arc::clone(&self.shared),
         }
     }
 
-    /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
-    pub fn upsert_text(
-        &mut self,
-        input: TextUpsertInput,
-    ) -> Result<TextUpsertResult, StorageError> {
-        let (reply_sender, reply_receiver) = sync_channel(1);
-        if self
-            .command_sender
-            .send(StorageCommand::UpsertText {
-                input,
-                reply: reply_sender,
-            })
-            .is_err()
-        {
-            return Err(self.worker_failure_error());
-        }
+    /// 在存储线程的实际连接上执行只读探针并等待结果。
+    pub fn status(&self) -> Result<StorageStatus, StorageError> {
+        self.client().status()
+    }
 
-        match reply_receiver.recv() {
-            Ok(result) => result,
-            Err(_) => Err(self.worker_failure_error()),
-        }
+    /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
+    pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
+        self.client().upsert_text(input)
     }
 
     /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
     pub fn list_history_summaries(
-        &mut self,
+        &self,
         cursor: Option<HistoryCursor>,
         limit: u32,
     ) -> Result<HistoryPage, StorageError> {
@@ -374,59 +401,57 @@ impl StorageExecutor {
 
     /// 使用关键词、来源、类型、收藏和复合游标查询摘要；正文始终留在 SQLite worker 内。
     pub fn query_history_summaries(
-        &mut self,
+        &self,
         query: HistoryQuery,
     ) -> Result<HistoryPage, StorageError> {
-        let limit = query.limit;
-        if limit > MAX_HISTORY_PAGE_SIZE {
-            return Err(StorageError::InvalidPageSize {
-                requested: limit,
-                max: MAX_HISTORY_PAGE_SIZE,
-            });
-        }
-
-        let (reply_sender, reply_receiver) = sync_channel(1);
-        if self
-            .command_sender
-            .send(StorageCommand::ListHistory {
-                query,
-                reply: reply_sender,
-            })
-            .is_err()
-        {
-            return Err(self.worker_failure_error());
-        }
-
-        match reply_receiver.recv() {
-            Ok(result) => result,
-            Err(_) => Err(self.worker_failure_error()),
-        }
+        self.client().query_history_summaries(query)
     }
 
     /// 按 ID 读取完整历史 payload；找不到记录时返回 `Ok(None)`。
-    pub fn get_history_payload(&mut self, id: i64) -> Result<Option<HistoryPayload>, StorageError> {
-        let (reply_sender, reply_receiver) = sync_channel(1);
-        if self
-            .command_sender
-            .send(StorageCommand::GetHistoryPayload {
-                id,
-                reply: reply_sender,
-            })
-            .is_err()
-        {
-            return Err(self.worker_failure_error());
-        }
+    pub fn get_history_payload(&self, id: i64) -> Result<Option<HistoryPayload>, StorageError> {
+        self.client().get_history_payload(id)
+    }
 
-        match reply_receiver.recv() {
-            Ok(result) => result,
-            Err(_) => Err(self.worker_failure_error()),
+    /// 建立关闭线性化点；返回后所有现存和逃逸的客户端都稳定拒绝新命令。
+    pub fn begin_closing(&mut self) -> Result<(), StorageError> {
+        // 先发布准入栅栏，再等待已经进入临界区的单个提交完成，避免普通 Mutex
+        // 缺乏公平性时逃逸 clone 持续抢占导致关闭线程饥饿。
+        self.shared.closing_intent.store(true, Ordering::Release);
+        let mut lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| StorageError::ChannelClosed)?;
+        match *lifecycle {
+            StorageLifecycle::Open => {
+                *lifecycle = StorageLifecycle::Closing;
+                Ok(())
+            }
+            StorageLifecycle::Closing => Err(StorageError::StorageClosing),
+            StorageLifecycle::Closed => Err(StorageError::StorageClosed),
         }
     }
 
-    /// 请求 worker 关闭连接并等待线程结束；消费 self 后无法再次发送命令。
-    pub fn shutdown(mut self) -> Result<(), StorageError> {
+    /// 由唯一所有者发送唯一 Shutdown、等待回执并回收 worker。
+    ///
+    /// 必须先调用 `begin_closing`；即使发送或回执失败，本方法也会继续 join 并最终
+    /// 将共享状态置为 Closed，避免逃逸客户端观察到虚假的可用状态。
+    pub fn finish_shutdown(&mut self) -> Result<(), StorageError> {
+        {
+            let lifecycle = self
+                .shared
+                .lifecycle
+                .lock()
+                .map_err(|_| StorageError::ChannelClosed)?;
+            match *lifecycle {
+                StorageLifecycle::Open => return Err(StorageError::ShutdownNotBegun),
+                StorageLifecycle::Closing => {}
+                StorageLifecycle::Closed => return Err(StorageError::StorageClosed),
+            }
+        }
+
         let (reply_sender, reply_receiver) = sync_channel(1);
-        let command_result = match self.command_sender.send(StorageCommand::Shutdown {
+        let command_result = match self.shared.command_sender.send(StorageCommand::Shutdown {
             reply: reply_sender,
         }) {
             Ok(()) => reply_receiver
@@ -435,12 +460,21 @@ impl StorageExecutor {
             Err(_) => Err(StorageError::ChannelClosed),
         };
         let join_result = self.join_worker();
+        if let Ok(mut lifecycle) = self.shared.lifecycle.lock() {
+            *lifecycle = StorageLifecycle::Closed;
+        }
 
         match (command_result, join_result) {
             (_, Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+
+    /// 兼容单步关闭调用；内部仍严格执行 begin/finish 两阶段协议。
+    pub fn shutdown(mut self) -> Result<(), StorageError> {
+        self.begin_closing()?;
+        self.finish_shutdown()
     }
 
     /// 回收 worker 句柄并将 panic 映射为可观察的存储错误。
@@ -451,35 +485,183 @@ impl StorageExecutor {
             .join()
             .map_err(|_| StorageError::WorkerPanicked)
     }
-
-    /// 将命令或回执通道断开统一映射为可诊断的线程生命周期错误。
-    fn worker_failure_error(&mut self) -> StorageError {
-        if self.join_worker().is_err() {
-            StorageError::WorkerPanicked
-        } else {
-            StorageError::ChannelClosed
-        }
-    }
 }
 
 impl Drop for StorageExecutor {
-    /// 在异常路径也先通知 worker 关闭，再等待其释放 SQLite 连接。
+    /// 在异常路径保守执行两阶段关闭；任何失败都不能跳过 worker 回收。
     fn drop(&mut self) {
-        let Some(worker) = self.worker.take() else {
+        if self.worker.is_none() {
             return;
-        };
+        }
+        let _ = self.begin_closing();
+        let _ = self.finish_shutdown();
+    }
+}
 
+impl StorageClient {
+    /// 在同一门禁内检查 Open 并提交命令；入队后立即释放门禁，绝不持锁等待回执。
+    fn submit(&self, command: StorageCommand) -> Result<(), StorageError> {
+        if self.shared.closing_intent.load(Ordering::Acquire) {
+            return Err(self.lifecycle_error());
+        }
+        let lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| StorageError::ChannelClosed)?;
+        match *lifecycle {
+            StorageLifecycle::Open if !self.shared.closing_intent.load(Ordering::Acquire) => self
+                .shared
+                .command_sender
+                .send(command)
+                .map_err(|_| StorageError::ChannelClosed),
+            StorageLifecycle::Open | StorageLifecycle::Closing => Err(StorageError::StorageClosing),
+            StorageLifecycle::Closed => Err(StorageError::StorageClosed),
+        }
+    }
+
+    /// 根据共享生命周期生成不触碰 transport 的稳定拒绝错误。
+    fn lifecycle_error(&self) -> StorageError {
+        match self.shared.lifecycle.lock() {
+            Ok(lifecycle) if *lifecycle == StorageLifecycle::Closed => StorageError::StorageClosed,
+            _ => StorageError::StorageClosing,
+        }
+    }
+
+    /// 在共享 worker 的实际连接上执行只读线程归属探针。
+    pub fn status(&self) -> Result<StorageStatus, StorageError> {
         let (reply_sender, reply_receiver) = sync_channel(1);
-        if self
+        self.submit(StorageCommand::Inspect {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 在共享 worker 上事务性插入或更新文本历史。
+    pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::UpsertText {
+            input,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 使用复合游标读取一页历史摘要。
+    pub fn list_history_summaries(
+        &self,
+        cursor: Option<HistoryCursor>,
+        limit: u32,
+    ) -> Result<HistoryPage, StorageError> {
+        self.query_history_summaries(HistoryQuery {
+            cursor,
+            limit,
+            ..HistoryQuery::default()
+        })
+    }
+
+    /// 提交筛选摘要查询；页大小在进入有界队列前校验。
+    pub fn query_history_summaries(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<HistoryPage, StorageError> {
+        let limit = query.limit;
+        if limit > MAX_HISTORY_PAGE_SIZE {
+            return Err(StorageError::InvalidPageSize {
+                requested: limit,
+                max: MAX_HISTORY_PAGE_SIZE,
+            });
+        }
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::ListHistory {
+            query,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 按 ID 读取完整历史 payload；找不到记录时返回 `Ok(None)`。
+    pub fn get_history_payload(&self, id: i64) -> Result<Option<HistoryPayload>, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::GetHistoryPayload {
+            id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 测试专用：阻塞 worker，直到测试释放栅栏。
+    #[cfg(test)]
+    fn test_block(
+        &self,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    ) -> Result<(), StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::TestBlock {
+            entered,
+            release,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 测试专用：让 worker 在命令处理中 panic。
+    #[cfg(test)]
+    fn test_panic_worker(&self) -> Result<(), StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::TestPanic {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 测试专用：暴露“已取得门禁”和“已完成入队”两个确定性时点。
+    #[cfg(test)]
+    fn test_status_with_admission(
+        &self,
+        gate_entered: SyncSender<()>,
+        admitted: SyncSender<()>,
+    ) -> Result<StorageStatus, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        let lifecycle = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| StorageError::ChannelClosed)?;
+        if *lifecycle != StorageLifecycle::Open {
+            return Err(if *lifecycle == StorageLifecycle::Closed {
+                StorageError::StorageClosed
+            } else {
+                StorageError::StorageClosing
+            });
+        }
+        gate_entered
+            .send(())
+            .map_err(|_| StorageError::ChannelClosed)?;
+        self.shared
             .command_sender
-            .send(StorageCommand::Shutdown {
+            .send(StorageCommand::Inspect {
                 reply: reply_sender,
             })
-            .is_ok()
-        {
-            let _ = reply_receiver.recv();
-        }
-        let _ = worker.join();
+            .map_err(|_| StorageError::ChannelClosed)?;
+        drop(lifecycle);
+        admitted.send(()).map_err(|_| StorageError::ChannelClosed)?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
     }
 }
 
@@ -519,6 +701,22 @@ fn storage_thread(
             StorageCommand::Shutdown { reply } => {
                 let _ = reply.send(Ok(()));
                 break;
+            }
+            #[cfg(test)]
+            StorageCommand::TestBlock {
+                entered,
+                release,
+                reply,
+            } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+                let _ = reply.send(Ok(()));
+            }
+            #[cfg(test)]
+            StorageCommand::TestPanic { reply } => {
+                // 显式丢弃后 panic，等待客户端会因回执通道断开而解除阻塞。
+                drop(reply);
+                panic!("测试注入的存储 worker panic");
             }
         }
     }
@@ -783,13 +981,20 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc::sync_channel,
+            Arc,
+        },
         thread,
     };
 
     use rusqlite::{params, Connection};
 
-    use super::{HistoryCursor, HistoryQuery, StorageExecutor, TextUpsertInput};
+    use super::{
+        HistoryCursor, HistoryQuery, StorageExecutor, TextUpsertInput, COMMAND_QUEUE_CAPACITY,
+    };
+    use crate::storage::StorageError;
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -832,14 +1037,14 @@ mod tests {
         let directory = temporary_directory();
         {
             let executor = StorageExecutor::open_at(&directory).expect("首次启动存储线程失败");
-            let mut executor = executor;
+            let executor = executor;
             let status = executor.status().expect("读取首次存储状态失败");
             assert_eq!(status.schema_version, 1);
             assert_eq!(status.probe_result, 1);
             assert_eq!(status.clipboard_item_count, 0);
         }
         {
-            let mut executor = StorageExecutor::open_at(&directory).expect("重复启动存储线程失败");
+            let executor = StorageExecutor::open_at(&directory).expect("重复启动存储线程失败");
             assert_eq!(
                 executor
                     .status()
@@ -855,7 +1060,7 @@ mod tests {
     #[test]
     fn connection_probe_stays_on_storage_thread() {
         let directory = temporary_directory();
-        let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
         let caller_thread_id = thread::current().id();
         let status = executor.status().expect("执行连接探针失败");
 
@@ -875,6 +1080,184 @@ mod tests {
         remove_directory(&directory);
     }
 
+    /// 验证多个客户端只复用同一连接线程，不会各自创建 SQLite 连接。
+    #[test]
+    fn cloned_clients_share_the_single_storage_worker() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor.client();
+        let second = first.clone();
+
+        let first_status = first.status().expect("首个客户端探针失败");
+        let second_status = second.status().expect("克隆客户端探针失败");
+        assert_eq!(
+            first_status.connection_thread_id,
+            second_status.connection_thread_id
+        );
+        assert_eq!(
+            first_status.worker_thread_id,
+            second_status.worker_thread_id
+        );
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证关闭线性化点会同时约束既有和逃逸克隆，完成关闭后错误稳定转为 Closed。
+    #[test]
+    fn closing_rejects_all_existing_clients_and_owner_shuts_down_once() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor.client();
+        let escaped = first.clone();
+
+        executor.begin_closing().expect("建立关闭线性化点失败");
+        assert!(matches!(first.status(), Err(StorageError::StorageClosing)));
+        assert!(matches!(
+            escaped.status(),
+            Err(StorageError::StorageClosing)
+        ));
+        assert!(matches!(
+            executor.begin_closing(),
+            Err(StorageError::StorageClosing)
+        ));
+
+        executor.finish_shutdown().expect("完成存储关闭失败");
+        assert!(matches!(escaped.status(), Err(StorageError::StorageClosed)));
+        assert!(matches!(
+            executor.finish_shutdown(),
+            Err(StorageError::StorageClosed)
+        ));
+        remove_directory(&directory);
+    }
+
+    /// 验证所有者不能跳过 begin 阶段直接发送 Shutdown。
+    #[test]
+    fn finish_shutdown_requires_begin_closing() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        assert!(matches!(
+            executor.finish_shutdown(),
+            Err(StorageError::ShutdownNotBegun)
+        ));
+        executor.shutdown().expect("恢复执行正常关闭失败");
+        remove_directory(&directory);
+    }
+
+    /// 验证等待业务回执的客户端不持有生命周期门禁，所有者可并发进入 Closing。
+    #[test]
+    fn client_waiting_for_reply_does_not_block_begin_closing() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let client = executor.client();
+        let (entered_sender, entered_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let waiting_client =
+            thread::spawn(move || client.test_block(entered_sender, release_receiver));
+
+        entered_receiver.recv().expect("worker 未进入测试栅栏");
+        executor.begin_closing().expect("等待回执时无法进入关闭态");
+        release_sender.send(()).expect("释放测试栅栏失败");
+        waiting_client
+            .join()
+            .expect("等待客户端线程 panic")
+            .expect("已准入命令未完成");
+        executor.finish_shutdown().expect("完成存储关闭失败");
+        remove_directory(&directory);
+    }
+
+    /// 验证容量四队列满载时，已取得门禁的提交先入队，关闭随后完成且不发生死锁。
+    #[test]
+    fn full_queue_drains_admitted_commands_before_closing() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let (block_entered_sender, block_entered_receiver) = sync_channel(1);
+        let (block_release_sender, block_release_receiver) = sync_channel(1);
+        let blocking_client = executor.client();
+        let blocker = thread::spawn(move || {
+            blocking_client.test_block(block_entered_sender, block_release_receiver)
+        });
+        block_entered_receiver
+            .recv()
+            .expect("worker 未进入阻塞栅栏");
+
+        let mut queued = Vec::new();
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            let client = executor.client();
+            let (gate_sender, gate_receiver) = sync_channel(1);
+            let (admitted_sender, admitted_receiver) = sync_channel(1);
+            let handle = thread::spawn(move || {
+                client.test_status_with_admission(gate_sender, admitted_sender)
+            });
+            gate_receiver.recv().expect("排队客户端未取得门禁");
+            admitted_receiver.recv().expect("排队客户端未完成入队");
+            queued.push(handle);
+        }
+
+        let extra_client = executor.client();
+        let (extra_gate_sender, extra_gate_receiver) = sync_channel(1);
+        let (extra_admitted_sender, extra_admitted_receiver) = sync_channel(1);
+        let extra = thread::spawn(move || {
+            extra_client.test_status_with_admission(extra_gate_sender, extra_admitted_sender)
+        });
+        // 额外客户端在容量已满时持有门禁并阻塞于 send。
+        extra_gate_receiver.recv().expect("额外客户端未取得门禁");
+
+        let shared = Arc::clone(&executor.shared);
+        let closing = thread::spawn(move || {
+            let mut executor = executor;
+            executor.begin_closing().expect("满队列后进入关闭态失败");
+            executor
+        });
+        while !shared.closing_intent.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        block_release_sender.send(()).expect("释放 worker 栅栏失败");
+        blocker
+            .join()
+            .expect("阻塞客户端线程 panic")
+            .expect("阻塞命令未完成");
+        extra_admitted_receiver
+            .recv()
+            .expect("额外客户端未在关闭前完成已准入提交");
+        for handle in queued {
+            handle
+                .join()
+                .expect("排队客户端线程 panic")
+                .expect("已排队探针未完成");
+        }
+        extra
+            .join()
+            .expect("额外客户端线程 panic")
+            .expect("额外已准入探针未完成");
+
+        let mut executor = closing.join().expect("关闭所有者线程 panic");
+        executor.finish_shutdown().expect("满队列后关闭失败");
+        remove_directory(&directory);
+    }
+
+    /// 验证 worker panic 时客户端只观察通道错误，所有者负责 join 并优先报告 panic。
+    #[test]
+    fn worker_panic_is_joined_only_by_owner_and_leaves_closed_state() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let client = executor.client();
+        let escaped = client.clone();
+        let client_result = thread::spawn(move || client.test_panic_worker())
+            .join()
+            .expect("故障注入客户端线程 panic");
+        assert!(matches!(client_result, Err(StorageError::ChannelClosed)));
+
+        executor.begin_closing().expect("panic 后建立关闭态失败");
+        assert!(matches!(
+            executor.finish_shutdown(),
+            Err(StorageError::WorkerPanicked)
+        ));
+        assert!(matches!(escaped.status(), Err(StorageError::StorageClosed)));
+        remove_directory(&directory);
+    }
+
     /// 验证已有哨兵记录在 executor 重启和 v1 重复迁移后仍然存在。
     #[test]
     fn preexisting_sentinel_survives_reopen() {
@@ -891,7 +1274,7 @@ mod tests {
                 .expect("写入预置哨兵失败");
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("打开预置数据库失败");
+        let executor = StorageExecutor::open_at(&directory).expect("打开预置数据库失败");
         assert_eq!(
             executor
                 .status()
@@ -908,7 +1291,7 @@ mod tests {
     fn text_upsert_deduplicates_and_preserves_old_fields() {
         let directory = temporary_directory();
         let first = {
-            let mut executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+            let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
             let first = executor
                 .upsert_text(text_input(11, "old body", "old preview", 100))
                 .expect("首次文本 upsert 失败");
@@ -934,7 +1317,7 @@ mod tests {
                 .expect("预置收藏字段失败");
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("重新启动存储线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("重新启动存储线程失败");
         let duplicate = executor
             .upsert_text(TextUpsertInput {
                 content_hash: test_hash(11),
@@ -996,7 +1379,7 @@ mod tests {
             }
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("打开计数数据库失败");
+        let executor = StorageExecutor::open_at(&directory).expect("打开计数数据库失败");
         let max_result = executor
             .upsert_text(text_input(21, "new", "new", 2))
             .expect("最大计数 upsert 失败");
@@ -1035,7 +1418,7 @@ mod tests {
                 .expect("创建回滚触发器失败");
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("打开回滚数据库失败");
+        let executor = StorageExecutor::open_at(&directory).expect("打开回滚数据库失败");
         let result = executor.upsert_text(TextUpsertInput {
             content_hash: test_hash(31),
             text_content: "new body".to_owned(),
@@ -1099,7 +1482,7 @@ mod tests {
     #[test]
     fn history_cursor_pages_are_stable_at_same_timestamp_boundary() {
         let directory = temporary_directory();
-        let mut executor = StorageExecutor::open_at(&directory).expect("启动查询存储线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("启动查询存储线程失败");
         for (hash_value, copied_at) in [(41_u8, 100_i64), (42, 100), (43, 100), (44, 99), (45, 98)]
         {
             executor
@@ -1178,7 +1561,7 @@ mod tests {
     #[test]
     fn history_cursor_boundaries_are_explicit() {
         let directory = temporary_directory();
-        let mut executor = StorageExecutor::open_at(&directory).expect("启动边界查询线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("启动边界查询线程失败");
 
         let empty_page = executor
             .list_history_summaries(None, 50)
@@ -1230,7 +1613,7 @@ mod tests {
     fn history_query_filters_and_escapes_literals() {
         let directory = temporary_directory();
         {
-            let mut executor = StorageExecutor::open_at(&directory).expect("启动筛选查询线程失败");
+            let executor = StorageExecutor::open_at(&directory).expect("启动筛选查询线程失败");
             executor
                 .upsert_text(TextUpsertInput {
                     content_hash: test_hash(51),
@@ -1280,7 +1663,7 @@ mod tests {
                 .expect("写入图片筛选记录失败");
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("重新打开筛选查询线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("重新打开筛选查询线程失败");
         let literal = executor
             .query_history_summaries(HistoryQuery {
                 keyword: Some(r"100%_ \done".to_owned()),
@@ -1364,7 +1747,7 @@ mod tests {
     #[test]
     fn history_query_cursor_pages_are_filter_stable() {
         let directory = temporary_directory();
-        let mut executor = StorageExecutor::open_at(&directory).expect("启动筛选分页线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("启动筛选分页线程失败");
         for (hash_value, copied_at, text) in [
             (61_u8, 100_i64, "分页-61"),
             (62_u8, 100_i64, "分页-62"),
@@ -1457,7 +1840,7 @@ mod tests {
     #[test]
     fn history_payload_by_id_returns_full_row_or_none() {
         let directory = temporary_directory();
-        let mut executor = StorageExecutor::open_at(&directory).expect("启动 payload 查询线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("启动 payload 查询线程失败");
         let inserted = executor
             .upsert_text(TextUpsertInput {
                 content_hash: test_hash(47),
@@ -1511,7 +1894,7 @@ mod tests {
                 .expect("写入非文本测试记录失败");
         }
 
-        let mut executor = StorageExecutor::open_at(&directory).expect("打开非文本查询线程失败");
+        let executor = StorageExecutor::open_at(&directory).expect("打开非文本查询线程失败");
         let summaries = executor
             .list_history_summaries(None, 10)
             .expect("读取非文本摘要失败");
@@ -1552,8 +1935,7 @@ mod tests {
                     .expect("写入损坏哈希记录失败");
             }
 
-            let mut executor =
-                StorageExecutor::open_at(&directory).expect("打开损坏哈希查询线程失败");
+            let executor = StorageExecutor::open_at(&directory).expect("打开损坏哈希查询线程失败");
             assert!(matches!(
                 executor.list_history_summaries(None, 10),
                 Err(crate::storage::StorageError::InvalidContentHashLength {

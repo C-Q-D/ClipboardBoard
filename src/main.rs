@@ -9,23 +9,19 @@ use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
 use clipboard_board::app::{bind_app_window, bind_copy_request_inbox};
 #[cfg(windows)]
-use clipboard_board::clipboard::{
-    ClipboardCaptureInbox, ClipboardWorkItem, ClipboardWriteExpectationStore,
-};
+use clipboard_board::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
 #[cfg(windows)]
 use clipboard_board::command::UiEvent;
 #[cfg(windows)]
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
-use clipboard_board::history_bridge::{
-    process_capture, process_copy_request, unix_millis_now, CaptureProcessOutcome,
-};
+use clipboard_board::history_bridge::run_clipboard_pump;
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
 #[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
-use clipboard_board::storage::StorageExecutor;
+use clipboard_board::storage::{StorageClient, StorageExecutor};
 #[cfg(windows)]
 use slint::ComponentHandle;
 #[cfg(windows)]
@@ -56,13 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey_manager = HotkeyManager::start_with_write_expectations(write_expectations.clone())?;
     let clipboard_inbox = hotkey_manager.clipboard_inbox();
     bind_copy_request_inbox(clipboard_inbox.clone());
-    let capture_pump = match start_clipboard_pump(clipboard_inbox, storage, write_expectations) {
-        Ok(handle) => handle,
-        Err(error) => {
-            let _ = hotkey_manager.stop();
-            return Err(error.into());
-        }
-    };
+    let capture_pump =
+        match start_clipboard_pump(clipboard_inbox, storage.client(), write_expectations) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = hotkey_manager.stop();
+                return Err(error.into());
+            }
+        };
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
@@ -73,11 +70,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "剪贴板结果泵线程异常退出")
         .map(|_| ());
+    // 先关闭输入并排空已接受的捕获，再建立存储关闭线性化点，避免退出期丢失最后一条历史。
+    let storage_result = storage
+        .begin_closing()
+        .and_then(|()| storage.finish_shutdown());
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopped));
 
     event_loop_result?;
     hotkey_result?;
     capture_pump_result?;
+    storage_result?;
     Ok(())
 }
 
@@ -85,48 +87,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 fn start_clipboard_pump(
     inbox: ClipboardCaptureInbox,
-    mut storage: StorageExecutor,
+    storage: StorageClient,
     write_expectations: ClipboardWriteExpectationStore,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("clipboard-board-capture-pump".to_owned())
         .spawn(move || {
-            while let Some(work) = inbox.wait_take_work() {
-                match work {
-                    ClipboardWorkItem::Copy(request) => {
-                        if let Err(error) =
-                            process_copy_request(&mut storage, request, &write_expectations)
-                        {
-                            // 仅复制失败只输出稳定错误，不把正文写入日志或 UI。
-                            eprintln!("仅复制处理失败：{error}");
-                        }
-                    }
-                    ClipboardWorkItem::Capture(event) => {
-                        let Ok(capture) = event else {
-                            // sequence 失配或格式错误只丢弃本次结果，不能终止后续复制事件。
-                            continue;
-                        };
-                        let result =
-                            process_capture(&mut storage, capture, unix_millis_now(), |event| {
-                                post_ui_event(event).is_ok()
-                            });
-                        match result {
-                            Ok(CaptureProcessOutcome::Posted) => {}
-                            Ok(CaptureProcessOutcome::UiClosed) => {
-                                // sink=false 代表 UI 已停止；离开闭包会 drop 唯一存储执行器。
-                                break;
-                            }
-                            Ok(CaptureProcessOutcome::Skipped) => {
-                                // 当前有效文本不会走此分支，保留分支以兼容未来非 UI 捕获类型。
-                            }
-                            Err(error) => {
-                                // 错误不携带正文；记录后继续处理后续捕获，避免一次失败拖垮常驻工具。
-                                eprintln!("剪贴板捕获处理失败：{error}");
-                            }
-                        }
-                    }
-                }
-            }
+            run_clipboard_pump(inbox, storage, write_expectations, |event| {
+                post_ui_event(event).is_ok()
+            });
         })
 }
 

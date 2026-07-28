@@ -7,6 +7,7 @@ slint::include_modules!();
 // 公开应用核心模块，后续平台线程只能通过这些模块与 UI 线程通信。
 pub mod app;
 pub mod command;
+pub mod diagnostics;
 
 // Windows 平台模块只在目标平台编译，避免把原生 API 泄漏到业务层公共接口。
 #[cfg(windows)]

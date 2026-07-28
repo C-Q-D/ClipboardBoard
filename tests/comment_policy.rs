@@ -29,6 +29,7 @@ fn 核心源码包含中文文件级职责说明() {
         "src/main.rs",
         "ui/app-window.slint",
         "src/command.rs",
+        "src/diagnostics.rs",
         "src/app/mod.rs",
         "src/app/ui_event.rs",
         "tests/ui_event.rs",

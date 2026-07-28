@@ -6,6 +6,8 @@
 #[cfg(windows)]
 use clipboard_board::app::bind_app_window;
 #[cfg(windows)]
+use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
+#[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
 use slint::ComponentHandle;
@@ -19,13 +21,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SingleInstanceRole::Secondary => return Ok(()),
     };
 
+    // 仅主实例初始化日志，并且早于 Win32 消息线程；事件只经过隐私字段白名单序列化。
+    diagnostics::init();
+    diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Starting));
+
     let window = clipboard_board::create_app_window()?;
     bind_app_window(&window);
     window.hide()?;
 
     let hotkey_manager = HotkeyManager::start()?;
+    diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
+    diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
     let hotkey_result = hotkey_manager.stop();
+    diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopped));
 
     event_loop_result?;
     hotkey_result?;

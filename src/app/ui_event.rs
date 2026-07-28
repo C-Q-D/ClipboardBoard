@@ -5,7 +5,7 @@
 //! 目标窗口快照也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
 #[cfg(windows)]
-use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
+use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest, ClipboardPasteRequest};
 use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::AppWindow;
@@ -17,8 +17,8 @@ use std::time::Duration;
 
 #[cfg(windows)]
 use crate::platform::windows::window::{
-    capture_target, center_position, cursor_work_area, move_panel, panel_hwnd, panel_size,
-    PanelTarget,
+    capture_target, center_position, cursor_work_area, execute_paste, move_panel, panel_hwnd,
+    panel_size, PanelTarget,
 };
 #[cfg(windows)]
 use slint::PhysicalPosition;
@@ -37,6 +37,20 @@ enum UiAction {
     ScrollSelection,
     /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
     CopySelection { id: u64, content_hash: [u8; 32] },
+    /// 请求后台按 ID 写回文本，完成后由当前 UI 代次执行目标复核和自动粘贴。
+    RequestPaste {
+        id: u64,
+        content_hash: [u8; 32],
+        generation: u64,
+        request_token: u64,
+    },
+    #[cfg(windows)]
+    /// 后台写回成功后，在 UI 线程执行最后一次目标复核、焦点恢复和 Ctrl+V。
+    ExecutePaste {
+        generation: u64,
+        request_token: u64,
+        target: PanelTarget,
+    },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
     Hide,
     /// 该事件只改变数据或已经过期，不触发窗口副作用。
@@ -58,6 +72,15 @@ struct UiState {
     #[cfg(windows)]
     /// 仅在 UI 线程持有的目标身份；后续粘贴前必须重新查询并比较。
     panel_target: Option<PanelTarget>,
+    #[cfg(windows)]
+    /// 防止写回尚未完成时重复提交自动粘贴，并隔离旧代次结果。
+    paste_pending: bool,
+    #[cfg(windows)]
+    /// 仅在 SetForegroundWindow 到 SendInput 的短同步窗口内置位，屏蔽内部失焦回调。
+    paste_executing: bool,
+    #[cfg(windows)]
+    /// 当前自动粘贴请求令牌；与打开代次一起构成结果事件的幂等身份。
+    paste_request_token: u64,
     applied_event_count: u64,
     applied_on_thread: Option<ThreadId>,
 }
@@ -73,6 +96,12 @@ impl Default for UiState {
             quitting: false,
             #[cfg(windows)]
             panel_target: None,
+            #[cfg(windows)]
+            paste_pending: false,
+            #[cfg(windows)]
+            paste_executing: false,
+            #[cfg(windows)]
+            paste_request_token: 0,
             applied_event_count: 0,
             applied_on_thread: None,
         }
@@ -97,12 +126,19 @@ impl UiState {
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
+                        self.paste_pending = false;
+                        self.paste_executing = false;
                     }
                     UiAction::Hide
                 } else {
                     // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    #[cfg(windows)]
+                    {
+                        self.paste_pending = false;
+                        self.paste_executing = false;
+                    }
                     self.select_first_if_needed();
                     UiAction::Show
                 }
@@ -113,6 +149,11 @@ impl UiState {
                 } else {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    #[cfg(windows)]
+                    {
+                        self.paste_pending = false;
+                        self.paste_executing = false;
+                    }
                     self.select_first_if_needed();
                     UiAction::Show
                 }
@@ -123,6 +164,8 @@ impl UiState {
                 #[cfg(windows)]
                 {
                     self.panel_target = None;
+                    self.paste_pending = false;
+                    self.paste_executing = false;
                 }
                 UiAction::Quit
             }
@@ -132,6 +175,8 @@ impl UiState {
                     #[cfg(windows)]
                     {
                         self.panel_target = None;
+                        self.paste_pending = false;
+                        self.paste_executing = false;
                     }
                     UiAction::Hide
                 } else {
@@ -172,6 +217,13 @@ impl UiState {
                 UiAction::ScrollSelection
             }
             UiEvent::CopySelection => {
+                #[cfg(windows)]
+                {
+                    // Ctrl+Enter 明确取消尚未完成的自动粘贴；即使旧 Paste 已被 worker
+                    // 取走，后续带旧令牌的结果也会因 pending=false 被拒绝。
+                    self.paste_pending = false;
+                    self.paste_executing = false;
+                }
                 if !self.panel_visible {
                     return UiAction::None;
                 }
@@ -189,7 +241,157 @@ impl UiState {
                     content_hash: item.content_hash,
                 }
             }
+            UiEvent::PasteSelection {
+                generation,
+                id,
+                content_hash,
+            } => {
+                #[cfg(windows)]
+                {
+                    self.apply_paste_selection(generation, id, content_hash)
+                }
+                #[cfg(not(windows))]
+                {
+                    UiAction::None
+                }
+            }
+            UiEvent::PastePrepared {
+                generation,
+                request_token,
+            } => {
+                #[cfg(windows)]
+                {
+                    if !self.panel_visible
+                        || !self.paste_pending
+                        || generation != self.panel_generation
+                        || request_token != self.paste_request_token
+                    {
+                        return UiAction::None;
+                    }
+                    let Some(target) = self.panel_target else {
+                        self.paste_pending = false;
+                        self.paste_executing = false;
+                        return UiAction::None;
+                    };
+                    self.paste_executing = true;
+                    UiAction::ExecutePaste {
+                        generation,
+                        request_token,
+                        target,
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (generation, request_token);
+                    UiAction::None
+                }
+            }
+            UiEvent::PasteSucceeded {
+                generation,
+                request_token,
+            } => {
+                #[cfg(windows)]
+                {
+                    if !self.panel_visible
+                        || !self.paste_pending
+                        || !self.paste_executing
+                        || generation != self.panel_generation
+                        || request_token != self.paste_request_token
+                    {
+                        return UiAction::None;
+                    }
+                    self.panel_visible = false;
+                    self.panel_target = None;
+                    self.paste_pending = false;
+                    self.paste_executing = false;
+                    UiAction::Hide
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (generation, request_token);
+                    UiAction::None
+                }
+            }
+            UiEvent::PasteFailed {
+                generation,
+                request_token,
+            } => {
+                #[cfg(windows)]
+                {
+                    if generation == self.panel_generation
+                        && request_token == self.paste_request_token
+                    {
+                        self.paste_pending = false;
+                        self.paste_executing = false;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (generation, request_token);
+                }
+                UiAction::None
+            }
         }
+    }
+
+    #[cfg(windows)]
+    /// 记录当前选中项和打开代次；目标快照不跨 UI 状态直接暴露给后台正文读取线程。
+    fn apply_paste_selection(
+        &mut self,
+        generation: u64,
+        id: u64,
+        content_hash: [u8; 32],
+    ) -> UiAction {
+        if !self.panel_visible || self.paste_pending || generation != self.panel_generation {
+            return UiAction::None;
+        }
+        let Some(target) = self.panel_target else {
+            return UiAction::None;
+        };
+        let Some(index) = self.snapshot.selected_index else {
+            return UiAction::None;
+        };
+        if index >= selection_limit(&self.snapshot) {
+            return UiAction::None;
+        }
+        let Some(item) = self.snapshot.items.get(index) else {
+            return UiAction::None;
+        };
+        // 这里仅确认曾经捕获过目标；Medium/窗口/PID/前台状态必须在 SendInput 前再次查询。
+        let _ = target;
+        if item.id != id || item.content_hash != content_hash {
+            return UiAction::None;
+        }
+        self.paste_pending = true;
+        let Some(request_token) = self.paste_request_token.checked_add(1) else {
+            self.paste_pending = false;
+            return UiAction::None;
+        };
+        self.paste_request_token = request_token;
+        UiAction::RequestPaste {
+            id: item.id,
+            content_hash: item.content_hash,
+            generation: self.panel_generation,
+            request_token,
+        }
+    }
+
+    #[cfg(windows)]
+    /// 在 Enter 回调所在的 UI 线程同步捕获当前选择，防止事件排队期间误用新选择。
+    fn paste_selection_event(&self) -> Option<UiEvent> {
+        if !self.panel_visible || self.paste_pending || self.panel_target.is_none() {
+            return None;
+        }
+        let index = self.snapshot.selected_index?;
+        if index >= selection_limit(&self.snapshot) {
+            return None;
+        }
+        let item = self.snapshot.items.get(index)?;
+        Some(UiEvent::PasteSelection {
+            generation: self.panel_generation,
+            id: item.id,
+            content_hash: item.content_hash,
+        })
     }
 
     /// 面板首次显示时把选择置于当前首批第一项；空列表保持无选中项。
@@ -250,6 +452,8 @@ impl UiState {
         #[cfg(windows)]
         {
             self.panel_target = None;
+            self.paste_pending = false;
+            self.paste_executing = false;
         }
     }
 
@@ -306,6 +510,18 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
+    window.on_panel_focus_lost_requested(|| {
+        // SetForegroundWindow 会让面板短暂失去焦点；自动粘贴未完成时不能把这个内部
+        // 焦点变化当成用户关闭，否则后续目标复核失败仍会隐藏面板。
+        if paste_request_pending() {
+            return;
+        }
+        let generation = current_panel_generation();
+        if let Err(error) = post_ui_event(UiEvent::HidePanel { generation }) {
+            eprintln!("面板失焦事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
     window.on_selection_move_requested(|delta| {
         if let Err(error) = post_ui_event(UiEvent::MoveSelection { delta }) {
             eprintln!("键盘选择事件无法进入 UI 事件队列：{error}");
@@ -317,10 +533,19 @@ pub fn bind_app_window(window: &AppWindow) {
             eprintln!("仅复制事件无法进入 UI 事件队列：{error}");
         }
     });
+
+    window.on_paste_selection_requested(|| {
+        let Some(event) = current_paste_selection_event() else {
+            return;
+        };
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("自动粘贴事件无法进入 UI 事件队列：{error}");
+        }
+    });
 }
 
 #[cfg(windows)]
-/// 登记由消息线程创建的复制请求桥；正文读取和系统写回仍在历史结果泵线程完成。
+/// 登记由消息线程创建的剪贴板写回请求桥；正文读取和系统写回仍在历史结果泵线程完成。
 pub fn bind_copy_request_inbox(inbox: ClipboardCaptureInbox) {
     UI_COPY_INBOX.with(|slot| {
         *slot.borrow_mut() = Some(inbox);
@@ -337,7 +562,12 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let refresh_model = !matches!(
             &event,
-            UiEvent::MoveSelection { .. } | UiEvent::CopySelection
+            UiEvent::MoveSelection { .. }
+                | UiEvent::CopySelection
+                | UiEvent::PasteSelection { .. }
+                | UiEvent::PastePrepared { .. }
+                | UiEvent::PasteSucceeded { .. }
+                | UiEvent::PasteFailed { .. }
         );
         let (action, snapshot) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -372,6 +602,58 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 request_copy_selection(id, content_hash);
             }
 
+            if let UiAction::RequestPaste {
+                id,
+                content_hash,
+                generation,
+                request_token,
+            } = action
+            {
+                #[cfg(windows)]
+                if let Err(error) =
+                    request_paste_selection(id, content_hash, generation, request_token)
+                {
+                    eprintln!("自动粘贴请求无法进入工作桥：{error:?}");
+                    let _ = post_ui_event(UiEvent::PasteFailed {
+                        generation,
+                        request_token,
+                    });
+                }
+            }
+
+            #[cfg(windows)]
+            if let UiAction::ExecutePaste {
+                generation,
+                request_token,
+                target,
+            } = action
+            {
+                match execute_paste(target, panel_hwnd()) {
+                    Ok(()) => {
+                        // 成功状态必须在同一个 UI 闭包内先按 generation/token 生效，再隐藏
+                        // 物理窗口；否则旧请求可能先隐藏面板，而后续 Copy/新请求只能拦截状态。
+                        let completion = UI_STATE.with(|state| {
+                            state.borrow_mut().apply(UiEvent::PasteSucceeded {
+                                generation,
+                                request_token,
+                            })
+                        });
+                        if completion == UiAction::Hide {
+                            if let Err(error) = window.hide() {
+                                eprintln!("自动粘贴成功但面板隐藏失败：{error}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("自动粘贴目标复核失败：{error:?}");
+                        let _ = post_ui_event(UiEvent::PasteFailed {
+                            generation,
+                            request_token,
+                        });
+                    }
+                }
+            }
+
             match action {
                 UiAction::Show => {
                     #[cfg(windows)]
@@ -396,6 +678,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 }
                 UiAction::ScrollSelection => {}
                 UiAction::CopySelection { .. } => {}
+                UiAction::RequestPaste { .. } => {}
+                #[cfg(windows)]
+                UiAction::ExecutePaste { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
                 UiAction::Quit => unreachable!("退出动作必须在窗口副作用前处理"),
@@ -417,6 +702,46 @@ fn request_copy_selection(id: u64, content_hash: [u8; 32]) {
             eprintln!("仅复制请求无法进入工作桥：{error:?}");
         }
     });
+}
+
+#[cfg(windows)]
+/// 将 UI 产生的 ID/哈希/代次命令投递给有界自动粘贴工作桥，不在 UI 线程读取正文。
+fn request_paste_selection(
+    id: u64,
+    content_hash: [u8; 32],
+    generation: u64,
+    request_token: u64,
+) -> Result<(), crate::clipboard::ClipboardWorkerError> {
+    UI_COPY_INBOX.with(|slot| {
+        let binding = slot.borrow();
+        let Some(inbox) = binding.as_ref() else {
+            return Err(crate::clipboard::ClipboardWorkerError::Disconnected);
+        };
+        inbox.request_paste(ClipboardPasteRequest::new(
+            id,
+            content_hash,
+            generation,
+            request_token,
+        ))
+    })
+}
+
+#[cfg(windows)]
+/// 在 UI 回调同步捕获当前选中项、代次和哈希，避免事件排队期间选择变化导致误粘贴。
+fn current_paste_selection_event() -> Option<UiEvent> {
+    UI_STATE.with(|state| state.borrow().paste_selection_event())
+}
+
+#[cfg(windows)]
+/// 读取当前自动粘贴请求是否仍在 UI reducer 中等待完成，用于区分内部焦点切换和用户失焦。
+fn paste_request_pending() -> bool {
+    UI_STATE.with(|state| state.borrow().paste_executing)
+}
+
+#[cfg(not(windows))]
+/// 非 Windows 目标没有原生粘贴流程，失焦回调始终按普通关闭处理。
+fn paste_request_pending() -> bool {
+    false
 }
 
 /// 按内容哈希重定位选中项；去重或容量裁剪后仍优先保持原条目身份。
@@ -570,6 +895,8 @@ mod tests {
         UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
+    #[cfg(windows)]
+    use crate::platform::windows::window::{IntegrityLevel, PanelTarget};
 
     /// 构造具有稳定哈希的测试卡片，便于验证首批边界而不混入重复去重行为。
     fn test_item(index: usize) -> UiClipboardItem {
@@ -819,6 +1146,190 @@ mod tests {
             }
         );
         assert!(state.panel_visible);
+    }
+
+    /// 自动粘贴请求必须锁定当前代次和单调令牌，重复 Enter 不能并发提交第二次写回。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴动作携带代次令牌并防止重入() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+
+        assert_eq!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste {
+                id: 1,
+                content_hash: [0; 32],
+                generation: 1,
+                request_token: 1,
+            }
+        );
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::None
+        ));
+        assert!(state.paste_pending);
+
+        // 同代次但错误令牌的旧结果不能清理当前请求。
+        state.apply(UiEvent::PasteFailed {
+            generation: 1,
+            request_token: 99,
+        });
+        assert!(state.paste_pending);
+
+        assert!(matches!(
+            state.apply(UiEvent::PastePrepared {
+                generation: 1,
+                request_token: 1,
+            }),
+            UiAction::ExecutePaste { .. }
+        ));
+        // Prepare 阶段仍保持 pending，屏蔽 SetForegroundWindow 触发的内部失焦。
+        assert!(state.paste_pending);
+        state.apply(UiEvent::PasteFailed {
+            generation: 1,
+            request_token: 1,
+        });
+        assert!(!state.paste_pending);
+    }
+
+    /// 旧面板的准备/失败事件不能影响新打开代次，即使请求令牌数值碰巧相同也必须隔离。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴旧代次结果不会污染新面板() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste { generation: 1, .. }
+        ));
+        state.apply(UiEvent::HidePanel { generation: 1 });
+
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 2234,
+            process_id: 6678,
+            integrity: IntegrityLevel::Medium,
+        });
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 2,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste { generation: 2, .. }
+        ));
+        state.apply(UiEvent::PastePrepared {
+            generation: 1,
+            request_token: 1,
+        });
+        state.apply(UiEvent::PasteFailed {
+            generation: 1,
+            request_token: 1,
+        });
+        assert!(state.paste_pending);
+        state.apply(UiEvent::PasteFailed {
+            generation: 2,
+            request_token: 2,
+        });
+        assert!(!state.paste_pending);
+    }
+
+    /// 自动粘贴成功事件必须携带令牌；旧请求的异步收尾不能隐藏同代次的新请求。
+    #[cfg(windows)]
+    #[test]
+    fn 自动粘贴成功收尾不会隐藏新请求() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.panel_target = Some(PanelTarget {
+            hwnd: 1234,
+            process_id: 5678,
+            integrity: IntegrityLevel::Medium,
+        });
+
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste {
+                request_token: 1,
+                ..
+            }
+        ));
+        state.apply(UiEvent::PastePrepared {
+            generation: 1,
+            request_token: 1,
+        });
+        // Ctrl+Enter 取消 A，随后同一面板代次可以发起 B。
+        state.apply(UiEvent::CopySelection);
+        assert!(matches!(
+            state.apply(UiEvent::PasteSelection {
+                generation: 1,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::RequestPaste {
+                request_token: 2,
+                ..
+            }
+        ));
+        state.apply(UiEvent::PastePrepared {
+            generation: 1,
+            request_token: 2,
+        });
+
+        assert_eq!(
+            state.apply(UiEvent::PasteSucceeded {
+                generation: 1,
+                request_token: 1,
+            }),
+            UiAction::None
+        );
+        assert!(state.panel_visible && state.paste_pending);
+        assert_eq!(
+            state.apply(UiEvent::PasteSucceeded {
+                generation: 1,
+                request_token: 2,
+            }),
+            UiAction::Hide
+        );
+        assert!(!state.panel_visible && !state.paste_pending);
     }
 
     /// 没有可见面板时的迟到仅复制事件必须被 reducer 丢弃。

@@ -71,13 +71,40 @@ impl ClipboardCopyRequest {
     }
 }
 
-/// 结果泵需要消费的两类工作；复制请求和捕获结果共享一个有界唤醒通道。
+/// UI 请求自动粘贴某条历史时提交的轻量命令；正文仍必须从存储线程按 ID 读取。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardPasteRequest {
+    /// 目标历史记录的数据库 ID。
+    pub id: u64,
+    /// UI 当前卡片看到的哈希，用于拒绝旧选择误写入新记录正文。
+    pub content_hash: [u8; 32],
+    /// 面板打开代次；结果只能回到发起本次请求的同一轮面板。
+    pub generation: u64,
+    /// 当前面板内自动粘贴请求的单调令牌，用于拒绝同代次的旧结果。
+    pub request_token: u64,
+}
+
+impl ClipboardPasteRequest {
+    /// 创建带一致性哈希、面板代次和请求令牌的自动粘贴请求，不携带完整剪贴板正文。
+    pub fn new(id: u64, content_hash: [u8; 32], generation: u64, request_token: u64) -> Self {
+        Self {
+            id,
+            content_hash,
+            generation,
+            request_token,
+        }
+    }
+}
+
+/// 结果泵需要消费的捕获、仅复制和自动粘贴工作；三者共享一个有界唤醒通道。
 #[derive(Debug)]
 pub enum ClipboardWorkItem {
     /// ClipboardIO worker 发布的捕获结果。
     Capture(Result<ClipboardCaptureResult, ClipboardReadError>),
     /// UI 投递的按 ID 仅复制请求。
     Copy(ClipboardCopyRequest),
+    /// UI 投递的按 ID 自动粘贴请求。
+    Paste(ClipboardPasteRequest),
 }
 
 /// 从消息线程移交捕获结果的容量为一 latest-wins 桥。
@@ -98,6 +125,8 @@ struct CaptureInboxState {
     pending: Option<Result<ClipboardCaptureResult, ClipboardReadError>>,
     /// 尚未处理的最新仅复制请求；快速重复按键只保留最后一次选择。
     pending_copy: Option<ClipboardCopyRequest>,
+    /// 尚未处理的最新自动粘贴请求；新的写回命令会替换旧的复制命令，保持 latest-wins。
+    pending_paste: Option<ClipboardPasteRequest>,
     /// 关闭闩锁；worker 停止后消费者不再等待。
     closed: bool,
 }
@@ -109,6 +138,7 @@ impl ClipboardCaptureInbox {
             state: Arc::new(Mutex::new(CaptureInboxState {
                 pending: None,
                 pending_copy: None,
+                pending_paste: None,
                 closed: false,
             })),
             wake: Arc::new(Condvar::new()),
@@ -125,7 +155,7 @@ impl ClipboardCaptureInbox {
         loop {
             match self.wait_take_work()? {
                 ClipboardWorkItem::Capture(result) => return Some(result),
-                ClipboardWorkItem::Copy(_) => {
+                ClipboardWorkItem::Copy(_) | ClipboardWorkItem::Paste(_) => {
                     // 兼容旧 API 的调用方不消费复制命令；生产结果泵使用 wait_take_work。
                 }
             }
@@ -142,14 +172,36 @@ impl ClipboardCaptureInbox {
             return Err(ClipboardWorkerError::Disconnected);
         }
         state.pending_copy = Some(request);
+        state.pending_paste = None;
         self.wake.notify_one();
         Ok(())
     }
 
-    /// 阻塞取得最新捕获或仅复制命令；复制请求优先，避免被持续复制事件饿死。
+    /// 投递最新自动粘贴请求；新的写回动作会替换尚未执行的仅复制动作。
+    pub fn request_paste(
+        &self,
+        request: ClipboardPasteRequest,
+    ) -> Result<(), ClipboardWorkerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ClipboardWorkerError::Disconnected)?;
+        if state.closed {
+            return Err(ClipboardWorkerError::Disconnected);
+        }
+        state.pending_paste = Some(request);
+        state.pending_copy = None;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// 阻塞取得最新捕获或写回命令；最新写回动作优先，避免用户按键被捕获高峰饿死。
     pub fn wait_take_work(&self) -> Option<ClipboardWorkItem> {
         let mut state = self.state.lock().ok()?;
         loop {
+            if let Some(request) = state.pending_paste.take() {
+                return Some(ClipboardWorkItem::Paste(request));
+            }
             if let Some(request) = state.pending_copy.take() {
                 return Some(ClipboardWorkItem::Copy(request));
             }
@@ -170,6 +222,7 @@ impl ClipboardCaptureInbox {
     pub(crate) fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.pending_copy = None;
+            state.pending_paste = None;
             state.closed = true;
             self.wake.notify_all();
         }
@@ -463,8 +516,8 @@ mod tests {
 
     use super::{
         should_publish_capture, ClipboardCaptureInbox, ClipboardCaptureRequest,
-        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardIoWorker, ClipboardWorkItem,
-        ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
+        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardIoWorker, ClipboardPasteRequest,
+        ClipboardWorkItem, ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
     };
     use crate::clipboard::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
     use crate::domain::ClipboardPayload;
@@ -607,6 +660,17 @@ mod tests {
         assert!(inbox.wait_take_work().is_none());
     }
 
+    /// 桥关闭时必须同时丢弃待执行的自动粘贴，避免退出后继续写回系统剪贴板。
+    #[test]
+    fn 关闭时丢弃待处理自动粘贴命令() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox
+            .request_paste(ClipboardPasteRequest::new(88, [8; 32], 3, 4))
+            .expect("开放桥应接受自动粘贴命令");
+        inbox.close();
+        assert!(inbox.wait_take_work().is_none());
+    }
+
     /// 捕获请求必须把序号和来源快照绑定到同一个响应通道，避免快速复制时错配来源。
     #[test]
     fn 捕获请求保存序号和来源快照() {
@@ -651,6 +715,30 @@ mod tests {
                 assert_eq!(request.content_hash, [4; 32]);
             }
             ClipboardWorkItem::Capture(_) => panic!("复制命令不能伪装为捕获结果"),
+            ClipboardWorkItem::Paste(_) => panic!("复制命令不能伪装为自动粘贴结果"),
+        }
+    }
+
+    /// 自动粘贴请求必须携带面板代次和令牌，并与仅复制命令共享 latest-wins 语义。
+    #[test]
+    fn 自动粘贴请求替换旧写回命令() {
+        let inbox = ClipboardCaptureInbox::new();
+        inbox
+            .request_copy(ClipboardCopyRequest::new(1, [1; 32]))
+            .expect("开放桥应接受复制命令");
+        inbox
+            .request_paste(ClipboardPasteRequest::new(2, [2; 32], 7, 9))
+            .expect("开放桥应接受自动粘贴命令");
+
+        match inbox.wait_take_work().expect("应取得最新自动粘贴命令") {
+            ClipboardWorkItem::Paste(request) => {
+                assert_eq!(request.id, 2);
+                assert_eq!(request.content_hash, [2; 32]);
+                assert_eq!(request.generation, 7);
+                assert_eq!(request.request_token, 9);
+            }
+            ClipboardWorkItem::Copy(_) => panic!("旧复制命令不能覆盖最新自动粘贴命令"),
+            ClipboardWorkItem::Capture(_) => panic!("自动粘贴命令不能伪装为捕获结果"),
         }
     }
 

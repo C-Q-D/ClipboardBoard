@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     clipboard::{
-        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWriteError,
+        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardPasteRequest, ClipboardWriteError,
         ClipboardWriteExpectationStore, ClipboardWriter,
     },
     command::{UiClipboardItem, UiEvent},
@@ -144,6 +144,22 @@ pub fn process_copy_request(
     })
 }
 
+/// 按 UI 提供的 ID 读取完整文本，复用仅复制的完整性校验后写入系统剪贴板。
+///
+/// 自动粘贴与仅复制必须共享同一正文哈希、内部 NUL 和自身事件抑制契约；本函数只
+/// 负责把带面板代次的请求转换为相同的写回操作，目标窗口复核留在 UI 线程完成。
+pub fn process_paste_request(
+    storage: &mut StorageExecutor,
+    request: ClipboardPasteRequest,
+    expectations: &ClipboardWriteExpectationStore,
+) -> Result<u32, CopyProcessError> {
+    process_copy_request(
+        storage,
+        ClipboardCopyRequest::new(request.id, request.content_hash),
+        expectations,
+    )
+}
+
 /// 校验按 ID 读取的 payload 并调用注入的 writer；抽出纯接缝便于不改写真实剪贴板的测试。
 fn process_copy_payload<F>(
     payload: &HistoryPayload,
@@ -224,11 +240,14 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        process_capture, process_capture_with_upsert, process_copy_payload, CaptureProcessError,
-        CaptureProcessOutcome, CopyProcessError,
+        process_capture, process_capture_with_upsert, process_copy_payload, process_paste_request,
+        CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
     };
     use crate::{
-        clipboard::{ClipboardCaptureResult, ClipboardWriteError},
+        clipboard::{
+            ClipboardCaptureResult, ClipboardPasteRequest, ClipboardWriteError,
+            ClipboardWriteExpectationStore,
+        },
         command::UiEvent,
         domain::ClipboardPayload,
         platform::windows::ProcessSource,
@@ -500,5 +519,32 @@ mod tests {
             Err(CopyProcessError::InvalidPayload)
         ));
         assert_eq!(writes, 0);
+    }
+
+    /// 自动粘贴桥必须按 ID 读取真实 payload，并在触碰系统剪贴板前拒绝旧哈希请求。
+    #[test]
+    fn 自动粘贴桥拒绝旧哈希而不触碰写入器() {
+        let directory = test_directory("paste-stale-hash");
+        let mut storage = StorageExecutor::open_at(&directory).expect("启动测试存储失败");
+        let result = storage
+            .upsert_text(crate::storage::TextUpsertInput {
+                content_hash: ClipboardPayload::from_text("自动粘贴正文")
+                    .summary()
+                    .content_hash,
+                text_content: "自动粘贴正文".to_owned(),
+                preview_text: "自动粘贴正文".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 1,
+            })
+            .expect("预置文本记录失败");
+        let request = ClipboardPasteRequest::new(result.id as u64, [9; 32], 3, 4);
+        let error = process_paste_request(
+            &mut storage,
+            request,
+            &ClipboardWriteExpectationStore::new(),
+        )
+        .expect_err("旧哈希不应触碰系统剪贴板");
+        assert_eq!(error.to_string(), "仅复制目标哈希已变化");
     }
 }

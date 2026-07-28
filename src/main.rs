@@ -1,8 +1,8 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
 //! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板
-//! 结果泵和托盘消息线程；启动恢复与 Ctrl+Enter 仅复制写回已经接入，自动粘贴和完整
-//! 窗口交互仍由后续原子接入。
+//! 结果泵和托盘消息线程；启动恢复、Ctrl+Enter 仅复制和普通目标自动粘贴已经接入，
+//! 管理员目标降级提示及完整窗口交互仍由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
@@ -18,7 +18,8 @@ use clipboard_board::command::UiEvent;
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::{
-    process_capture, process_copy_request, unix_millis_now, CaptureProcessOutcome,
+    process_capture, process_copy_request, process_paste_request, unix_millis_now,
+    CaptureProcessOutcome,
 };
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
@@ -97,6 +98,26 @@ fn start_clipboard_pump(
                         {
                             // 仅复制失败只输出稳定错误，不把正文写入日志或 UI。
                             eprintln!("仅复制处理失败：{error}");
+                        }
+                    }
+                    ClipboardWorkItem::Paste(request) => {
+                        let generation = request.generation;
+                        let request_token = request.request_token;
+                        match process_paste_request(&mut storage, request, &write_expectations) {
+                            Ok(_) => {
+                                let _ = post_ui_event(UiEvent::PastePrepared {
+                                    generation,
+                                    request_token,
+                                });
+                            }
+                            Err(error) => {
+                                // 自动粘贴失败只记录稳定错误并清理当前请求；用户提示由 ATOM-22 负责。
+                                eprintln!("自动粘贴写回失败：{error}");
+                                let _ = post_ui_event(UiEvent::PasteFailed {
+                                    generation,
+                                    request_token,
+                                });
+                            }
                         }
                     }
                     ClipboardWorkItem::Capture(event) => {

@@ -123,6 +123,18 @@ pub enum UiEvent {
     MoveSelection { delta: i32 },
     /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。
     CopySelection,
+    /// 请求 UI reducer 为指定打开代次的选中项准备自动粘贴；正文仍不进入事件。
+    PasteSelection {
+        generation: u64,
+        id: u64,
+        content_hash: [u8; 32],
+    },
+    /// 后台已经完成文本写回，UI 线程必须按当前打开代次和请求令牌再次复核目标后才能注入输入。
+    PastePrepared { generation: u64, request_token: u64 },
+    /// UI 线程已完成 Ctrl+V；只有匹配当前 pending 令牌时才同步标记隐藏面板。
+    PasteSucceeded { generation: u64, request_token: u64 },
+    /// 后台写回或目标复核失败；只清理当前代次的进行中标志，不在本原子显示提示。
+    PasteFailed { generation: u64, request_token: u64 },
 }
 
 #[cfg(all(test, windows))]

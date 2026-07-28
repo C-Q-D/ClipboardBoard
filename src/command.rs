@@ -5,6 +5,8 @@
 
 #[cfg(windows)]
 use crate::clipboard::ClipboardCaptureResult;
+#[cfg(windows)]
+use crate::storage::TextUpsertResult;
 
 /// 单条剪贴板历史的最小 UI 展示数据。
 ///
@@ -21,14 +23,17 @@ pub struct UiClipboardItem {
     pub relative_time: String,
     /// 规范化文本哈希；历史协调器据此合并重复内容，不需要再次读取正文。
     pub content_hash: [u8; 32],
-    /// 同一规范内容被复制的次数；由历史协调器做饱和递增。
+    /// 同一规范内容被复制的次数；捕获路径必须采用 SQLite 返回的最终饱和值。
     pub copy_count: u64,
-    /// 用户是否收藏该记录；合并重复内容时必须保留旧值。
+    /// 用户是否收藏该记录；捕获路径必须采用 SQLite 返回的最终收藏状态。
     pub is_pinned: bool,
 }
 
 impl UiClipboardItem {
-    /// 将 ClipboardIO 的拥有型结果转换为不含完整正文的 UI 卡片数据。
+    /// 将旧的 ClipboardIO 拥有型结果转换为不含完整正文的 UI 卡片数据。
+    ///
+    /// 该方法仅供非持久化测试或恢复前路径使用；生产捕获必须使用
+    /// [`Self::from_persisted_result`]，避免 UI 在 SQLite 之外猜测 ID 和计数。
     #[cfg(windows)]
     pub fn from_capture(capture: &ClipboardCaptureResult) -> Self {
         let summary = capture.payload.summary();
@@ -49,6 +54,42 @@ impl UiClipboardItem {
             copy_count: 1,
             is_pinned: false,
         }
+    }
+
+    /// 将 SQLite 事务返回的最终快照转换为 UI 卡片；不再信任捕获前的临时序号或摘要。
+    ///
+    /// ID 和计数必须是可展示的正数，任何不满足约束的持久化 DTO 都返回 `None`，
+    /// 由上层把它记录为转换错误，避免先写入数据库再制造幽灵 UI 记录。
+    #[cfg(windows)]
+    pub fn from_persisted_result(result: &TextUpsertResult) -> Option<Self> {
+        let id = u64::try_from(result.id).ok()?;
+        let copy_count = u64::try_from(result.copy_count).ok()?;
+        if id == 0 || copy_count == 0 {
+            return None;
+        }
+
+        let source = result
+            .source_app
+            .as_deref()
+            .filter(|source| !source.is_empty())
+            .or_else(|| {
+                result
+                    .source_exe
+                    .as_deref()
+                    .filter(|source| !source.is_empty())
+            })
+            .unwrap_or("未知来源")
+            .to_owned();
+
+        Some(Self {
+            id,
+            preview: result.preview_text.clone(),
+            source,
+            relative_time: "刚刚".to_owned(),
+            content_hash: result.content_hash,
+            copy_count,
+            is_pinned: result.is_pinned,
+        })
     }
 }
 
@@ -76,7 +117,7 @@ pub enum UiEvent {
     HidePanel { generation: u64 },
     /// 用一个完整且拥有所有权的快照替换 UI 历史状态。
     ReplaceSnapshot(UiSnapshot),
-    /// 将一条已转换为摘要的剪贴板记录交给 UI 线程置顶显示。
+    /// 将一条已由持久化结果转换的剪贴板记录交给 UI 线程置顶显示。
     ClipboardCaptured(UiClipboardItem),
 }
 
@@ -88,6 +129,7 @@ mod tests {
     use crate::clipboard::{ClipboardCaptureRequest, ClipboardCaptureResult};
     use crate::domain::ClipboardPayload;
     use crate::platform::windows::ProcessSource;
+    use crate::storage::TextUpsertResult;
 
     /// 转换层必须丢弃完整正文，只保留领域摘要和来源显示名。
     #[test]
@@ -122,6 +164,51 @@ mod tests {
         };
         let item = UiClipboardItem::from_capture(&capture);
         assert_eq!(item.source, "未知来源");
+    }
+
+    /// 持久化快照必须使用数据库最终字段，并按应用、可执行文件、未知来源依次回退。
+    #[test]
+    fn 持久化结果使用最终字段和来源优先级() {
+        let result = TextUpsertResult {
+            id: 9,
+            content_hash: [3; 32],
+            preview_text: "数据库预览".to_owned(),
+            source_exe: Some("fallback.exe".to_owned()),
+            source_app: Some("持久化应用".to_owned()),
+            copy_count: 4,
+            is_pinned: true,
+            created_at: 10,
+            copied_at: 20,
+            last_used_at: Some(30),
+        };
+
+        let item = UiClipboardItem::from_persisted_result(&result).expect("有效 DTO 应可转换");
+        assert_eq!(item.id, 9);
+        assert_eq!(item.preview, "数据库预览");
+        assert_eq!(item.source, "持久化应用");
+        assert_eq!(item.copy_count, 4);
+        assert!(item.is_pinned);
+        assert_eq!(item.content_hash, [3; 32]);
+        assert_eq!(item.relative_time, "刚刚");
+    }
+
+    /// ID 或计数不合法时必须拒绝 DTO，避免把不可追踪的数据送入 UI。
+    #[test]
+    fn 不可转换的持久化结果被拒绝() {
+        let result = TextUpsertResult {
+            id: -1,
+            content_hash: [4; 32],
+            preview_text: "错误 DTO".to_owned(),
+            source_exe: None,
+            source_app: None,
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 1,
+            last_used_at: None,
+        };
+
+        assert!(UiClipboardItem::from_persisted_result(&result).is_none());
     }
 
     /// 保证测试不会误把仅用于构造请求的类型当成 UI 正文模型的一部分。

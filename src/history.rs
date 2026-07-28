@@ -1,7 +1,8 @@
 //! 此模块提供内存历史协调器，集中处理文本记录的去重、置顶、计数和容量限制。
 //!
-//! 协调器只接收拥有型 UI 摘要，不读取剪贴板、不写 SQLite，也不触碰 Slint；后续持久化
-//! 原子可以用数据库结果替换该模块，而不会把规范哈希和收藏规则散落到 UI 调用方。
+//! 协调器只接收拥有型 UI 摘要，不读取剪贴板、不写 SQLite，也不触碰 Slint；捕获提交
+//! 路径使用 `record_persisted` 直接接收数据库最终快照，旧 `record` 仅保留给非持久化
+//! 测试或恢复前路径，避免 UI 在 SQLite 之外重新推导计数和身份。
 
 use crate::command::UiClipboardItem;
 
@@ -46,6 +47,23 @@ impl MemoryHistory {
             self.items.insert(0, incoming);
         }
 
+        self.items.truncate(self.capacity);
+    }
+
+    /// 记录已经由 SQLite upsert 返回的最终快照，不重新推导重复计数或覆盖身份字段。
+    ///
+    /// 捕获提交路径必须使用此方法：数据库已经决定最终 ID、预览、来源、收藏和饱和
+    /// 计数，UI 只负责把该快照置顶；DTO 转换层已经拒绝非法计数，这里不再改写它。
+    pub fn record_persisted(&mut self, incoming: UiClipboardItem) {
+        if let Some(existing_index) = self
+            .items
+            .iter()
+            .position(|item| item.content_hash == incoming.content_hash)
+        {
+            self.items.remove(existing_index);
+        }
+
+        self.items.insert(0, incoming);
         self.items.truncate(self.capacity);
     }
 
@@ -194,5 +212,26 @@ mod tests {
         history.record(item(8, "新摘要", "刚刚", false));
 
         assert_eq!(history.items()[0].copy_count, u64::MAX);
+    }
+
+    /// 持久化捕获重复项必须完整采用数据库最终快照，不能把旧卡片本地加一或保留旧身份。
+    #[test]
+    fn 持久化重复项采用数据库最终快照() {
+        let mut history = MemoryHistory::new(10);
+        history.record(item(12, "旧预览", "之前", false));
+
+        let mut persisted = item(12, "数据库最终预览", "刚刚", true);
+        persisted.id = 88;
+        persisted.source = "数据库来源".to_owned();
+        persisted.copy_count = u64::MAX;
+        history.record_persisted(persisted);
+
+        let actual = &history.items()[0];
+        assert_eq!(actual.id, 88);
+        assert_eq!(actual.preview, "数据库最终预览");
+        assert_eq!(actual.source, "数据库来源");
+        assert_eq!(actual.relative_time, "刚刚");
+        assert_eq!(actual.copy_count, u64::MAX);
+        assert!(actual.is_pinned);
     }
 }

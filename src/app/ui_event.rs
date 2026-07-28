@@ -127,7 +127,8 @@ impl UiState {
                     .selected_index
                     .and_then(|index| self.snapshot.items.get(index))
                     .map(|item| item.content_hash);
-                self.history.record(item);
+                // 捕获事件已经由 SQLite 返回最终快照，不能再走本地“旧值加一”的兼容路径。
+                self.history.record_persisted(item);
                 self.snapshot.items = self.history.items().to_vec();
                 restore_selected_index(&mut self.snapshot, selected_hash);
                 UiAction::None
@@ -472,13 +473,13 @@ mod tests {
             is_pinned: true,
         }));
         state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
-            id: 2,
-            preview: "新复制摘要".to_owned(),
-            source: "新来源".to_owned(),
+            id: 1,
+            preview: "收藏正文".to_owned(),
+            source: "旧来源".to_owned(),
             relative_time: "刚刚".to_owned(),
             content_hash: [9; 32],
-            copy_count: 1,
-            is_pinned: false,
+            copy_count: u64::MAX,
+            is_pinned: true,
         }));
 
         assert_eq!(state.snapshot.items.len(), 1);
@@ -486,7 +487,7 @@ mod tests {
         assert_eq!(state.snapshot.items[0].preview, "收藏正文");
         assert_eq!(state.snapshot.items[0].source, "旧来源");
         assert_eq!(state.snapshot.items[0].relative_time, "刚刚");
-        assert_eq!(state.snapshot.items[0].copy_count, 2);
+        assert_eq!(state.snapshot.items[0].copy_count, u64::MAX);
         assert!(state.snapshot.items[0].is_pinned);
     }
 

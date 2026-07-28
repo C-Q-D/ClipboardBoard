@@ -1,6 +1,7 @@
 //! 此库负责暴露 ClipboardBoard 的最小界面创建入口。
 //!
-//! 当前库已经提供可运行的黑色看板、热键桥和剪贴板结果摘要入口；写回、存储和完整历史能力由后续原子逐步加入。
+//! 当前库已经提供可运行的黑色看板、热键桥、SQLite 文本写入和剪贴板结果摘要入口；
+//! 启动恢复、写回和完整历史能力由后续原子逐步加入。
 
 slint::include_modules!();
 
@@ -17,6 +18,10 @@ pub mod storage;
 // 引入无法实现的原生句柄类型。
 #[cfg(windows)]
 pub mod clipboard;
+
+// 捕获持久化桥只在 Windows 目标暴露，因为输入 DTO 来自 Windows ClipboardIO worker。
+#[cfg(windows)]
+pub mod history_bridge;
 
 // Windows 平台模块只在目标平台编译，避免把原生 API 泄漏到业务层公共接口。
 #[cfg(windows)]

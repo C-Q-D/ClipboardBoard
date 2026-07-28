@@ -1,7 +1,7 @@
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
-//! 当前入口先完成单实例判定，再创建 UI、绑定弱窗口并启动热键、剪贴板结果泵和托盘消息线程；
-//! 剪贴板写回、历史持久化和完整窗口交互仍由后续原子接入。
+//! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板
+//! 结果泵和托盘消息线程；启动恢复、剪贴板写回和完整窗口交互仍由后续原子接入。
 
 #[cfg(windows)]
 use clipboard_board::app::bind_app_window;
@@ -10,11 +10,13 @@ use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
 use clipboard_board::clipboard::ClipboardCaptureInbox;
 #[cfg(windows)]
-use clipboard_board::command::{UiClipboardItem, UiEvent};
-#[cfg(windows)]
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
+use clipboard_board::history_bridge::{process_capture, unix_millis_now, CaptureProcessOutcome};
+#[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
+#[cfg(windows)]
+use clipboard_board::storage::StorageExecutor;
 #[cfg(windows)]
 use slint::ComponentHandle;
 #[cfg(windows)]
@@ -37,8 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_app_window(&window);
     window.hide()?;
 
+    // 存储执行器必须在热键和剪贴板监听前唯一创建，随后移动给结果泵线程。
+    let storage = StorageExecutor::open()?;
     let hotkey_manager = HotkeyManager::start()?;
-    let capture_pump = match start_clipboard_pump(hotkey_manager.clipboard_inbox()) {
+    let capture_pump = match start_clipboard_pump(hotkey_manager.clipboard_inbox(), storage) {
         Ok(handle) => handle,
         Err(error) => {
             let _ = hotkey_manager.stop();
@@ -61,9 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 启动结果桥消费线程；该线程只做 DTO 转换和 UI 事件投递，不触碰 Slint 对象。
+/// 启动结果桥消费线程；该线程先提交 SQLite，再投递 DTO，不触碰 Slint 对象。
 #[cfg(windows)]
-fn start_clipboard_pump(inbox: ClipboardCaptureInbox) -> std::io::Result<JoinHandle<()>> {
+fn start_clipboard_pump(
+    inbox: ClipboardCaptureInbox,
+    mut storage: StorageExecutor,
+) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("clipboard-board-capture-pump".to_owned())
         .spawn(move || {
@@ -72,10 +79,22 @@ fn start_clipboard_pump(inbox: ClipboardCaptureInbox) -> std::io::Result<JoinHan
                     // sequence 失配或格式错误只丢弃本次结果，不能终止后续复制事件。
                     continue;
                 };
-                let item = UiClipboardItem::from_capture(&capture);
-                if post_ui_event(UiEvent::ClipboardCaptured(item)).is_err() {
-                    // UI 事件循环已停止时退出泵，避免继续堆积无效闭包。
-                    break;
+                let result = process_capture(&mut storage, capture, unix_millis_now(), |event| {
+                    post_ui_event(event).is_ok()
+                });
+                match result {
+                    Ok(CaptureProcessOutcome::Posted) => {}
+                    Ok(CaptureProcessOutcome::UiClosed) => {
+                        // sink=false 代表 UI 已停止；离开闭包会 drop 唯一存储执行器。
+                        break;
+                    }
+                    Ok(CaptureProcessOutcome::Skipped) => {
+                        // 当前有效文本不会走此分支，保留分支以兼容未来非 UI 捕获类型。
+                    }
+                    Err(error) => {
+                        // 错误不携带正文；记录后继续处理后续捕获，避免一次失败拖垮常驻工具。
+                        eprintln!("剪贴板捕获处理失败：{error}");
+                    }
                 }
             }
         })

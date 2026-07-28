@@ -1,13 +1,16 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前原子负责连接创建、v1 迁移、线程归属探针和文本历史事务 upsert；查询、清理和 UI 接线由后续原子实现。
+//! 当前原子负责连接创建、v1 迁移、线程归属探针、文本事务 upsert 和游标摘要查询；清理和 UI 接线由后续原子实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
 mod migration;
 mod worker;
 
-pub use worker::{StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult};
+pub use worker::{
+    HistoryCursor, HistoryPage, HistoryPayload, HistorySummary, StorageExecutor, StorageStatus,
+    TextUpsertInput, TextUpsertResult,
+};
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
 #[derive(Debug)]
@@ -26,6 +29,13 @@ pub enum StorageError {
     InitializationChannelClosed,
     /// 存储线程运行期间命令通道已经关闭。
     ChannelClosed,
+    /// 查询请求超过固定页大小上限，避免一次性加载无界历史记录。
+    InvalidPageSize {
+        /// 调用方请求的页大小。
+        requested: u32,
+        /// 当前存储层允许的最大页大小。
+        max: u32,
+    },
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
 }
@@ -45,6 +55,9 @@ impl fmt::Display for StorageError {
             }
             Self::InitializationChannelClosed => write!(formatter, "存储线程未返回初始化结果"),
             Self::ChannelClosed => write!(formatter, "存储线程命令通道已关闭"),
+            Self::InvalidPageSize { requested, max } => {
+                write!(formatter, "历史查询页大小 {requested} 超过上限 {max}")
+            }
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }
     }

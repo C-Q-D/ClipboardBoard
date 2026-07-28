@@ -10,12 +10,15 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use super::{migration, StorageError};
 
-/// 存储线程命令队列的容量；探针、文本 upsert 和关闭命令共用有界队列，避免无限堆积。
+/// 存储线程命令队列的容量；探针、upsert、查询和关闭命令共用有界队列，避免无限堆积。
 const COMMAND_QUEUE_CAPACITY: usize = 4;
+
+/// 单次摘要查询允许返回的最大记录数，防止调用方绕过虚拟列表加载无界数据。
+const MAX_HISTORY_PAGE_SIZE: u32 = 100;
 
 /// 文本历史 upsert 的固定 SQL；重复记录只更新最近复制时间和饱和计数。
 const UPSERT_TEXT_SQL: &str = r#"
@@ -30,6 +33,34 @@ ON CONFLICT(content_hash) DO UPDATE SET
         WHEN copy_count <= 0 THEN 2
         ELSE copy_count + 1
     END
+"#;
+
+/// 首页摘要查询；通过多取一行判断是否存在下一页，不使用 OFFSET。
+const HISTORY_PAGE_SQL: &str = r#"
+SELECT id, item_type, preview_text, source_exe, source_app, copy_count,
+       is_pinned, created_at, copied_at, last_used_at
+FROM clipboard_items
+ORDER BY copied_at DESC, id DESC
+LIMIT ?1
+"#;
+
+/// 后续摘要查询；复合游标严格排除锚点及其之前的记录。
+const HISTORY_PAGE_AFTER_SQL: &str = r#"
+SELECT id, item_type, preview_text, source_exe, source_app, copy_count,
+       is_pinned, created_at, copied_at, last_used_at
+FROM clipboard_items
+WHERE copied_at < ?1 OR (copied_at = ?1 AND id < ?2)
+ORDER BY copied_at DESC, id DESC
+LIMIT ?3
+"#;
+
+/// 按主键读取完整 payload；可空正文和原始哈希字节保持数据库语义。
+const HISTORY_PAYLOAD_SQL: &str = r#"
+SELECT id, item_type, text_content, preview_text, content_hash,
+       source_exe, source_app, copy_count, is_pinned, created_at,
+       copied_at, last_used_at
+FROM clipboard_items
+WHERE id = ?1
 "#;
 
 /// 返回给调用方的只读存储状态和真实连接线程探针。
@@ -91,6 +122,78 @@ pub struct TextUpsertResult {
     pub last_used_at: Option<i64>,
 }
 
+/// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HistoryCursor {
+    /// 游标锚点的最近复制时间。
+    pub copied_at: i64,
+    /// 游标锚点的数据库 ID。
+    pub id: i64,
+}
+
+/// 历史列表摘要；不携带完整正文，适合放入有界 UI 模型。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HistorySummary {
+    /// 历史记录数据库 ID。
+    pub id: i64,
+    /// 内容类型，例如 v1 文本记录的 `text`。
+    pub item_type: String,
+    /// 列表卡片使用的预览文本。
+    pub preview_text: String,
+    /// 来源可执行文件名；数据库允许为空。
+    pub source_exe: Option<String>,
+    /// 来源应用显示名；数据库允许为空。
+    pub source_app: Option<String>,
+    /// 复制次数。
+    pub copy_count: i64,
+    /// 是否已收藏。
+    pub is_pinned: bool,
+    /// 首次创建时间。
+    pub created_at: i64,
+    /// 最近复制时间。
+    pub copied_at: i64,
+    /// 最近使用时间；从未使用时为空。
+    pub last_used_at: Option<i64>,
+}
+
+/// 一页历史摘要及其下一页游标。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HistoryPage {
+    /// 本页实际返回的摘要，最多等于调用方请求的 limit。
+    pub items: Vec<HistorySummary>,
+    /// 仅在数据库还有未返回记录时指向本页最后一条摘要。
+    pub next_cursor: Option<HistoryCursor>,
+}
+
+/// 按 ID 返回的完整历史 payload；字段类型与 v1 表的可空语义一致。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HistoryPayload {
+    /// 历史记录数据库 ID。
+    pub id: i64,
+    /// 内容类型，例如 `text`。
+    pub item_type: String,
+    /// 完整正文；图片或未来无正文类型可以为空。
+    pub text_content: Option<String>,
+    /// 列表预览文本。
+    pub preview_text: String,
+    /// 数据库中原样保存的内容哈希字节。
+    pub content_hash: Vec<u8>,
+    /// 来源可执行文件名；数据库允许为空。
+    pub source_exe: Option<String>,
+    /// 来源应用显示名；数据库允许为空。
+    pub source_app: Option<String>,
+    /// 复制次数。
+    pub copy_count: i64,
+    /// 是否已收藏。
+    pub is_pinned: bool,
+    /// 首次创建时间。
+    pub created_at: i64,
+    /// 最近复制时间。
+    pub copied_at: i64,
+    /// 最近使用时间；从未使用时为空。
+    pub last_used_at: Option<i64>,
+}
+
 /// 可发送给存储线程的内部命令；不对外暴露连接、Statement 或 SQL 句柄。
 enum StorageCommand {
     /// 在实际连接上执行只读线程归属探针。
@@ -104,6 +207,22 @@ enum StorageCommand {
         input: TextUpsertInput,
         /// 返回同一事务中读取的最终稳定快照。
         reply: SyncSender<Result<TextUpsertResult, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上读取一页历史摘要。
+    ListHistory {
+        /// 可选的复合游标锚点。
+        cursor: Option<HistoryCursor>,
+        /// 已通过页大小校验的请求数量。
+        limit: u32,
+        /// 返回摘要页和下一页游标。
+        reply: SyncSender<Result<HistoryPage, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上按 ID 读取完整 payload。
+    GetHistoryPayload {
+        /// 目标历史记录 ID。
+        id: i64,
+        /// 返回 payload 或不存在标记。
+        reply: SyncSender<Result<Option<HistoryPayload>, StorageError>>,
     },
     /// 请求 worker 先关闭连接，再结束命令循环。
     Shutdown {
@@ -222,6 +341,58 @@ impl StorageExecutor {
         }
     }
 
+    /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
+    pub fn list_history_summaries(
+        &mut self,
+        cursor: Option<HistoryCursor>,
+        limit: u32,
+    ) -> Result<HistoryPage, StorageError> {
+        if limit > MAX_HISTORY_PAGE_SIZE {
+            return Err(StorageError::InvalidPageSize {
+                requested: limit,
+                max: MAX_HISTORY_PAGE_SIZE,
+            });
+        }
+
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        if self
+            .command_sender
+            .send(StorageCommand::ListHistory {
+                cursor,
+                limit,
+                reply: reply_sender,
+            })
+            .is_err()
+        {
+            return Err(self.worker_failure_error());
+        }
+
+        match reply_receiver.recv() {
+            Ok(result) => result,
+            Err(_) => Err(self.worker_failure_error()),
+        }
+    }
+
+    /// 按 ID 读取完整历史 payload；找不到记录时返回 `Ok(None)`。
+    pub fn get_history_payload(&mut self, id: i64) -> Result<Option<HistoryPayload>, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        if self
+            .command_sender
+            .send(StorageCommand::GetHistoryPayload {
+                id,
+                reply: reply_sender,
+            })
+            .is_err()
+        {
+            return Err(self.worker_failure_error());
+        }
+
+        match reply_receiver.recv() {
+            Ok(result) => result,
+            Err(_) => Err(self.worker_failure_error()),
+        }
+    }
+
     /// 请求 worker 关闭连接并等待线程结束；消费 self 后无法再次发送命令。
     pub fn shutdown(mut self) -> Result<(), StorageError> {
         let (reply_sender, reply_receiver) = sync_channel(1);
@@ -308,6 +479,16 @@ fn storage_thread(
             }
             StorageCommand::UpsertText { input, reply } => {
                 let _ = reply.send(upsert_text(&mut state.connection, input));
+            }
+            StorageCommand::ListHistory {
+                cursor,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(list_history_summaries(&state.connection, cursor, limit));
+            }
+            StorageCommand::GetHistoryPayload { id, reply } => {
+                let _ = reply.send(get_history_payload(&state.connection, id));
             }
             StorageCommand::Shutdown { reply } => {
                 let _ = reply.send(Ok(()));
@@ -416,9 +597,107 @@ WHERE content_hash = ?1
     Ok(result)
 }
 
+/// 从 worker 的唯一连接读取一页摘要，并用多取一行决定 next_cursor。
+fn list_history_summaries(
+    connection: &Connection,
+    cursor: Option<HistoryCursor>,
+    limit: u32,
+) -> Result<HistoryPage, StorageError> {
+    if limit == 0 {
+        return Ok(HistoryPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    }
+
+    let query_limit = i64::from(limit) + 1;
+    let mut summaries = if let Some(cursor) = cursor {
+        let mut statement = connection.prepare(HISTORY_PAGE_AFTER_SQL)?;
+        collect_history_summaries(
+            &mut statement,
+            params![cursor.copied_at, cursor.id, query_limit],
+        )?
+    } else {
+        let mut statement = connection.prepare(HISTORY_PAGE_SQL)?;
+        collect_history_summaries(&mut statement, params![query_limit])?
+    };
+
+    let has_more = summaries.len() > limit as usize;
+    if has_more {
+        summaries.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        summaries.last().map(|summary| HistoryCursor {
+            copied_at: summary.copied_at,
+            id: summary.id,
+        })
+    } else {
+        None
+    };
+
+    Ok(HistoryPage {
+        items: summaries,
+        next_cursor,
+    })
+}
+
+/// 将 SQLite 行映射为不携带正文的历史摘要，并集中维护列顺序。
+fn history_summary_from_row(row: &Row<'_>) -> rusqlite::Result<HistorySummary> {
+    Ok(HistorySummary {
+        id: row.get(0)?,
+        item_type: row.get(1)?,
+        preview_text: row.get(2)?,
+        source_exe: row.get(3)?,
+        source_app: row.get(4)?,
+        copy_count: row.get(5)?,
+        is_pinned: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        copied_at: row.get(8)?,
+        last_used_at: row.get(9)?,
+    })
+}
+
+/// 使用泛型参数承接首页和后续页两种绑定，避免复制行映射逻辑。
+fn collect_history_summaries<P>(
+    statement: &mut Statement<'_>,
+    parameters: P,
+) -> Result<Vec<HistorySummary>, StorageError>
+where
+    P: rusqlite::Params,
+{
+    let rows = statement.query_map(parameters, history_summary_from_row)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 按 ID 读取完整 payload；OptionalExtension 将不存在映射为稳定的 None。
+fn get_history_payload(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<HistoryPayload>, StorageError> {
+    let payload = connection
+        .query_row(HISTORY_PAYLOAD_SQL, params![id], |row| {
+            Ok(HistoryPayload {
+                id: row.get(0)?,
+                item_type: row.get(1)?,
+                text_content: row.get(2)?,
+                preview_text: row.get(3)?,
+                content_hash: row.get(4)?,
+                source_exe: row.get(5)?,
+                source_app: row.get(6)?,
+                copy_count: row.get(7)?,
+                is_pinned: row.get::<_, i64>(8)? != 0,
+                created_at: row.get(9)?,
+                copied_at: row.get(10)?,
+                last_used_at: row.get(11)?,
+            })
+        })
+        .optional()?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
-    //! 此测试模块验证线程执行器、文本事务规则、迁移隔离和错误回滚语义。
+    //! 此测试模块验证线程执行器、文本事务规则、游标查询、迁移隔离和错误回滚语义。
 
     use std::{
         fs,
@@ -429,7 +708,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{StorageExecutor, TextUpsertInput};
+    use super::{HistoryCursor, StorageExecutor, TextUpsertInput};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -437,7 +716,7 @@ mod tests {
     fn temporary_directory() -> PathBuf {
         let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "clipboard-board-atom16-{}-{sequence}",
+            "clipboard-board-atom17-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("创建存储测试目录失败");
@@ -732,6 +1011,214 @@ mod tests {
             )
         );
         drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 验证同毫秒记录按 ID 倒序分页，游标跨页后既不重复也不遗漏。
+    #[test]
+    fn history_cursor_pages_are_stable_at_same_timestamp_boundary() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动查询存储线程失败");
+        for (hash_value, copied_at) in [(41_u8, 100_i64), (42, 100), (43, 100), (44, 99), (45, 98)]
+        {
+            executor
+                .upsert_text(text_input(
+                    hash_value,
+                    &format!("body-{hash_value}"),
+                    &format!("preview-{hash_value}"),
+                    copied_at,
+                ))
+                .expect("写入分页测试记录失败");
+        }
+
+        let first_page = executor
+            .list_history_summaries(None, 2)
+            .expect("读取首页摘要失败");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            first_page.next_cursor,
+            Some(HistoryCursor {
+                copied_at: 100,
+                id: 2
+            })
+        );
+
+        let second_page = executor
+            .list_history_summaries(first_page.next_cursor, 2)
+            .expect("读取第二页摘要失败");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(
+            second_page.next_cursor,
+            Some(HistoryCursor {
+                copied_at: 99,
+                id: 4
+            })
+        );
+
+        let third_page = executor
+            .list_history_summaries(second_page.next_cursor, 2)
+            .expect("读取尾页摘要失败");
+        assert_eq!(
+            third_page
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert_eq!(third_page.next_cursor, None);
+
+        let all_ids = [first_page, second_page, third_page]
+            .into_iter()
+            .flat_map(|page| page.items.into_iter().map(|item| item.id))
+            .collect::<Vec<_>>();
+        assert_eq!(all_ids, vec![3, 2, 1, 4, 5]);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证空库、零页大小、尾部游标和页大小上限都具有明确结果。
+    #[test]
+    fn history_cursor_boundaries_are_explicit() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动边界查询线程失败");
+
+        let empty_page = executor
+            .list_history_summaries(None, 50)
+            .expect("读取空库摘要失败");
+        assert!(empty_page.items.is_empty());
+        assert_eq!(empty_page.next_cursor, None);
+
+        let zero_page = executor
+            .list_history_summaries(
+                Some(HistoryCursor {
+                    copied_at: i64::MAX,
+                    id: i64::MAX,
+                }),
+                0,
+            )
+            .expect("读取零大小摘要失败");
+        assert!(zero_page.items.is_empty());
+        assert_eq!(zero_page.next_cursor, None);
+
+        let invalid = executor.list_history_summaries(None, 101);
+        assert!(matches!(
+            invalid,
+            Err(crate::storage::StorageError::InvalidPageSize {
+                requested: 101,
+                max: 100
+            })
+        ));
+
+        executor
+            .upsert_text(text_input(46, "tail body", "tail preview", 1))
+            .expect("写入尾部边界记录失败");
+        let after_tail = executor
+            .list_history_summaries(
+                Some(HistoryCursor {
+                    copied_at: 1,
+                    id: 1,
+                }),
+                50,
+            )
+            .expect("读取尾部之后摘要失败");
+        assert!(after_tail.items.is_empty());
+        assert_eq!(after_tail.next_cursor, None);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证按 ID 读取完整 payload 保留正文、可空字段、来源和数据库原始哈希。
+    #[test]
+    fn history_payload_by_id_returns_full_row_or_none() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动 payload 查询线程失败");
+        let inserted = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: test_hash(47),
+                text_content: "完整正文".to_owned(),
+                preview_text: "正文预览".to_owned(),
+                source_exe: Some("payload.exe".to_owned()),
+                source_app: Some("Payload App".to_owned()),
+                copied_at: 123,
+            })
+            .expect("写入 payload 测试记录失败");
+
+        let payload = executor
+            .get_history_payload(inserted.id)
+            .expect("读取完整 payload 失败")
+            .expect("已写入记录却未返回 payload");
+        assert_eq!(payload.id, inserted.id);
+        assert_eq!(payload.item_type, "text");
+        assert_eq!(payload.text_content.as_deref(), Some("完整正文"));
+        assert_eq!(payload.preview_text, "正文预览");
+        assert_eq!(payload.content_hash, test_hash(47).to_vec());
+        assert_eq!(payload.source_exe.as_deref(), Some("payload.exe"));
+        assert_eq!(payload.source_app.as_deref(), Some("Payload App"));
+        assert_eq!(payload.copy_count, 1);
+        assert!(!payload.is_pinned);
+        assert_eq!(payload.created_at, 123);
+        assert_eq!(payload.copied_at, 123);
+        assert_eq!(payload.last_used_at, None);
+        assert_eq!(
+            executor
+                .get_history_payload(i64::MAX)
+                .expect("读取未知 payload 失败"),
+            None
+        );
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证查询不假设未来类型为 text，并保留 v1 允许为空的正文与来源字段。
+    #[test]
+    fn history_payload_preserves_nullable_non_text_row() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        {
+            let mut connection = Connection::open(&database_path).expect("创建非文本数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("非文本数据库迁移失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', NULL, 'image preview', X'01', 1, 1, 10, 20)",
+                    [],
+                )
+                .expect("写入非文本测试记录失败");
+        }
+
+        let mut executor = StorageExecutor::open_at(&directory).expect("打开非文本查询线程失败");
+        let summaries = executor
+            .list_history_summaries(None, 10)
+            .expect("读取非文本摘要失败");
+        assert_eq!(summaries.items.len(), 1);
+        assert_eq!(summaries.items[0].item_type, "image");
+        assert!(summaries.items[0].is_pinned);
+
+        let payload = executor
+            .get_history_payload(1)
+            .expect("读取非文本 payload 失败")
+            .expect("非文本记录不存在");
+        assert_eq!(payload.item_type, "image");
+        assert_eq!(payload.text_content, None);
+        assert_eq!(payload.content_hash, vec![1]);
+        assert_eq!(payload.source_exe, None);
+        assert_eq!(payload.source_app, None);
+        assert_eq!(payload.last_used_at, None);
+        drop(executor);
         remove_directory(&directory);
     }
 

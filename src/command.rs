@@ -119,6 +119,8 @@ pub enum UiEvent {
     ReplaceSnapshot(UiSnapshot),
     /// 将一条已由持久化结果转换的剪贴板记录交给 UI 线程置顶显示。
     ClipboardCaptured(UiClipboardItem),
+    /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
+    MoveSelection { delta: i32 },
 }
 
 #[cfg(all(test, windows))]

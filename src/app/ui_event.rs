@@ -31,6 +31,8 @@ pub const UI_FIRST_BATCH_SIZE: usize = 30;
 enum UiAction {
     /// 显示面板，并在显示前完成目标快照与工作区定位。
     Show,
+    /// 选择索引已变化，需要在 UI 线程调整当前卡片视口。
+    ScrollSelection,
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
     Hide,
     /// 该事件只改变数据或已经过期，不触发窗口副作用。
@@ -97,6 +99,7 @@ impl UiState {
                     // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    self.select_first_if_needed();
                     UiAction::Show
                 }
             }
@@ -106,6 +109,7 @@ impl UiState {
                 } else {
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
                     self.panel_visible = true;
+                    self.select_first_if_needed();
                     UiAction::Show
                 }
             }
@@ -134,6 +138,7 @@ impl UiState {
             UiEvent::ReplaceSnapshot(snapshot) => {
                 let selected_hash = snapshot
                     .selected_index
+                    .map(|index| index.min(snapshot.items.len().saturating_sub(1)))
                     .and_then(|index| snapshot.items.get(index))
                     .map(|item| item.content_hash);
                 self.history.replace(snapshot.items.clone());
@@ -154,7 +159,54 @@ impl UiState {
                 restore_selected_index(&mut self.snapshot, selected_hash);
                 UiAction::None
             }
+            UiEvent::MoveSelection { delta } => {
+                // 面板隐藏后拒绝迟到的键盘事件，避免旧事件改变下一轮打开时的选择状态。
+                if !self.panel_visible {
+                    return UiAction::None;
+                }
+                self.move_selection(delta);
+                UiAction::ScrollSelection
+            }
         }
+    }
+
+    /// 面板首次显示时把选择置于当前首批第一项；空列表保持无选中项。
+    fn select_first_if_needed(&mut self) {
+        let limit = selection_limit(&self.snapshot);
+        if limit == 0 {
+            self.snapshot.selected_index = None;
+            return;
+        }
+
+        self.snapshot.selected_index = Some(
+            self.snapshot
+                .selected_index
+                .unwrap_or(0)
+                .min(limit.saturating_sub(1)),
+        );
+    }
+
+    /// 在当前窗口已构造的首批范围内按一步移动选择，边界处保持原索引。
+    fn move_selection(&mut self, delta: i32) {
+        let limit = selection_limit(&self.snapshot);
+        if limit == 0 {
+            self.snapshot.selected_index = None;
+            return;
+        }
+
+        let current = self
+            .snapshot
+            .selected_index
+            .unwrap_or(0)
+            .min(limit.saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else if delta > 0 {
+            current.saturating_add(1).min(limit.saturating_sub(1))
+        } else {
+            current
+        };
+        self.snapshot.selected_index = Some(next);
     }
 
     /// 返回当前打开代次，回调据此生成不会误伤新面板的关闭事件。
@@ -228,6 +280,12 @@ pub fn bind_app_window(window: &AppWindow) {
             eprintln!("面板关闭事件无法进入 UI 事件队列：{error}");
         }
     });
+
+    window.on_selection_move_requested(|delta| {
+        if let Err(error) = post_ui_event(UiEvent::MoveSelection { delta }) {
+            eprintln!("键盘选择事件无法进入 UI 事件队列：{error}");
+        }
+    });
 }
 
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
@@ -236,6 +294,9 @@ pub fn bind_app_window(window: &AppWindow) {
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
+        // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
+        // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
+        let refresh_model = !matches!(&event, UiEvent::MoveSelection { .. });
         let (action, snapshot) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
             let action = state.apply(event);
@@ -256,8 +317,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 return;
             };
 
-            // 每次快照事件都在 UI 线程重建轻量卡片模型；模型只包含摘要、来源和时间文案。
-            set_window_snapshot(&window, &snapshot);
+            // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
+            if refresh_model {
+                set_window_snapshot(&window, &snapshot);
+            }
+            if refresh_model || action == UiAction::ScrollSelection {
+                ensure_selection_visible(&window, snapshot.selected_index);
+            }
 
             match action {
                 UiAction::Show => {
@@ -266,6 +332,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
                     match window.show() {
                         Ok(()) => {
+                            ensure_selection_visible(&window, snapshot.selected_index);
                             #[cfg(windows)]
                             schedule_panel_position(&window, current_panel_generation(), 3);
                         }
@@ -280,6 +347,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                         eprintln!("无法隐藏剪贴板看板：{error}");
                     }
                 }
+                UiAction::ScrollSelection => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
                 UiAction::Quit => unreachable!("退出动作必须在窗口副作用前处理"),
@@ -290,17 +358,26 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
 /// 按内容哈希重定位选中项；去重或容量裁剪后仍优先保持原条目身份。
 fn restore_selected_index(snapshot: &mut UiSnapshot, selected_hash: Option<[u8; 32]>) {
+    let limit = selection_limit(snapshot);
+    if limit == 0 {
+        snapshot.selected_index = None;
+        return;
+    }
+
     snapshot.selected_index = selected_hash
         .and_then(|hash| {
             snapshot
                 .items
                 .iter()
+                .take(limit)
                 .position(|item| item.content_hash == hash)
         })
-        .or_else(|| {
-            selected_hash
-                .and_then(|_| (!snapshot.items.is_empty()).then_some(snapshot.items.len() - 1))
-        });
+        .or_else(|| selected_hash.map(|_| limit.saturating_sub(1)));
+}
+
+/// 计算当前快照可被窗口选择和构造的条目数量。
+fn selection_limit(snapshot: &UiSnapshot) -> usize {
+    snapshot.items.len().min(UI_FIRST_BATCH_SIZE)
 }
 
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
@@ -318,6 +395,48 @@ fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
 /// 返回窗口模型允许使用的首批摘要；完整内存快照保留在状态中供后续分页原子复用。
 fn visible_snapshot_items(snapshot: &UiSnapshot) -> impl Iterator<Item = &UiClipboardItem> {
     snapshot.items.iter().take(UI_FIRST_BATCH_SIZE)
+}
+
+/// 根据固定 106px 卡片高度计算保持选中项可见所需的负向视口偏移。
+fn selection_viewport_y(
+    selected_index: usize,
+    current_viewport_y: f32,
+    visible_height: f32,
+    content_height: f32,
+) -> f32 {
+    if visible_height <= 0.0 || content_height <= visible_height {
+        return 0.0;
+    }
+
+    let max_offset = (content_height - visible_height).max(0.0);
+    let current_offset = (-current_viewport_y).clamp(0.0, max_offset);
+    let item_top = selected_index as f32 * 106.0;
+    let item_bottom = item_top + 106.0;
+    let target_offset = if item_top < current_offset {
+        item_top
+    } else if item_bottom > current_offset + visible_height {
+        item_bottom - visible_height
+    } else {
+        current_offset
+    };
+
+    -target_offset.clamp(0.0, max_offset)
+}
+
+/// 在 UI 线程把选中卡片滚入视口；空列表或尚未完成布局时安全回到顶部。
+fn ensure_selection_visible(window: &AppWindow, selected_index: Option<usize>) {
+    let Some(selected_index) = selected_index else {
+        window.set_history_viewport_y(0.0);
+        return;
+    };
+
+    let target = selection_viewport_y(
+        selected_index,
+        window.get_history_viewport_y(),
+        window.get_history_visible_height(),
+        window.get_history_viewport_height(),
+    );
+    window.set_history_viewport_y(target);
 }
 
 /// 读取当前面板代次；Slint 回调在 UI 线程运行，因此不需要跨线程锁。
@@ -384,9 +503,23 @@ mod tests {
     //! 此测试模块验证面板代次协议，确保旧的关闭事件不会误关闭新面板。
 
     use super::{
-        visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
+        selection_viewport_y, visible_snapshot_items, UiAction, UiState, UI_FIRST_BATCH_SIZE,
+        UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{UiClipboardItem, UiEvent, UiSnapshot};
+
+    /// 构造具有稳定哈希的测试卡片，便于验证首批边界而不混入重复去重行为。
+    fn test_item(index: usize) -> UiClipboardItem {
+        UiClipboardItem {
+            id: index as u64 + 1,
+            preview: format!("条目-{index}"),
+            source: "测试来源".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [index as u8; 32],
+            copy_count: 1,
+            is_pinned: false,
+        }
+    }
 
     /// 打开两轮面板后，第一轮的关闭事件必须被 reducer 拒绝。
     #[test]
@@ -582,17 +715,7 @@ mod tests {
     #[test]
     fn 窗口模型首批固定三十条() {
         let snapshot = UiSnapshot {
-            items: (0..(UI_FIRST_BATCH_SIZE + 20))
-                .map(|index| UiClipboardItem {
-                    id: index as u64 + 1,
-                    preview: format!("条目-{index}"),
-                    source: "测试来源".to_owned(),
-                    relative_time: "刚刚".to_owned(),
-                    content_hash: [index as u8; 32],
-                    copy_count: 1,
-                    is_pinned: false,
-                })
-                .collect(),
+            items: (0..(UI_FIRST_BATCH_SIZE + 20)).map(test_item).collect(),
             selected_index: None,
         };
 
@@ -600,5 +723,104 @@ mod tests {
             visible_snapshot_items(&snapshot).count(),
             UI_FIRST_BATCH_SIZE
         );
+    }
+
+    /// 面板打开且存在首批记录时，选择应从第一张卡片开始。
+    #[test]
+    fn 打开面板默认选择第一项() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 空历史不应因为上下键产生伪造的索引。
+    #[test]
+    fn 空列表上下键保持无选择() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+
+        assert_eq!(
+            state.apply(UiEvent::MoveSelection { delta: 1 }),
+            UiAction::ScrollSelection
+        );
+        assert_eq!(state.snapshot.selected_index, None);
+        state.apply(UiEvent::MoveSelection { delta: -1 });
+        assert_eq!(state.snapshot.selected_index, None);
+    }
+
+    /// 面板隐藏后到达的迟到选择事件不能污染下一轮打开时的状态。
+    #[test]
+    fn 隐藏面板忽略迟到选择事件() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+
+        assert_eq!(
+            state.apply(UiEvent::MoveSelection { delta: 1 }),
+            UiAction::None
+        );
+        assert_eq!(state.snapshot.selected_index, None);
+    }
+
+    /// 连续上下键只能在当前首批范围内移动，不能越过两端。
+    #[test]
+    fn 三十条边界不越界() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..UI_FIRST_BATCH_SIZE).map(test_item).collect(),
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+
+        for _ in 0..(UI_FIRST_BATCH_SIZE + 10) {
+            state.apply(UiEvent::MoveSelection { delta: 1 });
+        }
+        assert_eq!(state.snapshot.selected_index, Some(UI_FIRST_BATCH_SIZE - 1));
+
+        for _ in 0..(UI_FIRST_BATCH_SIZE + 10) {
+            state.apply(UiEvent::MoveSelection { delta: -1 });
+        }
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 快照中存在超过首批的旧索引时，恢复逻辑必须夹到最后一张已构造卡片。
+    #[test]
+    fn 超过首批边界的旧选择被夹紧() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..(UI_FIRST_BATCH_SIZE + 10)).map(test_item).collect(),
+            selected_index: Some(UI_FIRST_BATCH_SIZE + 5),
+        }));
+
+        assert_eq!(state.snapshot.selected_index, Some(UI_FIRST_BATCH_SIZE - 1));
+    }
+
+    /// 外部快照带有越过实际条数的索引时，替换过程必须先夹到最后一条再恢复选择。
+    #[test]
+    fn 快照非法选择索引被安全夹紧() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: Some(usize::MAX),
+        }));
+
+        assert_eq!(state.snapshot.selected_index, Some(1));
+    }
+
+    /// 选中项进入视口上方、下方和内容边界时，偏移必须使用负向 viewport-y 并夹紧。
+    #[test]
+    fn 选中项视口定位使用固定卡片高度() {
+        assert_eq!(selection_viewport_y(0, 0.0, 212.0, 1000.0), 0.0);
+        assert_eq!(selection_viewport_y(4, 0.0, 212.0, 1000.0), -318.0);
+        assert_eq!(selection_viewport_y(29, 0.0, 212.0, 3180.0), -2968.0);
+        assert_eq!(selection_viewport_y(1, -318.0, 212.0, 1000.0), -106.0);
+        assert_eq!(selection_viewport_y(1, 0.0, 0.0, 1000.0), 0.0);
     }
 }

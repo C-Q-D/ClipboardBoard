@@ -25,6 +25,8 @@ component ListView inherits Flickable {
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次处理 Esc/失焦竞态。
     callback panel-dismiss-requested();
+    // 上下键只发出方向请求，选择状态和边界夹紧由 Rust UI reducer 统一处理。
+    callback selection-move-requested(delta: int);
     forward-focus: panel-focus;
 
     title: "ClipboardBoard";
@@ -45,6 +47,14 @@ export component AppWindow inherits Window {
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 panel-dismiss-requested();
+                accept
+            }
+            if (event.text == Key.UpArrow) {
+                selection-move-requested(-1);
+                accept
+            }
+            if (event.text == Key.DownArrow) {
+                selection-move-requested(1);
                 accept
             }
             reject

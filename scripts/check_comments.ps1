@@ -29,6 +29,7 @@ $requiredFiles = @(
     'src/platform/windows/system_window.rs',
     'src/platform/windows/tray.rs',
     'src/platform/windows/single_instance.rs',
+    'src/platform/windows/source.rs',
     'src/platform/windows/window/mod.rs',
     'src/platform/windows/window/lifecycle.rs'
 )

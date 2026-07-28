@@ -40,6 +40,8 @@ enum UiAction {
     Reassert,
     /// 选择索引已变化，需要在 UI 线程调整当前卡片视口。
     ScrollSelection,
+    /// 鼠标已经选择一张当前卡片，只同步选中视觉，不改变列表视口。
+    SelectItem,
     /// 请求将当前选中记录按 ID 写回系统剪贴板；不隐藏面板也不重建模型。
     CopySelection { id: u64, content_hash: [u8; 32] },
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
@@ -236,6 +238,28 @@ impl UiState {
                 }
                 self.move_selection(delta);
                 UiAction::ScrollSelection
+            }
+            UiEvent::SelectItem {
+                panel_generation,
+                id,
+                content_hash,
+            } => {
+                // 点击事件跨过异步 UI 队列后，索引可能已经被搜索、捕获或重排复用。
+                // 因此只接受仍属于当前面板代次、且当前首批列表中 ID/哈希同时匹配的身份。
+                if !self.panel_visible || panel_generation != self.panel_generation {
+                    return UiAction::None;
+                }
+                let Some(index) = self
+                    .snapshot
+                    .items
+                    .iter()
+                    .take(selection_limit(&self.snapshot))
+                    .position(|item| item.id == id && item.content_hash == content_hash)
+                else {
+                    return UiAction::None;
+                };
+                self.snapshot.selected_index = Some(index);
+                UiAction::SelectItem
             }
             UiEvent::CopySelection => {
                 if !self.panel_visible {
@@ -461,7 +485,7 @@ pub struct UiStateSnapshot {
     pub applied_on_thread: Option<ThreadId>,
 }
 
-/// 在 UI 线程登记主窗口弱引用，并把 Slint 的 Esc、原生关闭和上下选择回调接入状态协议。
+/// 在 UI 线程登记主窗口弱引用，并把关闭、键盘、鼠标与搜索回调接入状态协议。
 pub fn bind_app_window(window: &AppWindow) {
     UI_WINDOW.with(|target| {
         *target.borrow_mut() = Some(window.as_weak());
@@ -482,6 +506,16 @@ pub fn bind_app_window(window: &AppWindow) {
     window.on_selection_move_requested(|delta| {
         if let Err(error) = post_ui_event(UiEvent::MoveSelection { delta }) {
             eprintln!("键盘选择事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_card_selection_requested(|index| {
+        // Slint 回调与 UI reducer 位于同一线程；在事件排队前立刻把易变索引解析成稳定身份。
+        let Some(event) = resolve_card_selection(index) else {
+            return;
+        };
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("鼠标选择事件无法进入 UI 事件队列：{error}");
         }
     });
 
@@ -518,7 +552,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = !matches!(
             &event,
-            UiEvent::MoveSelection { .. } | UiEvent::CopySelection
+            UiEvent::MoveSelection { .. } | UiEvent::SelectItem { .. } | UiEvent::CopySelection
         );
         let (action, snapshot, search_text, search_filter, search_status) =
             UI_STATE.with(|state| {
@@ -559,6 +593,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             if refresh_model {
                 set_window_snapshot(&window, &snapshot);
             }
+            // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
+            window.set_selected_index(
+                snapshot
+                    .selected_index
+                    .and_then(|index| i32::try_from(index).ok())
+                    .unwrap_or(-1),
+            );
             if refresh_model || action == UiAction::ScrollSelection {
                 ensure_selection_visible(&window, snapshot.selected_index);
             }
@@ -608,6 +649,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     }
                 }
                 UiAction::ScrollSelection => {}
+                UiAction::SelectItem => {}
                 UiAction::CopySelection { .. } => {}
                 UiAction::ScheduleSearch { .. } => {}
                 UiAction::None => {}
@@ -657,6 +699,23 @@ fn selection_limit(snapshot: &UiSnapshot) -> usize {
     snapshot.items.len().min(UI_FIRST_BATCH_SIZE)
 }
 
+/// 将当前可见卡片索引同步解析为代次绑定的稳定身份；空白区和越界索引直接忽略。
+fn resolve_card_selection(index: i32) -> Option<UiEvent> {
+    let index = usize::try_from(index).ok()?;
+    UI_STATE.with(|state| {
+        let state = state.borrow();
+        if !state.panel_visible || index >= selection_limit(&state.snapshot) {
+            return None;
+        }
+        let item = state.snapshot.items.get(index)?;
+        Some(UiEvent::SelectItem {
+            panel_generation: state.panel_generation,
+            id: item.id,
+            content_hash: item.content_hash,
+        })
+    })
+}
+
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
 fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
     let cards = visible_snapshot_items(snapshot)
@@ -667,6 +726,12 @@ fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
+    window.set_selected_index(
+        snapshot
+            .selected_index
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1),
+    );
 }
 
 /// 将搜索框、标签和结果状态同步到 Slint；状态文案不携带查询正文之外的内部错误。
@@ -1139,6 +1204,133 @@ mod tests {
 
         assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
         assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 鼠标点击携带的稳定身份必须选中对应卡片，并与键盘共用同一个选中索引。
+    #[test]
+    fn 鼠标按稳定身份选择卡片() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1), test_item(2)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        assert_eq!(
+            state.apply(UiEvent::SelectItem {
+                panel_generation: generation,
+                id: 3,
+                content_hash: [2; 32],
+            }),
+            UiAction::SelectItem
+        );
+        assert_eq!(state.snapshot.selected_index, Some(2));
+
+        state.apply(UiEvent::MoveSelection { delta: -1 });
+        assert_eq!(state.snapshot.selected_index, Some(1));
+    }
+
+    /// 点击索引必须在排队前解析为当前面板代次、记录 ID 和内容哈希三元身份。
+    #[test]
+    fn 点击索引同步解析为稳定身份() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), test_item(1), test_item(2)],
+                selected_index: None,
+            }));
+            state.apply(UiEvent::OpenPanel);
+        });
+
+        assert_eq!(
+            super::resolve_card_selection(1),
+            Some(UiEvent::SelectItem {
+                panel_generation: 1,
+                id: 2,
+                content_hash: [1; 32],
+            })
+        );
+        assert_eq!(super::resolve_card_selection(-1), None);
+        assert_eq!(super::resolve_card_selection(3), None);
+    }
+
+    /// 面板关闭并重新打开后，旧代次的点击事件不能改变新会话选择。
+    #[test]
+    fn 旧面板代次点击被忽略() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_generation = state.panel_generation();
+        state.apply(UiEvent::HidePanel {
+            generation: old_generation,
+        });
+        state.apply(UiEvent::OpenPanel);
+
+        assert_eq!(
+            state.apply(UiEvent::SelectItem {
+                panel_generation: old_generation,
+                id: 2,
+                content_hash: [1; 32],
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 点击事件排队后若列表已重排且原身份不在当前首批，不能误选相同索引的新条目。
+    #[test]
+    fn 迟到点击不会误选重排后的同索引条目() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(2), test_item(0)],
+            selected_index: Some(0),
+        }));
+        assert_eq!(
+            state.apply(UiEvent::SelectItem {
+                panel_generation: generation,
+                id: 2,
+                content_hash: [1; 32],
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.snapshot.items[0].id, 3);
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 稳定身份要求 ID 与哈希同时匹配，任一字段不同都不能选择记录。
+    #[test]
+    fn 鼠标选择同时校验记录_id_和哈希() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        for (id, content_hash) in [(2, [0; 32]), (1, [1; 32])] {
+            assert_eq!(
+                state.apply(UiEvent::SelectItem {
+                    panel_generation: generation,
+                    id,
+                    content_hash,
+                }),
+                UiAction::None
+            );
+            assert_eq!(state.snapshot.selected_index, Some(0));
+        }
     }
 
     /// 关键词必须在防抖截止后应用，并把结果状态从 loading 转为 results。

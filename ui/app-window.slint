@@ -29,6 +29,8 @@ export component AppWindow inherits Window {
     callback panel-dismiss-requested();
     // 上下键只发出方向请求，选择状态和边界夹紧由 Rust UI reducer 统一处理。
     callback selection-move-requested(delta: int);
+    // 点击卡片只把当前可见索引交给 Rust；Rust 必须在 UI 线程同步解析稳定记录身份。
+    callback card-selection-requested(index: int);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -41,6 +43,8 @@ export component AppWindow inherits Window {
     background: #080808;
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
+    // 鼠标与键盘共用同一选中索引；负数表示当前没有选中卡片。
+    in property <int> selected-index: -1;
     // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
     in-out property <string> search-text: "";
     in-out property <int> search-filter: 0;
@@ -177,15 +181,20 @@ export component AppWindow inherits Window {
                 history-list := ListView {
                     vertical-stretch: 1;
 
-                    for card in cards: Rectangle {
+                    for card[index] in cards: Rectangle {
                         // 106px delegate = 96px 卡片 + 10px 透明间隔，保持原有视觉密度。
                         height: 106px;
                         background: transparent;
 
-                        Rectangle {
+                        card-background := Rectangle {
                             height: 96px;
                             width: parent.width;
-                            background: #141414;
+                            // 选中态优先于悬停态，确保鼠标离开后仍能辨认当前复制目标。
+                            background: index == selected-index
+                                ? #242424
+                                : card-touch.has-hover ? #1b1b1b : #141414;
+                            border-width: index == selected-index ? 2px : 1px;
+                            border-color: index == selected-index ? #f5f5f5 : #292929;
                             border-radius: 10px;
 
                             VerticalLayout {
@@ -217,6 +226,14 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: right;
                                         horizontal-stretch: 1;
                                     }
+                                }
+                            }
+
+                            card-touch := TouchArea {
+                                // 右侧 56px 是后续复制按钮的独立操作区；本原子只固定边界，不提前实现按钮。
+                                width: parent.width - 56px;
+                                clicked => {
+                                    card-selection-requested(index);
                                 }
                             }
                         }

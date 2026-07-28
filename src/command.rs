@@ -188,6 +188,15 @@ pub enum UiEvent {
     SearchDebounceElapsed { generation: u64 },
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
     MoveSelection { delta: i32 },
+    /// 请求选中一次点击时解析出的稳定记录身份；异步应用时必须重新校验面板代次和内容身份。
+    SelectItem {
+        /// 点击发生时的面板打开代次，旧会话事件必须被拒绝。
+        panel_generation: u64,
+        /// 点击发生时对应的持久化记录 ID。
+        id: u64,
+        /// 点击发生时对应的内容哈希，用于防止同一 ID 或索引被迟到事件误用。
+        content_hash: [u8; 32],
+    },
     /// 请求 UI reducer 将当前选中项按 ID 写回系统剪贴板；正文不进入事件。
     CopySelection,
 }

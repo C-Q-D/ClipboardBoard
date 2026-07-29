@@ -25,7 +25,9 @@ pub(crate) struct HotkeySpec {
 /// 当前版本的默认全局快捷键。
 pub(crate) const DEFAULT_HOTKEY: HotkeySpec = HotkeySpec {
     id: 0x4342,
-    modifiers: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_ALT,
+    // 显隐切换必须把一次物理按住压缩成一个事件，避免系统键盘重复令面板来回闪烁。
+    modifiers: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_ALT
+        | windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_NOREPEAT,
     virtual_key: windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_V as u32,
     label: "Alt + V",
 };
@@ -178,10 +180,14 @@ mod tests {
 
     use super::DEFAULT_HOTKEY;
 
-    /// Alt+V 必须由 Alt 修饰键和 V 虚拟键组成，ID 不能使用系统保留的零值。
+    /// Alt+V 必须由 Alt、V 和禁止重复标志组成，ID 不能使用系统保留的零值。
     #[test]
     fn 默认快捷键规格稳定() {
-        assert_eq!(DEFAULT_HOTKEY.modifiers, 1);
+        assert_eq!(
+            DEFAULT_HOTKEY.modifiers,
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_ALT
+                | windows_sys::Win32::UI::Input::KeyboardAndMouse::MOD_NOREPEAT
+        );
         assert_eq!(DEFAULT_HOTKEY.virtual_key, 86);
         assert_ne!(DEFAULT_HOTKEY.id, 0);
         assert_eq!(DEFAULT_HOTKEY.label, "Alt + V");

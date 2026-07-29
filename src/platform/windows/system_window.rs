@@ -265,9 +265,9 @@ unsafe extern "system" fn window_proc(
         return 0;
     }
 
-    if is_open_panel_message(message) || is_default_hotkey_message(message, wparam) {
-        if let Err(error) = post_ui_event(UiEvent::OpenPanel) {
-            eprintln!("打开面板事件无法进入 UI 事件队列：{error}");
+    if let Some(event) = panel_event_for_message(message, wparam) {
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("面板显示状态事件无法进入 UI 事件队列：{error}");
         }
         return 0;
     }
@@ -328,6 +328,20 @@ fn is_open_panel_message(message: u32) -> bool {
     message == OPEN_PANEL_MESSAGE
 }
 
+/// 将原生消息映射为互不混淆的面板语义：二次启动幂等显示，热键切换显隐。
+fn panel_event_for_message(
+    message: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+) -> Option<UiEvent> {
+    if is_open_panel_message(message) {
+        Some(UiEvent::ShowPanel)
+    } else if is_default_hotkey_message(message, wparam) {
+        Some(UiEvent::OpenPanel)
+    } else {
+        None
+    }
+}
+
 /// 拉取并分发消息，返回值 -1 被视为 Win32 错误，0 表示收到退出消息。
 fn message_loop() -> Result<(), HotkeyError> {
     loop {
@@ -357,8 +371,10 @@ mod tests {
     use super::TRAY_CALLBACK_MESSAGE;
     use super::{
         classify_registration_error, is_clipboard_update_message, is_default_hotkey_message,
-        is_open_panel_message, is_tray_callback_message, OPEN_PANEL_MESSAGE,
+        is_open_panel_message, is_tray_callback_message, panel_event_for_message,
+        OPEN_PANEL_MESSAGE,
     };
+    use crate::command::UiEvent;
     use crate::platform::windows::hotkey::HotkeyError;
     use windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED;
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CLIPBOARDUPDATE, WM_HOTKEY};
@@ -376,6 +392,20 @@ mod tests {
     fn 只接受固定打开消息() {
         assert!(is_open_panel_message(OPEN_PANEL_MESSAGE));
         assert!(!is_open_panel_message(OPEN_PANEL_MESSAGE + 1));
+    }
+
+    /// 二次启动必须幂等显示，Alt+V 必须切换，不能因共享消息窗口而混淆行为。
+    #[test]
+    fn 原生消息区分幂等显示与热键切换() {
+        assert_eq!(
+            panel_event_for_message(OPEN_PANEL_MESSAGE, 0),
+            Some(UiEvent::ShowPanel)
+        );
+        assert_eq!(
+            panel_event_for_message(WM_HOTKEY, 0x4342),
+            Some(UiEvent::OpenPanel)
+        );
+        assert_eq!(panel_event_for_message(WM_HOTKEY, 0x4343), None);
     }
 
     /// 只有固定托盘回调消息才进入托盘处理器。

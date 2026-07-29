@@ -11,10 +11,11 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTOPRIMARY,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE,
+    BringWindowToTop, FindWindowExW, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    SetForegroundWindow, SetWindowPos, SwitchToThisWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 
 /// 鼠标所在显示器扣除任务栏后的物理工作区。
@@ -118,7 +119,25 @@ pub(crate) fn activate_panel() -> bool {
         return false;
     }
 
-    unsafe { SetForegroundWindow(hwnd) != 0 }
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd {
+            return true;
+        }
+
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        if SetForegroundWindow(hwnd) == 0 || GetForegroundWindow() != hwnd {
+            // Windows 前台锁可能拒绝普通激活；该 API 与系统任务切换行为一致，作为
+            // 有界降级确保用户通过热键呼出后可立即输入搜索或按 Esc 关闭。
+            SwitchToThisWindow(hwnd, 1);
+        }
+        let activated = GetForegroundWindow() == hwnd;
+        if activated {
+            let _ = SetFocus(hwnd);
+        }
+        activated
+    }
 }
 
 /// 读取鼠标所在显示器的任务栏避让工作区；显示器查询失败时返回 `None`。

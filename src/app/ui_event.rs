@@ -250,7 +250,9 @@ impl UiState {
         match event {
             UiEvent::OpenPanel => {
                 if self.panel_visible {
-                    UiAction::Reassert
+                    // 全局热键是显式开关：第二次按下必须与 Esc 一样完整收口当前会话。
+                    self.hide_current_panel();
+                    UiAction::Hide
                 } else {
                     // 饱和递增保证长时间运行后不会回到零，从而避免旧事件碰巧匹配新代次。
                     self.panel_generation = self.panel_generation.saturating_add(1).max(1);
@@ -286,16 +288,7 @@ impl UiState {
             }
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
-                    self.panel_visible = false;
-                    self.clear_unpinned_confirmation_visible = false;
-                    self.clear_all_confirmation_visible = false;
-                    self.clear_all_confirmation_text.clear();
-                    self.search.cancel();
-                    self.history_pages.invalidate();
-                    self.pending_history_request = None;
-                    self.next_history_cursor = None;
-                    self.history_retry_required = false;
-                    self.history_was_near_bottom = false;
+                    self.hide_current_panel();
                     UiAction::Hide
                 } else {
                     // 旧代次的 Esc 关闭事件只能被记录，不能关闭新一轮面板。
@@ -470,6 +463,27 @@ impl UiState {
                 panel_generation,
                 confirmation_text,
             } => self.begin_clear_all_mutation(panel_generation, confirmation_text),
+        }
+    }
+
+    /// 收口当前面板会话；Esc 与第二次全局热键必须复用完全相同的状态清理规则。
+    fn hide_current_panel(&mut self) {
+        self.panel_visible = false;
+        self.clear_unpinned_confirmation_visible = false;
+        self.clear_all_confirmation_visible = false;
+        self.clear_all_confirmation_text.clear();
+        self.search.cancel();
+        self.history_pages.invalidate();
+        self.pending_history_request = None;
+        self.next_history_cursor = None;
+        self.history_retry_required = false;
+        self.history_was_near_bottom = false;
+    }
+
+    /// 首次显示副作用失败时回滚匹配代次，避免下一次热键把实际隐藏窗口误判为可见。
+    fn mark_panel_show_failed(&mut self, generation: u64) {
+        if self.panel_visible && self.panel_generation == generation {
+            self.hide_current_panel();
         }
     }
 
@@ -1755,17 +1769,31 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
             match action {
                 UiAction::Show => {
+                    let show_generation = current_panel_generation();
                     let show_result = perform_show_action(
                         || window.show(),
                         || {
                             ensure_selection_visible(&window, snapshot.selected_index);
                             #[cfg(windows)]
-                            schedule_panel_activation(&window, current_panel_generation(), 3, true);
+                            {
+                                let positioned = position_panel(&window);
+                                let activated = activate_panel();
+                                if !positioned || !activated {
+                                    schedule_panel_activation(
+                                        &window,
+                                        current_panel_generation(),
+                                        3,
+                                        true,
+                                    );
+                                }
+                            }
                         },
                     );
                     if let Err(error) = show_result {
-                        // 平台显示失败不能回滚 reducer；面板会话、搜索、筛选和选择保持不变，
-                        // 后续 Alt+V 仍可通过 Reassert 重试。
+                        // 失败时按代次回滚可见会话；下一次热键必须重新执行 Show。
+                        UI_STATE.with(|state| {
+                            state.borrow_mut().mark_panel_show_failed(show_generation);
+                        });
                         eprintln!("无法显示剪贴板看板：{error}");
                     }
                 }
@@ -1774,12 +1802,18 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                         || window.show(),
                         || {
                             #[cfg(windows)]
-                            schedule_panel_activation(
-                                &window,
-                                current_panel_generation(),
-                                3,
-                                false,
-                            );
+                            {
+                                let positioned = reassert_panel_topmost();
+                                let activated = activate_panel();
+                                if !positioned || !activated {
+                                    schedule_panel_activation(
+                                        &window,
+                                        current_panel_generation(),
+                                        3,
+                                        false,
+                                    );
+                                }
+                            }
                         },
                     );
                     if let Err(error) = show_result {
@@ -2774,9 +2808,9 @@ mod tests {
         );
     }
 
-    /// 首次打开立即请求 30 条 SQLite 首页，可见状态下重复激活不得重查。
+    /// 首次打开立即请求 30 条 SQLite 首页，托盘重复显示不得重查。
     #[test]
-    fn 首次打开立即查询首页且重复激活不重查() {
+    fn 首次打开立即查询首页且托盘重复显示不重查() {
         let mut state = UiState::default();
         assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
         let request = state
@@ -2785,7 +2819,7 @@ mod tests {
         assert_eq!(request.query.limit, UI_FIRST_BATCH_SIZE as u32);
         assert!(request.query.cursor.is_none());
 
-        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Reassert);
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::Reassert);
         assert!(state.take_pending_history_request().is_none());
     }
 
@@ -3104,9 +3138,9 @@ mod tests {
         assert_eq!(state.panel_generation(), generation);
     }
 
-    /// 重复热键只重新激活窗口，不能重置 generation、搜索条件或当前选择。
+    /// 重复热键必须隐藏当前面板，形成与 Esc 一致的显式开关契约。
     #[test]
-    fn 重复热键保持当前面板会话() {
+    fn 重复热键隐藏当前面板() {
         let start = Instant::now();
         let mut state = UiState::default();
         state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
@@ -3119,51 +3153,50 @@ mod tests {
         state.apply_at(UiEvent::SearchTextChanged("条目".to_owned()), start);
         let before = state.snapshot();
 
-        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Reassert);
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Hide);
         let after = state.snapshot();
         assert_eq!(after.snapshot, before.snapshot);
-        assert_eq!(after.search_text, before.search_text);
-        assert_eq!(after.search_filter, before.search_filter);
-        assert_eq!(after.search_status, before.search_status);
-        assert_eq!(after.search_generation, before.search_generation);
         assert_eq!(after.panel_generation, before.panel_generation);
-        assert!(after.panel_visible);
+        assert!(!after.panel_visible);
     }
 
-    /// 显示和重新激活失败都不能回滚 reducer 会话，也不能安排后续原生激活。
+    /// 首次显示失败必须恢复隐藏状态，使下一次热键重新执行 Show，而不是误走关闭。
     #[test]
-    fn 窗口显示失败保持当前会话() {
-        for already_visible in [false, true] {
-            let mut state = UiState::default();
-            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
-                items: vec![test_item(0), test_item(1)],
-                selected_index: Some(1),
-            }));
-            if already_visible {
-                state.apply(UiEvent::OpenPanel);
-                state.search_text = "保留查询".to_owned();
-            }
-            let action = state.apply(UiEvent::OpenPanel);
-            assert_eq!(
-                action,
-                if already_visible {
-                    UiAction::Reassert
-                } else {
-                    UiAction::Show
-                }
-            );
-            let before = state.snapshot();
-            let activation_scheduled = std::cell::Cell::new(false);
+    fn 显示失败后下一次热键重新打开() {
+        let mut state = UiState::default();
 
-            let result = perform_show_action(
-                || Err::<(), _>("注入显示失败"),
-                || activation_scheduled.set(true),
-            );
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        let failed_generation = state.panel_generation();
+        state.mark_panel_show_failed(failed_generation);
+        assert!(!state.panel_visible);
 
-            assert_eq!(result, Err("注入显示失败"));
-            assert!(!activation_scheduled.get());
-            assert_eq!(state.snapshot(), before);
-        }
+        assert_eq!(state.apply(UiEvent::OpenPanel), UiAction::Show);
+        assert!(state.panel_visible);
+        assert!(state.panel_generation() > failed_generation);
+    }
+
+    /// 重新激活时的 show 失败保持既有可见会话，同时不能安排后续原生激活。
+    #[test]
+    fn 窗口重新激活失败保持当前会话() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: Some(1),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.search_text = "保留查询".to_owned();
+        assert_eq!(state.apply(UiEvent::ShowPanel), UiAction::Reassert);
+        let before = state.snapshot();
+        let activation_scheduled = std::cell::Cell::new(false);
+
+        let result = perform_show_action(
+            || Err::<(), _>("注入重新显示失败"),
+            || activation_scheduled.set(true),
+        );
+
+        assert_eq!(result, Err("注入重新显示失败"));
+        assert!(!activation_scheduled.get());
+        assert_eq!(state.snapshot(), before);
     }
 
     /// 激活被 Windows 拒绝时只消费重试预算，耗尽后返回固定记录结果。

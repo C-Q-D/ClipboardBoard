@@ -90,6 +90,22 @@ impl MemoryHistory {
         }
     }
 
+    /// 按稳定身份同步一条缓存记录的收藏状态；不在缓存内时保持无副作用。
+    ///
+    /// 缓存可能属于另一筛选集合，因此返回值只表示缓存是否命中，不能作为数据库
+    /// 或当前可见快照是否成功更新的判据。
+    pub fn set_pinned(&mut self, id: u64, content_hash: [u8; 32], is_pinned: bool) -> bool {
+        let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id && item.content_hash == content_hash)
+        else {
+            return false;
+        };
+        item.is_pinned = is_pinned;
+        true
+    }
+
     /// 以只读切片形式暴露当前顺序，调用方不能绕过协调器修改去重状态。
     pub fn items(&self) -> &[UiClipboardItem] {
         &self.items
@@ -233,5 +249,16 @@ mod tests {
         assert_eq!(actual.relative_time, "刚刚");
         assert_eq!(actual.copy_count, u64::MAX);
         assert!(actual.is_pinned);
+    }
+
+    /// 收藏同步必须同时校验 ID 和哈希，且缓存未命中时不能误改其他记录。
+    #[test]
+    fn 按稳定身份同步收藏状态() {
+        let mut history = MemoryHistory::new(10);
+        history.record(item(21, "目标", "刚刚", false));
+        assert!(!history.set_pinned(99, [21; 32], true));
+        assert!(!history.set_pinned(21, [99; 32], true));
+        assert!(history.set_pinned(21, [21; 32], true));
+        assert!(history.items()[0].is_pinned);
     }
 }

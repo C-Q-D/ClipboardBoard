@@ -15,7 +15,7 @@ use crate::storage::{SetPinnedInput, StorageClient, StorageError};
 const PIN_MUTATION_QUEUE_CAPACITY: usize = 1;
 
 /// 一次收藏状态变更的稳定身份；不携带正文、预览或来源信息。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PinMutationRequest {
     /// UI 分配的单调 mutation 令牌，用于隔离同记录的迟到结果。
     pub mutation_token: u64,

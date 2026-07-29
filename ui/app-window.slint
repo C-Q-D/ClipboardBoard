@@ -12,6 +12,10 @@ export struct ClipboardCard {
     source: string,
     // 由应用状态层格式化的相对时间文本。
     relative_time: string,
+    // 数据库已经提交的最终收藏状态；pending 期间保持旧值。
+    is_pinned: bool,
+    // 当前卡片是否正在等待收藏事务结果，用于禁用重复点击。
+    pin_pending: bool,
 }
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -33,6 +37,8 @@ export component AppWindow inherits Window {
     callback card-selection-requested(index: int);
     // 复制按钮只发送当前可见索引；正文读取和系统剪贴板写回只能在后台执行。
     callback copy-item-requested(index: int);
+    // 收藏按钮只提交当前索引，Rust 同步解析稳定身份并生成明确期望状态。
+    callback pin-item-requested(index: int);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -56,6 +62,8 @@ export component AppWindow inherits Window {
     in-out property <int> search-filter: 0;
     in property <string> search-status: "idle";
     in property <bool> history-retry-required: false;
+    // 收藏失败只展示固定文案，不接收 SQLite 或正文错误详情。
+    in property <bool> pin-error-visible: false;
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -212,7 +220,7 @@ export component AppWindow inherits Window {
                             border-radius: 10px;
 
                             VerticalLayout {
-                                width: parent.width - 56px;
+                                width: parent.width - 100px;
                                 padding: 14px;
                                 spacing: 8px;
 
@@ -245,10 +253,39 @@ export component AppWindow inherits Window {
                             }
 
                             card-touch := TouchArea {
-                                // 右侧 56px 属于复制按钮，主体选择区与操作区不重叠。
-                                width: parent.width - 56px;
+                                // 右侧 100px 属于收藏和复制按钮，主体选择区与操作区不重叠。
+                                width: parent.width - 100px;
                                 clicked => {
                                     card-selection-requested(index);
+                                }
+                            }
+
+                            pin-button := Rectangle {
+                                x: parent.width - 94px;
+                                y: 30px;
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 6px;
+                                background: pin-touch.pressed
+                                    ? #f5f5f5
+                                    : pin-touch.has-hover ? #303030 : #242424;
+                                border-width: 1px;
+                                border-color: card.is_pinned ? #f5f5f5 : #4a4a4a;
+
+                                Text {
+                                    text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
+                                    color: pin-touch.pressed ? #080808 : #f5f5f5;
+                                    font-size: card.pin_pending ? 15px : 18px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                pin-touch := TouchArea {
+                                    clicked => {
+                                        if (!card.pin_pending) {
+                                            pin-item-requested(index);
+                                        }
+                                    }
                                 }
                             }
 
@@ -298,6 +335,13 @@ export component AppWindow inherits Window {
                     retry-touch := TouchArea {
                         clicked => { retry-history-page-requested(); }
                     }
+                }
+
+                if pin-error-visible: Text {
+                    text: "收藏更新失败，请重试";
+                    color: #d99b6c;
+                    font-size: 13px;
+                    horizontal-alignment: center;
                 }
 
                 if search-status == "loading": Text {

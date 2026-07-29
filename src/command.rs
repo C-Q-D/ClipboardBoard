@@ -222,6 +222,17 @@ pub enum UiEvent {
         /// 按钮点击时对应的内容哈希，后台读取正文后还会再次复核。
         content_hash: [u8; 32],
     },
+    /// 请求把卡片设置为明确收藏状态；UI reducer 会分配 mutation 令牌后再投递后台。
+    PinItem {
+        /// 点击发生时的面板代次。
+        panel_generation: u64,
+        /// 点击时对应的持久化记录 ID。
+        id: u64,
+        /// 点击时对应的固定内容哈希。
+        content_hash: [u8; 32],
+        /// 根据点击瞬间卡片状态计算出的明确期望状态。
+        is_pinned: bool,
+    },
 }
 
 #[cfg(all(test, windows))]

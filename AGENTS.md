@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| `ATOMIC-WCB-FAVORITE-001` | 原子开发 | [收藏管理原子计划](docs/planning/收藏管理原子计划.md) |
+| — | — | 当前无活动计划，等待用户验证收藏管理 |
 
 <!-- codex-plan-index:end -->

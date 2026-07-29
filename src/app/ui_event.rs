@@ -8,7 +8,7 @@
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
-use crate::history_mutation::PinMutationSender;
+use crate::history_mutation::{PinMutationRequest, PinMutationResult, PinMutationSender};
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
     HistoryRequestSender, HistoryResultReceiver, MAX_LOADED_ITEMS,
@@ -53,6 +53,8 @@ enum UiAction {
     SelectItem,
     /// 请求将按钮身份对应的记录排入后台复制邮箱；不隐藏面板也不重建模型。
     QueueCopy { id: u64, content_hash: [u8; 32] },
+    /// 请求把完整稳定身份投递到收藏单槽；提交失败由事件入口回写固定错误状态。
+    QueuePin(PinMutationRequest),
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
     ScheduleSearch { generation: u64 },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
@@ -136,6 +138,12 @@ struct UiState {
     history_retry_required: bool,
     /// 上一次几何通知是否位于底部阈值内，用于检测 outside→inside 边沿。
     history_was_near_bottom: bool,
+    /// 当前唯一在途收藏请求；隐藏面板不会取消已经接受的持久化事务。
+    pending_pin_mutation: Option<PinMutationRequest>,
+    /// 下一次收藏请求使用的单调令牌；耗尽时拒绝新请求而不回绕。
+    next_pin_mutation_token: u64,
+    /// 固定收藏失败提示的可见状态，不保存底层错误详情。
+    pin_error_visible: bool,
     panel_visible: bool,
     /// 只有从隐藏进入可见的新会话才递增，用来隔离旧的 Esc 事件。
     panel_generation: u64,
@@ -146,7 +154,7 @@ struct UiState {
 }
 
 impl Default for UiState {
-    /// 使用 ATOM-18B 固定的 100 条内存历史容量初始化 UI 状态。
+    /// 使用与窗口分页一致的 2,000 条摘要上限初始化 UI 状态。
     fn default() -> Self {
         Self {
             snapshot: UiSnapshot::default(),
@@ -161,6 +169,9 @@ impl Default for UiState {
             next_history_cursor: None,
             history_retry_required: false,
             history_was_near_bottom: false,
+            pending_pin_mutation: None,
+            next_pin_mutation_token: 1,
+            pin_error_visible: false,
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
@@ -274,8 +285,10 @@ impl UiState {
                 self.apply_search_if_current(generation, now)
             }
             UiEvent::HistoryQueryWake => UiAction::None,
-            // FAV-02 只建立后台桥和退出协议；FAV-03 再消费结果并更新卡片状态。
-            UiEvent::PinMutationCompleted(_) => UiAction::None,
+            UiEvent::PinMutationCompleted(result) => {
+                self.apply_pin_mutation_result(result);
+                UiAction::None
+            }
             UiEvent::HistoryViewportChanged {
                 viewport_y,
                 visible_height,
@@ -342,6 +355,122 @@ impl UiState {
                 self.snapshot.selected_index = Some(index);
                 UiAction::QueueCopy { id, content_hash }
             }
+            UiEvent::PinItem {
+                panel_generation,
+                id,
+                content_hash,
+                is_pinned,
+            } => self.begin_pin_mutation(panel_generation, id, content_hash, is_pinned),
+        }
+    }
+
+    /// 校验卡片稳定身份并建立唯一在途收藏请求；卡片状态在此阶段保持不变。
+    fn begin_pin_mutation(
+        &mut self,
+        panel_generation: u64,
+        id: u64,
+        content_hash: [u8; 32],
+        is_pinned: bool,
+    ) -> UiAction {
+        if !self.panel_visible
+            || panel_generation != self.panel_generation
+            || self.pending_pin_mutation.is_some()
+        {
+            return UiAction::None;
+        }
+        let Some(item) = self
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.id == id && item.content_hash == content_hash)
+        else {
+            return UiAction::None;
+        };
+        if item.is_pinned == is_pinned || self.next_pin_mutation_token == u64::MAX {
+            return UiAction::None;
+        }
+
+        let request = PinMutationRequest {
+            mutation_token: self.next_pin_mutation_token,
+            panel_generation,
+            id,
+            content_hash,
+            is_pinned,
+        };
+        self.next_pin_mutation_token += 1;
+        self.pending_pin_mutation = Some(request);
+        self.pin_error_visible = false;
+        UiAction::QueuePin(request)
+    }
+
+    /// 只接受与活动 mutation 五元身份完全一致的结果，并在提交成功后更新卡片。
+    fn apply_pin_mutation_result(&mut self, result: PinMutationResult) {
+        let Some(pending) = self.pending_pin_mutation else {
+            return;
+        };
+        if result.mutation_token != pending.mutation_token
+            || result.panel_generation != pending.panel_generation
+            || result.id != pending.id
+            || result.content_hash != pending.content_hash
+            || result.is_pinned != pending.is_pinned
+        {
+            return;
+        }
+
+        self.pending_pin_mutation = None;
+        match result.outcome {
+            Ok(()) => {
+                self.pin_error_visible = false;
+                self.history
+                    .set_pinned(result.id, result.content_hash, result.is_pinned);
+                let selected_identity = self
+                    .snapshot
+                    .selected_index
+                    .and_then(|index| self.snapshot.items.get(index))
+                    .map(|item| (item.id, item.content_hash));
+                if self.search_filter == SearchFilter::Pinned && !result.is_pinned {
+                    // 收藏筛选下取消后立即移除，避免等待异步首页期间仍显示已取消记录。
+                    self.snapshot.items.retain(|item| {
+                        item.id != result.id || item.content_hash != result.content_hash
+                    });
+                } else if let Some(item) =
+                    self.snapshot.items.iter_mut().find(|item| {
+                        item.id == result.id && item.content_hash == result.content_hash
+                    })
+                {
+                    // 直接更新当前 2,000 条快照，不能依赖可能属于另一筛选集合的缓存。
+                    item.is_pinned = result.is_pinned;
+                }
+                self.snapshot.selected_index =
+                    selected_identity.and_then(|(selected_id, selected_hash)| {
+                        self.snapshot.items.iter().position(|item| {
+                            item.id == selected_id && item.content_hash == selected_hash
+                        })
+                    });
+                self.select_first_if_needed();
+                self.search.cancel();
+                // 先推进数据集使旧首页/续页失效，再按当前筛选查询 SQLite 最终状态。
+                self.begin_history_dataset(self.panel_visible);
+            }
+            Err(_) => {
+                // 所有失败共享固定提示；身份变化也推进数据集，防止用户重试陈旧卡片。
+                self.pin_error_visible = true;
+                if matches!(
+                    result.outcome,
+                    Err(crate::history_mutation::PinMutationFailure::IdentityChanged)
+                ) {
+                    self.search.cancel();
+                    self.begin_history_dataset(self.panel_visible);
+                }
+            }
+        }
+    }
+
+    /// 收藏请求未进入后台单槽时清除 pending，恢复按钮并显示固定失败提示。
+    fn mark_pin_submission_failed(&mut self, request: &PinMutationRequest) {
+        if self.pending_pin_mutation.as_ref() == Some(request) {
+            self.pending_pin_mutation = None;
+            self.pin_error_visible = true;
         }
     }
 
@@ -357,6 +486,7 @@ impl UiState {
         self.history_retry_required = false;
         self.history_was_near_bottom = false;
         self.snapshot.selected_index = None;
+        self.pin_error_visible = false;
         self.rebuild_visible_snapshot(None);
     }
 
@@ -675,6 +805,8 @@ impl UiState {
             panel_visible: self.panel_visible,
             panel_generation: self.panel_generation,
             quitting: self.quitting,
+            pending_pin_mutation: self.pending_pin_mutation,
+            pin_error_visible: self.pin_error_visible,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -716,6 +848,10 @@ pub struct UiStateSnapshot {
     pub panel_generation: u64,
     /// 是否已经接受退出请求；用于验证退出闩锁拒绝迟到事件。
     pub quitting: bool,
+    /// 当前唯一在途收藏请求；测试只使用稳定身份，不包含正文。
+    pub pending_pin_mutation: Option<PinMutationRequest>,
+    /// 固定收藏失败提示当前是否可见。
+    pub pin_error_visible: bool,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
@@ -763,6 +899,16 @@ pub fn bind_app_window(window: &AppWindow) {
         };
         if let Err(error) = post_ui_event(event) {
             eprintln!("显式复制事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_pin_item_requested(|index| {
+        // 点击瞬间冻结稳定身份和相反的明确状态；后台禁止使用 toggle SQL。
+        let Some(event) = resolve_pin_item(index) else {
+            return;
+        };
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("收藏事件无法进入 UI 事件队列：{error}");
         }
     });
 
@@ -877,6 +1023,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             search_filter,
             mut search_status,
             mut history_retry_required,
+            mut pending_pin_mutation,
+            mut pin_error_visible,
             request,
         ) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -891,6 +1039,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.search_filter,
                 state.search_status,
                 state.history_retry_required,
+                state.pending_pin_mutation,
+                state.pin_error_visible,
                 state.take_pending_history_request(),
             )
         });
@@ -908,6 +1058,22 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     snapshot = state.snapshot.clone();
                     search_status = state.search_status;
                     history_retry_required = state.history_retry_required;
+                });
+            }
+        }
+        if let UiAction::QueuePin(pin_request) = action {
+            let submitted = UI_PIN_MUTATIONS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_submit(pin_request).is_ok())
+            });
+            if !submitted {
+                UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.mark_pin_submission_failed(&pin_request);
+                    snapshot = state.snapshot.clone();
+                    pending_pin_mutation = state.pending_pin_mutation;
+                    pin_error_visible = state.pin_error_visible;
                 });
             }
         }
@@ -938,10 +1104,11 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
             set_window_search_state(&window, &search_text, search_filter, search_status);
             window.set_history_retry_required(history_retry_required);
+            window.set_pin_error_visible(pin_error_visible);
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
-                set_window_snapshot(&window, &snapshot);
+                set_window_snapshot(&window, &snapshot, pending_pin_mutation.as_ref());
             }
             // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
             window.set_selected_index(
@@ -1001,6 +1168,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 UiAction::ScrollSelection => {}
                 UiAction::SelectItem => {}
                 UiAction::QueueCopy { .. } => {}
+                UiAction::QueuePin(_) => {}
                 UiAction::ScheduleSearch { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
@@ -1093,13 +1261,42 @@ fn resolve_copy_item(index: i32) -> Option<UiEvent> {
     })
 }
 
+/// 将收藏按钮索引同步解析为稳定身份和明确期望状态；已有请求时不产生第二个事件。
+fn resolve_pin_item(index: i32) -> Option<UiEvent> {
+    let index = usize::try_from(index).ok()?;
+    UI_STATE.with(|state| {
+        let state = state.borrow();
+        if !state.panel_visible
+            || state.pending_pin_mutation.is_some()
+            || index >= selection_limit(&state.snapshot)
+        {
+            return None;
+        }
+        let item = state.snapshot.items.get(index)?;
+        Some(UiEvent::PinItem {
+            panel_generation: state.panel_generation,
+            id: item.id,
+            content_hash: item.content_hash,
+            is_pinned: !item.is_pinned,
+        })
+    })
+}
+
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
-fn set_window_snapshot(window: &AppWindow, snapshot: &UiSnapshot) {
+fn set_window_snapshot(
+    window: &AppWindow,
+    snapshot: &UiSnapshot,
+    pending_pin: Option<&PinMutationRequest>,
+) {
     let cards = visible_snapshot_items(snapshot)
         .map(|item| crate::ClipboardCard {
             preview: SharedString::from(item.preview.as_str()),
             source: SharedString::from(item.source.as_str()),
             relative_time: SharedString::from(item.relative_time.as_str()),
+            is_pinned: item.is_pinned,
+            pin_pending: pending_pin.is_some_and(|pending| {
+                pending.id == item.id && pending.content_hash == item.content_hash
+            }),
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
@@ -1268,6 +1465,7 @@ mod tests {
         UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
+    use crate::history_mutation::{PinMutationFailure, PinMutationResult};
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
     use std::time::{Duration, Instant};
 
@@ -2381,5 +2579,235 @@ mod tests {
         assert_eq!(selection_viewport_y(29, 0.0, 212.0, 3180.0), -2968.0);
         assert_eq!(selection_viewport_y(1, -318.0, 212.0, 1000.0), -106.0);
         assert_eq!(selection_viewport_y(1, 0.0, 0.0, 1000.0), 0.0);
+    }
+
+    /// 收藏点击只建立 pending 和明确期望状态，数据库成功前不能乐观改变星标。
+    #[test]
+    fn 收藏点击不乐观更新且重复点击被拒绝() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        let action = state.apply(UiEvent::PinItem {
+            panel_generation: generation,
+            id: 1,
+            content_hash: [0; 32],
+            is_pinned: true,
+        });
+        let UiAction::QueuePin(request) = action else {
+            panic!("合法收藏点击必须生成后台请求");
+        };
+        assert_eq!(request.mutation_token, 1);
+        assert!(!state.snapshot.items[0].is_pinned);
+        assert_eq!(state.pending_pin_mutation, Some(request));
+        assert_eq!(
+            state.apply(UiEvent::PinItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+                is_pinned: true,
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.pending_pin_mutation, Some(request));
+    }
+
+    /// 入队失败必须清除 pending、保持旧状态并展示固定失败提示。
+    #[test]
+    fn 收藏入队失败恢复按钮且不改变状态() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let UiAction::QueuePin(request) = state.apply(UiEvent::PinItem {
+            panel_generation: state.panel_generation(),
+            id: 1,
+            content_hash: [0; 32],
+            is_pinned: true,
+        }) else {
+            panic!("合法收藏点击必须生成后台请求");
+        };
+
+        state.mark_pin_submission_failed(&request);
+        assert!(state.pending_pin_mutation.is_none());
+        assert!(!state.snapshot.items[0].is_pinned);
+        assert!(state.pin_error_visible);
+    }
+
+    /// 结果必须完整匹配活动五元身份；隐藏和重开不取消已接受事务。
+    #[test]
+    fn 收藏结果隔离迟到身份并允许隐藏期间完成() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_generation = state.panel_generation();
+        let UiAction::QueuePin(request) = state.apply(UiEvent::PinItem {
+            panel_generation: old_generation,
+            id: 1,
+            content_hash: [0; 32],
+            is_pinned: true,
+        }) else {
+            panic!("合法收藏点击必须生成后台请求");
+        };
+
+        for stale in [
+            PinMutationResult {
+                mutation_token: request.mutation_token + 1,
+                panel_generation: request.panel_generation,
+                id: request.id,
+                content_hash: request.content_hash,
+                is_pinned: request.is_pinned,
+                outcome: Ok(()),
+            },
+            PinMutationResult {
+                mutation_token: request.mutation_token,
+                panel_generation: request.panel_generation + 1,
+                id: request.id,
+                content_hash: request.content_hash,
+                is_pinned: request.is_pinned,
+                outcome: Ok(()),
+            },
+            PinMutationResult {
+                mutation_token: request.mutation_token,
+                panel_generation: request.panel_generation,
+                id: request.id,
+                content_hash: [9; 32],
+                is_pinned: request.is_pinned,
+                outcome: Ok(()),
+            },
+        ] {
+            state.apply(UiEvent::PinMutationCompleted(stale));
+            assert_eq!(state.pending_pin_mutation, Some(request));
+            assert!(!state.snapshot.items[0].is_pinned);
+        }
+
+        state.apply(UiEvent::HidePanel {
+            generation: old_generation,
+        });
+        state.apply(UiEvent::OpenPanel);
+        state.apply(UiEvent::PinMutationCompleted(PinMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            is_pinned: request.is_pinned,
+            outcome: Ok(()),
+        }));
+        assert!(state.pending_pin_mutation.is_none());
+        assert!(state.snapshot.items[0].is_pinned);
+    }
+
+    /// 收藏失败只清除 pending 和显示固定状态，不提前改变数据库状态镜像。
+    #[test]
+    fn 收藏失败保持旧状态() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let UiAction::QueuePin(request) = state.apply(UiEvent::PinItem {
+            panel_generation: state.panel_generation(),
+            id: 1,
+            content_hash: [0; 32],
+            is_pinned: true,
+        }) else {
+            panic!("合法收藏点击必须生成后台请求");
+        };
+
+        state.apply(UiEvent::PinMutationCompleted(PinMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            is_pinned: request.is_pinned,
+            outcome: Err(PinMutationFailure::StorageUnavailable),
+        }));
+        assert!(state.pending_pin_mutation.is_none());
+        assert!(!state.snapshot.items[0].is_pinned);
+        assert!(state.pin_error_visible);
+    }
+
+    /// 收藏筛选取消收藏要立即移除深分页记录，并使先前查询结果失效。
+    #[test]
+    fn 收藏筛选取消深分页记录并拒绝旧查询结果() {
+        let mut items = (0..150).map(test_item).collect::<Vec<_>>();
+        items[120].is_pinned = true;
+        let target = items[120].clone();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items,
+            selected_index: Some(120),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_request = state
+            .take_pending_history_request()
+            .expect("打开面板应存在旧首页请求");
+        state.search_filter = SearchFilter::Pinned;
+
+        let UiAction::QueuePin(request) = state.apply(UiEvent::PinItem {
+            panel_generation: state.panel_generation(),
+            id: target.id,
+            content_hash: target.content_hash,
+            is_pinned: false,
+        }) else {
+            panic!("深分页记录必须可取消收藏");
+        };
+        state.apply(UiEvent::PinMutationCompleted(PinMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            is_pinned: request.is_pinned,
+            outcome: Ok(()),
+        }));
+        assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
+        assert!(state.take_pending_history_request().is_some());
+
+        state.apply_history_page_result(page_result(
+            &old_request,
+            Ok(UiHistoryPage {
+                items: vec![target.clone()],
+                next_cursor: None,
+            }),
+        ));
+        assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
+    }
+
+    /// 收藏按钮索引必须在排队前同步冻结身份和相反的明确状态。
+    #[test]
+    fn 收藏按钮索引同步解析为稳定期望状态() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            let mut pinned = test_item(1);
+            pinned.is_pinned = true;
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), pinned],
+                selected_index: None,
+            }));
+            state.apply(UiEvent::OpenPanel);
+        });
+
+        assert_eq!(
+            super::resolve_pin_item(1),
+            Some(UiEvent::PinItem {
+                panel_generation: 1,
+                id: 2,
+                content_hash: [1; 32],
+                is_pinned: false,
+            })
+        );
+        assert_eq!(super::resolve_pin_item(-1), None);
+        assert_eq!(super::resolve_pin_item(2), None);
     }
 }

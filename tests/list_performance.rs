@@ -67,6 +67,8 @@ fn generate_cards(count: usize) -> Vec<ClipboardCard> {
             preview: SharedString::from(format!("固定高度摘要 #{index:05}：性能探针文本")),
             source: SharedString::from("性能探针"),
             relative_time: SharedString::from("刚刚"),
+            is_pinned: false,
+            pin_pending: false,
         })
         .collect()
 }

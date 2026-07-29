@@ -33,6 +33,8 @@ fn card(label: &str) -> ClipboardCard {
         preview: SharedString::from(label),
         source: SharedString::from("测试来源"),
         relative_time: SharedString::from("刚刚"),
+        is_pinned: false,
+        pin_pending: false,
     }
 }
 

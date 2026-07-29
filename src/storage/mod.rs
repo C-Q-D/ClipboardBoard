@@ -1,7 +1,7 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、文本删除与清空、
-//! 筛选摘要查询和复合游标；清空 UI 接线由其他模块实现。
+//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、单条删除、
+//! 分范围清空、筛选摘要查询和复合游标；清空 UI 接线由其他模块实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
@@ -9,9 +9,10 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult, HistoryCursor, HistoryPage,
-    HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput, SetPinnedResult, StorageClient,
-    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
+    ClearAllHistoryResult, ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult,
+    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput,
+    SetPinnedResult, StorageClient, StorageExecutor, StorageStatus, TextUpsertInput,
+    TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。

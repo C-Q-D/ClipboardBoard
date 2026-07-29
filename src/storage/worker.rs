@@ -180,6 +180,15 @@ pub struct ClearUnpinnedTextResult {
     pub mutation_revision: u64,
 }
 
+/// 清空全部历史事务提交后的有限结果；不携带任何剪贴板正文或记录身份。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ClearAllHistoryResult {
+    /// 本次事务实际删除的全部类型和收藏状态记录数量；零表示幂等成功。
+    pub deleted_count: u64,
+    /// 唯一存储线程为本次成功事务分配的进程内单调修订号。
+    pub mutation_revision: u64,
+}
+
 /// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct HistoryCursor {
@@ -303,6 +312,11 @@ enum StorageCommand {
     ClearUnpinnedText {
         /// 返回删除数量和存储线性化修订号。
         reply: SyncSender<Result<ClearUnpinnedTextResult, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上用单个事务清空全部历史记录。
+    ClearAllHistory {
+        /// 返回删除数量和存储线性化修订号。
+        reply: SyncSender<Result<ClearAllHistoryResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上读取一页历史摘要。
     ListHistory {
@@ -489,6 +503,11 @@ impl StorageExecutor {
         self.client().clear_unpinned_text()
     }
 
+    /// 使用单个事务删除全部类型和收藏状态的历史记录。
+    pub fn clear_all_history(&self) -> Result<ClearAllHistoryResult, StorageError> {
+        self.client().clear_all_history()
+    }
+
     /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
     pub fn list_history_summaries(
         &self,
@@ -646,6 +665,17 @@ impl StorageClient {
     pub fn clear_unpinned_text(&self) -> Result<ClearUnpinnedTextResult, StorageError> {
         let (reply_sender, reply_receiver) = sync_channel(1);
         self.submit(StorageCommand::ClearUnpinnedText {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 在共享 worker 上用单个事务删除全部历史记录。
+    pub fn clear_all_history(&self) -> Result<ClearAllHistoryResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::ClearAllHistory {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -870,6 +900,15 @@ fn storage_thread(
                 });
                 let _ = reply.send(result);
             }
+            StorageCommand::ClearAllHistory { reply } => {
+                let result = reserve_mutation_revision(&state).and_then(|revision| {
+                    clear_all_history(&mut state.connection, revision).inspect(|_| {
+                        // 全量删除零条也是成功事务，仍须安装新修订号以隔离旧捕获。
+                        state.storage_mutation_revision = revision;
+                    })
+                });
+                let _ = reply.send(result);
+            }
             StorageCommand::ListHistory { query, reply } => {
                 let _ = reply.send(query_history_summaries(&state.connection, query));
             }
@@ -1028,6 +1067,22 @@ fn clear_unpinned_text(
     transaction.commit()?;
 
     Ok(ClearUnpinnedTextResult {
+        // rusqlite 的影响行数是 usize；Rust 支持目标的 usize 不宽于 u64。
+        deleted_count: deleted_count as u64,
+        mutation_revision,
+    })
+}
+
+/// 使用单个 SQLite 事务删除全部历史行，并返回有限删除数量与线性化修订号。
+fn clear_all_history(
+    connection: &mut Connection,
+    mutation_revision: u64,
+) -> Result<ClearAllHistoryResult, StorageError> {
+    let transaction = connection.transaction()?;
+    let deleted_count = transaction.execute("DELETE FROM clipboard_items", [])?;
+    transaction.commit()?;
+
+    Ok(ClearAllHistoryResult {
         // rusqlite 的影响行数是 usize；Rust 支持目标的 usize 不宽于 u64。
         deleted_count: deleted_count as u64,
         mutation_revision,
@@ -1829,6 +1884,165 @@ mod tests {
         let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
         let first = executor.clear_unpinned_text().expect("首次空清理失败");
         let second = executor.clear_unpinned_text().expect("重复空清理失败");
+
+        assert_eq!(first.deleted_count, 0);
+        assert_eq!(second.deleted_count, 0);
+        assert_eq!(first.mutation_revision, 1);
+        assert_eq!(second.mutation_revision, 2);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 全量清空必须在一个事务中删除未收藏、收藏、文本和非文本记录。
+    #[test]
+    fn clear_all_history_removes_all_types_and_pinned_states() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let unpinned = executor
+            .upsert_text(text_input(57, "普通文本", "普通文本", 100))
+            .expect("写入普通文本失败");
+        let pinned = executor
+            .upsert_text(text_input(58, "收藏文本", "收藏文本", 200))
+            .expect("写入收藏文本失败");
+        executor
+            .set_history_pinned(SetPinnedInput {
+                id: pinned.id,
+                content_hash: pinned.content_hash,
+                is_pinned: true,
+            })
+            .expect("设置收藏文本失败");
+        {
+            let connection = Connection::open(&database_path).expect("打开混合类型数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items
+                     (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
+                     VALUES ('image', '收藏图片', ?1, 1, 300, 300)",
+                    params![test_hash(59).as_slice()],
+                )
+                .expect("写入收藏图片测试行失败");
+        }
+
+        let result = executor.clear_all_history().expect("清空全部失败");
+        assert_eq!(result.deleted_count, 3);
+        assert_eq!(result.mutation_revision, 3);
+        assert!(executor
+            .get_history_payload(unpinned.id)
+            .expect("查询普通文本失败")
+            .is_none());
+        assert!(executor
+            .get_history_payload(pinned.id)
+            .expect("查询收藏文本失败")
+            .is_none());
+        assert_eq!(
+            executor
+                .status()
+                .expect("读取全量清空后状态失败")
+                .clipboard_item_count,
+            0
+        );
+        drop(executor);
+
+        let connection = Connection::open(&database_path).expect("重启后打开数据库失败");
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM clipboard_items", [], |row| row.get(0))
+            .expect("查询重启后记录数失败");
+        assert_eq!(remaining, 0);
+        drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 全量 DELETE 失败必须回滚所有行，不推进修订号，并允许后续重试复用该值。
+    #[test]
+    fn clear_all_history_rolls_back_and_reuses_reserved_revision_after_failure() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor
+            .upsert_text(text_input(60, "第一条", "第一条", 100))
+            .expect("写入第一条失败");
+        executor
+            .upsert_text(text_input(61, "第二条", "第二条", 200))
+            .expect("写入第二条失败");
+        {
+            let connection = Connection::open(&database_path).expect("打开故障注入数据库失败");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER abort_clear_all
+                     BEFORE DELETE ON clipboard_items
+                     BEGIN
+                         SELECT RAISE(ABORT, 'clear all blocked');
+                     END;",
+                )
+                .expect("创建全量清空故障触发器失败");
+        }
+
+        assert!(matches!(
+            executor.clear_all_history(),
+            Err(StorageError::Sqlite(_))
+        ));
+        assert_eq!(
+            executor
+                .status()
+                .expect("读取回滚后状态失败")
+                .clipboard_item_count,
+            2
+        );
+        assert!(executor
+            .get_history_payload(first.id)
+            .expect("查询回滚后的第一条失败")
+            .is_some());
+        {
+            let connection = Connection::open(&database_path).expect("重新打开故障数据库失败");
+            connection
+                .execute_batch("DROP TRIGGER abort_clear_all;")
+                .expect("删除全量清空故障触发器失败");
+        }
+
+        let retry = executor
+            .clear_all_history()
+            .expect("故障后重试清空全部失败");
+        assert_eq!(retry.deleted_count, 2);
+        assert_eq!(retry.mutation_revision, 3);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 修订号耗尽必须在全量 DELETE 之前拒绝，收藏和普通记录均不得被部分删除。
+    #[test]
+    fn clear_all_history_rejects_revision_exhaustion_before_sql() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(62, "耗尽记录", "耗尽记录", 100))
+            .expect("写入耗尽测试记录失败");
+        executor
+            .client()
+            .test_set_mutation_revision(u64::MAX)
+            .expect("设置耗尽修订号失败");
+
+        assert!(matches!(
+            executor.clear_all_history(),
+            Err(StorageError::MutationRevisionExhausted)
+        ));
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("查询耗尽测试记录失败")
+            .is_some());
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 空库重复清空全部仍须成功，并为每个线性化事务分配严格递增修订号。
+    #[test]
+    fn clear_all_history_is_idempotent_with_monotonic_revision() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor.clear_all_history().expect("首次空库清空失败");
+        let second = executor.clear_all_history().expect("重复空库清空失败");
 
         assert_eq!(first.deleted_count, 0);
         assert_eq!(second.deleted_count, 0);

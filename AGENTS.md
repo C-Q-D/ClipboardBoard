@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划，等待用户验证单条删除 |
+| `ATOMIC-WCB-CLEAR-UNPINNED-001` | 原子开发 | [清空未收藏原子计划](docs/planning/清空未收藏原子计划.md) |
 
 <!-- codex-plan-index:end -->

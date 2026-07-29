@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use super::{migration, StorageError};
 
-/// 存储线程命令队列的容量；探针、upsert、查询和关闭命令共用有界队列，避免无限堆积。
+/// 存储线程命令队列的容量；探针、写入、删除、查询和关闭命令共用有界队列，避免无限堆积。
 const COMMAND_QUEUE_CAPACITY: usize = 4;
 
 /// 单次摘要查询允许返回的最大记录数，防止调用方绕过虚拟列表加载无界数据。
@@ -149,6 +149,26 @@ pub struct SetPinnedResult {
     pub is_pinned: bool,
 }
 
+/// 单条历史删除的最小拥有型输入；稳定身份由数据库主键和内容哈希共同组成。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeleteHistoryInput {
+    /// 历史记录数据库主键。
+    pub id: i64,
+    /// 与 ID 一起校验的固定内容哈希，防止陈旧卡片删除错误记录。
+    pub content_hash: [u8; 32],
+}
+
+/// 删除事务提交后的有限结果；不存在记录也作为幂等成功返回。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeleteHistoryResult {
+    /// 调用方提交并完成校验的历史记录 ID。
+    pub id: i64,
+    /// 调用方提交的内容哈希，供上层隔离迟到结果。
+    pub content_hash: [u8; 32],
+    /// 本次事务是否实际删除了一行；`false` 表示目标此前已经不存在。
+    pub was_deleted: bool,
+}
+
 /// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct HistoryCursor {
@@ -260,6 +280,13 @@ enum StorageCommand {
         input: SetPinnedInput,
         /// 返回事务提交后的有限结果。
         reply: SyncSender<Result<SetPinnedResult, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上按稳定身份幂等删除一条文本历史。
+    DeleteHistory {
+        /// 不含正文的稳定身份。
+        input: DeleteHistoryInput,
+        /// 返回事务提交后的有限删除结果。
+        reply: SyncSender<Result<DeleteHistoryResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上读取一页历史摘要。
     ListHistory {
@@ -421,6 +448,14 @@ impl StorageExecutor {
         input: SetPinnedInput,
     ) -> Result<SetPinnedResult, StorageError> {
         self.client().set_history_pinned(input)
+    }
+
+    /// 按 ID 和内容哈希事务性删除一条文本历史；目标不存在时返回幂等成功。
+    pub fn delete_history(
+        &self,
+        input: DeleteHistoryInput,
+    ) -> Result<DeleteHistoryResult, StorageError> {
+        self.client().delete_history(input)
     }
 
     /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
@@ -603,6 +638,21 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 在共享 worker 上按稳定身份事务性删除一条文本历史。
+    pub fn delete_history(
+        &self,
+        input: DeleteHistoryInput,
+    ) -> Result<DeleteHistoryResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::DeleteHistory {
+            input,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 使用复合游标读取一页历史摘要。
     pub fn list_history_summaries(
         &self,
@@ -746,6 +796,9 @@ fn storage_thread(
             }
             StorageCommand::SetPinned { input, reply } => {
                 let _ = reply.send(set_history_pinned(&mut state.connection, input));
+            }
+            StorageCommand::DeleteHistory { input, reply } => {
+                let _ = reply.send(delete_history(&mut state.connection, input));
             }
             StorageCommand::ListHistory { query, reply } => {
                 let _ = reply.send(query_history_summaries(&state.connection, query));
@@ -913,6 +966,63 @@ fn set_history_pinned(
     })
 }
 
+/// 在同一事务内校验类型与稳定身份，并精确删除一条文本历史。
+fn delete_history(
+    connection: &mut Connection,
+    input: DeleteHistoryInput,
+) -> Result<DeleteHistoryResult, StorageError> {
+    let DeleteHistoryInput { id, content_hash } = input;
+    let content_hash_blob = content_hash.to_vec();
+    let transaction = connection.transaction()?;
+
+    // 先按不可复用的 AUTOINCREMENT 主键读取身份；不存在是可重试的幂等成功。
+    let stored_identity = transaction
+        .query_row(
+            "SELECT item_type, content_hash FROM clipboard_items WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    let Some((item_type, stored_hash)) = stored_identity else {
+        transaction.commit()?;
+        return Ok(DeleteHistoryResult {
+            id,
+            content_hash,
+            was_deleted: false,
+        });
+    };
+
+    // 图片文件尚无删除生命周期契约，因此存储边界只放行文本记录。
+    if item_type != "text" {
+        return Err(StorageError::HistoryItemNotDeletable { id });
+    }
+    if stored_hash.len() != 32 {
+        return Err(StorageError::InvalidContentHashLength {
+            id,
+            length: stored_hash.len(),
+        });
+    }
+    if stored_hash.as_slice() != content_hash_blob.as_slice() {
+        return Err(StorageError::HistoryIdentityMismatch { id });
+    }
+
+    // WHERE 再次绑定全部身份与类型；触发器或并发异常导致零行时必须回滚。
+    let affected = transaction.execute(
+        "DELETE FROM clipboard_items WHERE id = ?1 AND content_hash = ?2 AND item_type = 'text'",
+        params![id, content_hash_blob.as_slice()],
+    )?;
+    if affected != 1 {
+        return Err(StorageError::HistoryDeleteAffectedRows { id, affected });
+    }
+    transaction.commit()?;
+
+    Ok(DeleteHistoryResult {
+        id,
+        content_hash,
+        was_deleted: true,
+    })
+}
+
 /// 从 worker 的唯一连接执行筛选摘要查询，并用多取一行决定 next_cursor。
 fn query_history_summaries(
     connection: &Connection,
@@ -1068,7 +1178,7 @@ fn get_history_payload(
 
 #[cfg(test)]
 mod tests {
-    //! 此测试模块验证线程执行器、文本事务规则、游标查询、迁移隔离和错误回滚语义。
+    //! 此测试模块验证线程执行器、文本写删事务、游标查询、迁移隔离和错误回滚语义。
 
     use std::{
         fs,
@@ -1084,8 +1194,8 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        HistoryCursor, HistoryQuery, SetPinnedInput, StorageExecutor, TextUpsertInput,
-        COMMAND_QUEUE_CAPACITY,
+        DeleteHistoryInput, HistoryCursor, HistoryQuery, SetPinnedInput, StorageExecutor,
+        TextUpsertInput, COMMAND_QUEUE_CAPACITY,
     };
     use crate::storage::StorageError;
 
@@ -1546,6 +1656,195 @@ mod tests {
             .expect("读取身份测试记录失败")
             .expect("身份测试记录不存在");
         assert!(!payload.is_pinned);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 删除成功必须持久化到磁盘，重复请求和重启后的同一请求都返回幂等成功。
+    #[test]
+    fn delete_history_persists_and_repeated_request_is_idempotent() {
+        let directory = temporary_directory();
+        let (id, content_hash) = {
+            let executor = StorageExecutor::open_at(&directory).expect("启动删除测试存储线程失败");
+            let inserted = executor
+                .upsert_text(text_input(71, "待删除正文", "待删除预览", 400))
+                .expect("写入待删除记录失败");
+            let request = DeleteHistoryInput {
+                id: inserted.id,
+                content_hash: inserted.content_hash,
+            };
+
+            let first = executor
+                .delete_history(request.clone())
+                .expect("首次删除失败");
+            let repeated = executor
+                .delete_history(request)
+                .expect("同进程幂等删除失败");
+            assert!(first.was_deleted);
+            assert!(!repeated.was_deleted);
+            assert_eq!(first.id, repeated.id);
+            assert_eq!(first.content_hash, repeated.content_hash);
+            (inserted.id, inserted.content_hash)
+        };
+
+        let reopened = StorageExecutor::open_at(&directory).expect("删除后重启存储线程失败");
+        assert!(reopened
+            .get_history_payload(id)
+            .expect("重启后查询删除记录失败")
+            .is_none());
+        let repeated_after_reopen = reopened
+            .delete_history(DeleteHistoryInput {
+                id,
+                // ID 不存在时任意固定长度哈希都必须幂等成功，不能把缺失误判为身份错配。
+                content_hash: test_hash(88),
+            })
+            .expect("重启后幂等删除失败");
+        assert!(!repeated_after_reopen.was_deleted);
+        assert_ne!(repeated_after_reopen.content_hash, content_hash);
+        drop(reopened);
+        remove_directory(&directory);
+    }
+
+    /// 已存在 ID 的错误哈希必须拒绝删除，并保留原记录全部字段。
+    #[test]
+    fn delete_history_rejects_hash_mismatch_without_mutation() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动身份测试存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(72, "身份正文", "身份预览", 500))
+            .expect("写入身份测试记录失败");
+
+        assert!(matches!(
+            executor.delete_history(DeleteHistoryInput {
+                id: inserted.id,
+                content_hash: test_hash(99),
+            }),
+            Err(StorageError::HistoryIdentityMismatch { .. })
+        ));
+        let payload = executor
+            .get_history_payload(inserted.id)
+            .expect("读取身份记录失败")
+            .expect("身份错配后记录被意外删除");
+        assert_eq!(payload.text_content.as_deref(), Some("身份正文"));
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 删除 API 必须拒绝非文本记录，避免未来图片元数据与磁盘缓存失去一致性。
+    #[test]
+    fn delete_history_rejects_non_text_item_without_mutation() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let id = {
+            let mut connection =
+                Connection::open(&database_path).expect("创建非文本测试数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("迁移非文本测试数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items \
+                     (item_type, preview_text, content_hash, created_at, copied_at) \
+                     VALUES ('image', '图片预览', ?1, 1, 1)",
+                    params![test_hash(73).as_slice()],
+                )
+                .expect("写入非文本测试记录失败");
+            connection.last_insert_rowid()
+        };
+
+        let executor = StorageExecutor::open_at(&directory).expect("启动非文本测试存储线程失败");
+        assert!(matches!(
+            executor.delete_history(DeleteHistoryInput {
+                id,
+                content_hash: test_hash(73),
+            }),
+            Err(StorageError::HistoryItemNotDeletable { .. })
+        ));
+        assert!(executor
+            .get_history_payload(id)
+            .expect("读取非文本记录失败")
+            .is_some());
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// SQLite 删除异常必须回滚，并且同一个 worker 在返回有限错误后仍可继续服务。
+    #[test]
+    fn delete_history_rolls_back_on_sql_error_and_worker_remains_usable() {
+        let directory = temporary_directory();
+        let inserted = {
+            let executor =
+                StorageExecutor::open_at(&directory).expect("启动 SQL 故障测试存储线程失败");
+            executor
+                .upsert_text(text_input(74, "回滚正文", "回滚预览", 600))
+                .expect("写入 SQL 故障测试记录失败")
+        };
+        {
+            let connection =
+                Connection::open(directory.join("clipboard.db")).expect("打开 SQL 故障数据库失败");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER abort_text_delete BEFORE DELETE ON clipboard_items \
+                     BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END;",
+                )
+                .expect("创建删除失败触发器失败");
+        }
+
+        let executor = StorageExecutor::open_at(&directory).expect("重启 SQL 故障测试存储线程失败");
+        assert!(matches!(
+            executor.delete_history(DeleteHistoryInput {
+                id: inserted.id,
+                content_hash: inserted.content_hash,
+            }),
+            Err(StorageError::Sqlite(_))
+        ));
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("SQL 失败后读取记录失败")
+            .is_some());
+        assert_eq!(
+            executor
+                .status()
+                .expect("SQL 失败后 worker 不可用")
+                .probe_result,
+            1
+        );
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 触发器静默忽略 DELETE 时影响行数为零，事务必须报告异常且保留记录。
+    #[test]
+    fn delete_history_rolls_back_when_delete_affects_zero_rows() {
+        let directory = temporary_directory();
+        let inserted = {
+            let executor =
+                StorageExecutor::open_at(&directory).expect("启动零影响测试存储线程失败");
+            executor
+                .upsert_text(text_input(75, "零影响正文", "零影响预览", 700))
+                .expect("写入零影响测试记录失败")
+        };
+        {
+            let connection =
+                Connection::open(directory.join("clipboard.db")).expect("打开零影响数据库失败");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER ignore_text_delete BEFORE DELETE ON clipboard_items \
+                     BEGIN SELECT RAISE(IGNORE); END;",
+                )
+                .expect("创建忽略删除触发器失败");
+        }
+
+        let executor = StorageExecutor::open_at(&directory).expect("重启零影响测试存储线程失败");
+        assert!(matches!(
+            executor.delete_history(DeleteHistoryInput {
+                id: inserted.id,
+                content_hash: inserted.content_hash,
+            }),
+            Err(StorageError::HistoryDeleteAffectedRows { affected: 0, .. })
+        ));
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("零影响后读取记录失败")
+            .is_some());
         drop(executor);
         remove_directory(&directory);
     }

@@ -1,7 +1,7 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前原子负责连接创建、v1 迁移、线程归属探针、文本事务 upsert、筛选摘要查询和复合游标；
-//! 清理和 UI 接线由后续原子实现。
+//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、单条文本删除、
+//! 筛选摘要查询和复合游标；清理和 UI 接线由其他模块实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
@@ -9,9 +9,9 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput,
-    SetPinnedResult, StorageClient, StorageExecutor, StorageStatus, TextUpsertInput,
-    TextUpsertResult,
+    DeleteHistoryInput, DeleteHistoryResult, HistoryCursor, HistoryPage, HistoryPayload,
+    HistoryQuery, HistorySummary, SetPinnedInput, SetPinnedResult, StorageClient, StorageExecutor,
+    StorageStatus, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -51,10 +51,22 @@ pub enum StorageError {
         /// SQLite 实际返回的哈希字节数。
         length: usize,
     },
-    /// 收藏变更使用的 ID 与内容哈希不再指向同一条记录，禁止修改可能被复用的身份。
+    /// 历史变更使用的 ID 与内容哈希不再指向同一条记录，禁止修改错误身份。
     HistoryIdentityMismatch {
         /// 调用方提交的历史记录 ID；错误不包含正文或哈希内容。
         id: i64,
+    },
+    /// 单条删除只允许处理文本记录，避免未来图片记录被删元数据后遗留缓存文件。
+    HistoryItemNotDeletable {
+        /// 调用方提交的历史记录 ID；错误不暴露实际内容类型。
+        id: i64,
+    },
+    /// 身份已校验但 DELETE 没有精确影响一行，必须回滚整个事务。
+    HistoryDeleteAffectedRows {
+        /// 调用方提交的历史记录 ID。
+        id: i64,
+        /// SQLite 报告的实际影响行数。
+        affected: usize,
     },
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
@@ -86,6 +98,12 @@ impl fmt::Display for StorageError {
             }
             Self::HistoryIdentityMismatch { id } => {
                 write!(formatter, "历史记录 {id} 的稳定身份已失效")
+            }
+            Self::HistoryItemNotDeletable { id } => {
+                write!(formatter, "历史记录 {id} 的类型暂不允许删除")
+            }
+            Self::HistoryDeleteAffectedRows { id, affected } => {
+                write!(formatter, "历史记录 {id} 删除影响行数异常：{affected}")
             }
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }

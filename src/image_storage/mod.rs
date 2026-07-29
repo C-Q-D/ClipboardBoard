@@ -10,6 +10,15 @@ use std::{
 
 use crate::domain::{image_metadata::content_hash_hex, ImageAssetRootId};
 
+mod prepare;
+#[cfg(windows)]
+mod windows_guard;
+
+pub use prepare::{
+    prepare_image_storage, ImageStorageFallback, ImageStoragePrepareError,
+    ImageStoragePrepareErrorKind, PreparedImageStorage,
+};
+
 /// 自定义图片根外部的受管恢复基目录名称。
 pub const CUSTOM_RECOVERY_DIRECTORY_NAME: &str = ".clipboardboard-recovery";
 
@@ -103,6 +112,14 @@ impl ImageStorageLayout {
         preference: ImageStoragePreference,
     ) -> Result<Self, ImageStoragePathError> {
         layout_from_local_app_data(std::env::var_os("LOCALAPPDATA"), preference)
+    }
+
+    /// 使用显式 LOCALAPPDATA 构造布局，供目录准备流程和隔离测试复用。
+    pub(crate) fn from_preference_with_local_app_data(
+        local_app_data: Option<OsString>,
+        preference: ImageStoragePreference,
+    ) -> Result<Self, ImageStoragePathError> {
+        layout_from_local_app_data(local_app_data, preference)
     }
 
     /// 返回根类型。

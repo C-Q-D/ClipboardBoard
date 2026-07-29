@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划，等待用户验证收藏管理 |
+| `ATOMIC-WCB-DELETE-001` | 原子开发 | [单条删除原子计划](docs/planning/单条删除原子计划.md) |
 
 <!-- codex-plan-index:end -->

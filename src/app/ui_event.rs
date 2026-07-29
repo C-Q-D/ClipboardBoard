@@ -9,9 +9,9 @@ use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::history_mutation::{
-    ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult, ClearUnpinnedMutationSender,
-    DeleteMutationFailure, DeleteMutationRequest, DeleteMutationResult, DeleteMutationSender,
-    PinMutationRequest, PinMutationResult, PinMutationSender,
+    ClearHistoryMutationRequest, ClearHistoryMutationResult, ClearHistoryMutationSender,
+    ClearHistoryScope, DeleteMutationFailure, DeleteMutationRequest, DeleteMutationResult,
+    DeleteMutationSender, PinMutationRequest, PinMutationResult, PinMutationSender,
 };
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
@@ -63,7 +63,7 @@ enum UiAction {
     /// 请求把完整稳定身份投递到删除单槽；事务成功前卡片保持可见。
     QueueDelete(DeleteMutationRequest),
     /// 请求把无正文清空身份投递到清空单槽；事务成功前卡片保持可见。
-    QueueClearUnpinned(ClearUnpinnedMutationRequest),
+    QueueClearUnpinned(ClearHistoryMutationRequest),
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
     ScheduleSearch { generation: u64 },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
@@ -162,7 +162,7 @@ struct UiState {
     /// 清空确认区是否可见；首次点击只打开该区域，不访问存储。
     clear_unpinned_confirmation_visible: bool,
     /// 当前唯一在途清空请求；隐藏面板不能取消已经接受的事务。
-    pending_clear_unpinned_mutation: Option<ClearUnpinnedMutationRequest>,
+    pending_clear_unpinned_mutation: Option<ClearHistoryMutationRequest>,
     /// 下一次清空请求使用的单调令牌；耗尽时拒绝而不回绕。
     next_clear_unpinned_mutation_token: u64,
     /// 固定清空失败提示的可见状态，不保存底层错误详情。
@@ -341,7 +341,7 @@ impl UiState {
                 self.apply_delete_mutation_result(result);
                 UiAction::None
             }
-            UiEvent::ClearUnpinnedMutationCompleted(result) => {
+            UiEvent::ClearHistoryMutationCompleted(result) => {
                 self.apply_clear_unpinned_result(result);
                 UiAction::None
             }
@@ -682,9 +682,11 @@ impl UiState {
             return UiAction::None;
         }
 
-        let request = ClearUnpinnedMutationRequest {
+        let request = ClearHistoryMutationRequest {
             mutation_token: self.next_clear_unpinned_mutation_token,
             panel_generation,
+            // 旧入口必须显式选择未收藏文本，绝不能依赖危险默认值。
+            scope: ClearHistoryScope::UnpinnedText,
         };
         self.next_clear_unpinned_mutation_token += 1;
         self.pending_clear_unpinned_mutation = Some(request);
@@ -694,12 +696,13 @@ impl UiState {
     }
 
     /// 只消费与活动清空二元身份匹配的结果；成功后按存储修订号精确清理旧摘要。
-    fn apply_clear_unpinned_result(&mut self, result: ClearUnpinnedMutationResult) {
+    fn apply_clear_unpinned_result(&mut self, result: ClearHistoryMutationResult) {
         let Some(pending) = self.pending_clear_unpinned_mutation else {
             return;
         };
         if result.mutation_token != pending.mutation_token
             || result.panel_generation != pending.panel_generation
+            || result.scope != pending.scope
         {
             return;
         }
@@ -744,7 +747,7 @@ impl UiState {
     }
 
     /// 清空请求未进入后台单槽时清除 pending，保留全部卡片并显示固定提示。
-    fn mark_clear_unpinned_submission_failed(&mut self, request: &ClearUnpinnedMutationRequest) {
+    fn mark_clear_unpinned_submission_failed(&mut self, request: &ClearHistoryMutationRequest) {
         if self.pending_clear_unpinned_mutation.as_ref() == Some(request) {
             self.pending_clear_unpinned_mutation = None;
             self.clear_unpinned_error_visible = true;
@@ -1127,8 +1130,8 @@ thread_local! {
     static UI_PIN_MUTATIONS: RefCell<Option<PinMutationSender>> = const { RefCell::new(None) };
     /// UI 线程只持有删除请求发送端；DEL-03 会通过该单槽执行非阻塞提交。
     static UI_DELETE_MUTATIONS: RefCell<Option<DeleteMutationSender>> = const { RefCell::new(None) };
-    /// UI 线程只持有清空请求发送端；SQLite 和 worker 生命周期仍由主线程拥有。
-    static UI_CLEAR_UNPINNED_MUTATIONS: RefCell<Option<ClearUnpinnedMutationSender>> = const { RefCell::new(None) };
+    /// UI 线程只持有双范围清空请求发送端；SQLite 和 worker 生命周期仍由主线程拥有。
+    static UI_CLEAR_HISTORY_MUTATIONS: RefCell<Option<ClearHistoryMutationSender>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -1161,7 +1164,7 @@ pub struct UiStateSnapshot {
     /// 清空未收藏确认区当前是否可见。
     pub clear_unpinned_confirmation_visible: bool,
     /// 当前唯一在途清空请求；只含 token 和面板代次。
-    pub pending_clear_unpinned_mutation: Option<ClearUnpinnedMutationRequest>,
+    pub pending_clear_unpinned_mutation: Option<ClearHistoryMutationRequest>,
     /// 固定清空失败提示当前是否可见。
     pub clear_unpinned_error_visible: bool,
     /// 已消费的最大清空修订号；用于测试水位只增不减。
@@ -1318,9 +1321,9 @@ pub fn bind_delete_mutation_sender(sender: DeleteMutationSender) {
     });
 }
 
-/// 在 UI 线程绑定清空未收藏文本的非阻塞单槽发送端。
-pub fn bind_clear_unpinned_mutation_sender(sender: ClearUnpinnedMutationSender) {
-    UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+/// 在 UI 线程绑定显式双范围清空历史的非阻塞单槽发送端。
+pub fn bind_clear_history_mutation_sender(sender: ClearHistoryMutationSender) {
+    UI_CLEAR_HISTORY_MUTATIONS.with(|slot| {
         *slot.borrow_mut() = Some(sender);
     });
 }
@@ -1357,9 +1360,9 @@ fn close_delete_mutation_bridge() {
     });
 }
 
-/// 关闭清空请求入口；已经进入单槽的请求由 worker 排空后退出。
-fn close_clear_unpinned_mutation_bridge() {
-    UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+/// 关闭双范围清空请求入口；已经进入单槽的请求由 worker 排空后退出。
+fn close_clear_history_mutation_bridge() {
+    UI_CLEAR_HISTORY_MUTATIONS.with(|slot| {
         if let Some(sender) = slot.borrow().as_ref() {
             sender.close();
         }
@@ -1472,7 +1475,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             }
         }
         if let UiAction::QueueClearUnpinned(clear_request) = action {
-            let submitted = UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+            let submitted = UI_CLEAR_HISTORY_MUTATIONS.with(|slot| {
                 slot.borrow()
                     .as_ref()
                     .is_some_and(|sender| sender.try_submit(clear_request).is_ok())
@@ -1495,7 +1498,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             close_history_query_bridge();
             close_pin_mutation_bridge();
             close_delete_mutation_bridge();
-            close_clear_unpinned_mutation_bridge();
+            close_clear_history_mutation_bridge();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");
@@ -1926,16 +1929,16 @@ mod tests {
     #[cfg(windows)]
     use super::{activation_attempt, ActivationAttempt};
     use super::{
-        bind_clear_unpinned_mutation_sender, close_clear_unpinned_mutation_bridge,
+        bind_clear_history_mutation_sender, close_clear_history_mutation_bridge,
         event_may_refresh_model, perform_show_action, selection_viewport_y, visible_snapshot_items,
         UiAction, UiState, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
     use crate::history_mutation::{
-        clear_unpinned_mutation_channel, ClearUnpinnedMutationFailure,
-        ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult,
-        ClearUnpinnedMutationSubmitError, ClearUnpinnedMutationSuccess, DeleteMutationFailure,
-        DeleteMutationResult, PinMutationFailure, PinMutationResult,
+        clear_history_mutation_channel, ClearHistoryMutationFailure, ClearHistoryMutationRequest,
+        ClearHistoryMutationResult, ClearHistoryMutationSubmitError, ClearHistoryMutationSuccess,
+        ClearHistoryScope, DeleteMutationFailure, DeleteMutationResult, PinMutationFailure,
+        PinMutationResult,
     };
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
     use std::time::{Duration, Instant};
@@ -1991,7 +1994,7 @@ mod tests {
     }
 
     /// 在已打开面板中完成“打开确认→确认”，返回 reducer 生成的后台请求。
-    fn begin_clear(state: &mut UiState) -> ClearUnpinnedMutationRequest {
+    fn begin_clear(state: &mut UiState) -> ClearHistoryMutationRequest {
         assert_eq!(state.apply(UiEvent::ClearUnpinnedRequested), UiAction::None);
         assert!(state.clear_unpinned_confirmation_visible);
         let action = state.apply(UiEvent::ClearUnpinnedConfirmed {
@@ -2000,15 +2003,17 @@ mod tests {
         let UiAction::QueueClearUnpinned(request) = action else {
             panic!("二次确认必须生成清空请求");
         };
+        assert_eq!(request.scope, ClearHistoryScope::UnpinnedText);
         request
     }
 
     /// 生成与指定请求严格匹配的清空成功事件。
-    fn clear_succeeded(request: ClearUnpinnedMutationRequest, clear_revision: u64) -> UiEvent {
-        UiEvent::ClearUnpinnedMutationCompleted(ClearUnpinnedMutationResult {
+    fn clear_succeeded(request: ClearHistoryMutationRequest, clear_revision: u64) -> UiEvent {
+        UiEvent::ClearHistoryMutationCompleted(ClearHistoryMutationResult {
             mutation_token: request.mutation_token,
             panel_generation: request.panel_generation,
-            outcome: Ok(ClearUnpinnedMutationSuccess {
+            scope: request.scope,
+            outcome: Ok(ClearHistoryMutationSuccess {
                 deleted_count: 1,
                 clear_revision,
             }),
@@ -2101,11 +2106,12 @@ mod tests {
         state.apply(UiEvent::OpenPanel);
         let request = begin_clear(&mut state);
         let before = state.snapshot.clone();
-        state.apply(UiEvent::ClearUnpinnedMutationCompleted(
-            ClearUnpinnedMutationResult {
+        state.apply(UiEvent::ClearHistoryMutationCompleted(
+            ClearHistoryMutationResult {
                 mutation_token: request.mutation_token,
                 panel_generation: request.panel_generation,
-                outcome: Err(ClearUnpinnedMutationFailure::StorageUnavailable),
+                scope: request.scope,
+                outcome: Err(ClearHistoryMutationFailure::StorageUnavailable),
             },
         ));
         assert_eq!(state.snapshot, before);
@@ -2261,16 +2267,17 @@ mod tests {
     /// Quit 使用的关闭辅助函数必须关闭已绑定 clear sender，并立即拒绝后续请求。
     #[test]
     fn 退出关闭已绑定的清空请求入口() {
-        let (sender, _receiver) = clear_unpinned_mutation_channel();
-        bind_clear_unpinned_mutation_sender(sender.clone());
-        close_clear_unpinned_mutation_bridge();
+        let (sender, _receiver) = clear_history_mutation_channel();
+        bind_clear_history_mutation_sender(sender.clone());
+        close_clear_history_mutation_bridge();
 
         assert_eq!(
-            sender.try_submit(ClearUnpinnedMutationRequest {
+            sender.try_submit(ClearHistoryMutationRequest {
                 mutation_token: 1,
                 panel_generation: 1,
+                scope: ClearHistoryScope::UnpinnedText,
             }),
-            Err(ClearUnpinnedMutationSubmitError::Closed)
+            Err(ClearHistoryMutationSubmitError::Closed)
         );
     }
 

@@ -8,7 +8,7 @@
 use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
 use clipboard_board::app::{
-    bind_app_window, bind_clear_unpinned_mutation_sender, bind_copy_request_inbox,
+    bind_app_window, bind_clear_history_mutation_sender, bind_copy_request_inbox,
     bind_delete_mutation_sender, bind_history_query_bridge, bind_pin_mutation_sender,
 };
 #[cfg(windows)]
@@ -21,8 +21,8 @@ use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 use clipboard_board::history_bridge::run_clipboard_pump;
 #[cfg(windows)]
 use clipboard_board::history_mutation::{
-    clear_unpinned_mutation_channel, delete_mutation_channel, pin_mutation_channel,
-    start_clear_unpinned_mutation_worker, start_delete_mutation_worker, start_pin_mutation_worker,
+    clear_history_mutation_channel, delete_mutation_channel, pin_mutation_channel,
+    start_clear_history_mutation_worker, start_delete_mutation_worker, start_pin_mutation_worker,
 };
 #[cfg(windows)]
 use clipboard_board::history_query::{
@@ -126,16 +126,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(error.into());
             }
         };
-    let (clear_unpinned_mutations, clear_unpinned_receiver) = clear_unpinned_mutation_channel();
-    bind_clear_unpinned_mutation_sender(clear_unpinned_mutations.clone());
-    let clear_unpinned_worker = match start_clear_unpinned_mutation_worker(
+    let (clear_history_mutations, clear_history_receiver) = clear_history_mutation_channel();
+    bind_clear_history_mutation_sender(clear_history_mutations.clone());
+    let clear_history_worker = match start_clear_history_mutation_worker(
         storage.client(),
-        clear_unpinned_receiver,
-        |result| post_ui_event(UiEvent::ClearUnpinnedMutationCompleted(result)).is_ok(),
+        clear_history_receiver,
+        |result| post_ui_event(UiEvent::ClearHistoryMutationCompleted(result)).is_ok(),
     ) {
         Ok(handle) => handle,
         Err(error) => {
-            clear_unpinned_mutations.close();
+            clear_history_mutations.close();
             delete_mutations.close();
             pin_mutations.close();
             history_requests.close();
@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
-    clear_unpinned_mutations.close();
+    clear_history_mutations.close();
     delete_mutations.close();
     pin_mutations.close();
     history_requests.close();
@@ -175,9 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "删除变更线程异常退出")
         .map(|_| ());
-    let clear_unpinned_result = clear_unpinned_worker
+    let clear_history_result = clear_history_worker
         .join()
-        .map_err(|_| "清空未收藏线程异常退出")
+        .map_err(|_| "清空历史线程异常退出")
         .map(|_| ());
     // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
     let storage_result = storage
@@ -191,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     history_query_result?;
     pin_mutation_result?;
     delete_mutation_result?;
-    clear_unpinned_result?;
+    clear_history_result?;
     storage_result?;
     Ok(())
 }

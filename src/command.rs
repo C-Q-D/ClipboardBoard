@@ -6,7 +6,7 @@
 #[cfg(windows)]
 use crate::clipboard::ClipboardCaptureResult;
 use crate::history_mutation::{
-    ClearUnpinnedMutationResult, DeleteMutationResult, PinMutationResult,
+    ClearHistoryMutationResult, DeleteMutationResult, PinMutationResult,
 };
 #[cfg(windows)]
 use crate::storage::TextUpsertResult;
@@ -200,8 +200,8 @@ pub enum UiEvent {
     PinMutationCompleted(PinMutationResult),
     /// 删除 worker 已完成一次事务；DEL-02 只建立事件接缝，DEL-03 再消费并更新快照。
     DeleteMutationCompleted(DeleteMutationResult),
-    /// 清空 worker 已完成一次事务；CLR-02 只建立事件接缝，CLR-03 再消费并更新快照。
-    ClearUnpinnedMutationCompleted(ClearUnpinnedMutationResult),
+    /// 单一清空 worker 已完成一次显式范围事务；UI 依据 pending scope 消费结果。
+    ClearHistoryMutationCompleted(ClearHistoryMutationResult),
     /// 历史列表真实视口几何变化；reducer 只在进入底部阈值的边沿请求续页。
     HistoryViewportChanged {
         /// Flickable 的负向纵向视口坐标。

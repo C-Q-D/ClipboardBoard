@@ -235,6 +235,15 @@ pub enum UiEvent {
         /// 根据点击瞬间卡片状态计算出的明确期望状态。
         is_pinned: bool,
     },
+    /// 请求删除一次点击时解析出的稳定记录身份；事务成功前 UI 不得移除卡片。
+    DeleteItem {
+        /// 点击发生时的面板打开代次。
+        panel_generation: u64,
+        /// 数据库稳定 ID。
+        id: u64,
+        /// 与 ID 共同校验的固定内容哈希。
+        content_hash: [u8; 32],
+    },
 }
 
 #[cfg(all(test, windows))]

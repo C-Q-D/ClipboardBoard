@@ -21,6 +21,7 @@ fn long_card() -> ClipboardCard {
         relative_time: SharedString::from("刚刚"),
         is_pinned: false,
         pin_pending: false,
+        delete_pending: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn short_card() -> ClipboardCard {
         relative_time: SharedString::from("刚刚"),
         is_pinned: false,
         pin_pending: false,
+        delete_pending: false,
     }
 }
 

@@ -9,7 +9,8 @@ use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::history_mutation::{
-    DeleteMutationSender, PinMutationRequest, PinMutationResult, PinMutationSender,
+    DeleteMutationFailure, DeleteMutationRequest, DeleteMutationResult, DeleteMutationSender,
+    PinMutationRequest, PinMutationResult, PinMutationSender,
 };
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
@@ -57,6 +58,8 @@ enum UiAction {
     QueueCopy { id: u64, content_hash: [u8; 32] },
     /// 请求把完整稳定身份投递到收藏单槽；提交失败由事件入口回写固定错误状态。
     QueuePin(PinMutationRequest),
+    /// 请求把完整稳定身份投递到删除单槽；事务成功前卡片保持可见。
+    QueueDelete(DeleteMutationRequest),
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
     ScheduleSearch { generation: u64 },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
@@ -146,6 +149,12 @@ struct UiState {
     next_pin_mutation_token: u64,
     /// 固定收藏失败提示的可见状态，不保存底层错误详情。
     pin_error_visible: bool,
+    /// 当前唯一在途删除请求；隐藏面板不会取消已经接受的持久化事务。
+    pending_delete_mutation: Option<DeleteMutationRequest>,
+    /// 下一次删除请求使用的单调令牌；耗尽时拒绝新请求而不回绕。
+    next_delete_mutation_token: u64,
+    /// 固定删除失败提示的可见状态，不保存底层错误详情。
+    delete_error_visible: bool,
     panel_visible: bool,
     /// 只有从隐藏进入可见的新会话才递增，用来隔离旧的 Esc 事件。
     panel_generation: u64,
@@ -174,6 +183,9 @@ impl Default for UiState {
             pending_pin_mutation: None,
             next_pin_mutation_token: 1,
             pin_error_visible: false,
+            pending_delete_mutation: None,
+            next_delete_mutation_token: 1,
+            delete_error_visible: false,
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
@@ -291,8 +303,8 @@ impl UiState {
                 self.apply_pin_mutation_result(result);
                 UiAction::None
             }
-            UiEvent::DeleteMutationCompleted(_result) => {
-                // DEL-02 只贯通后台结果；DEL-03 建立 pending 后再消费并改变快照。
+            UiEvent::DeleteMutationCompleted(result) => {
+                self.apply_delete_mutation_result(result);
                 UiAction::None
             }
             UiEvent::HistoryViewportChanged {
@@ -367,6 +379,11 @@ impl UiState {
                 content_hash,
                 is_pinned,
             } => self.begin_pin_mutation(panel_generation, id, content_hash, is_pinned),
+            UiEvent::DeleteItem {
+                panel_generation,
+                id,
+                content_hash,
+            } => self.begin_delete_mutation(panel_generation, id, content_hash),
         }
     }
 
@@ -381,6 +398,7 @@ impl UiState {
         if !self.panel_visible
             || panel_generation != self.panel_generation
             || self.pending_pin_mutation.is_some()
+            || self.pending_delete_mutation.is_some()
         {
             return UiAction::None;
         }
@@ -480,6 +498,107 @@ impl UiState {
         }
     }
 
+    /// 校验卡片稳定身份并建立唯一在途删除请求；事务成功前快照保持不变。
+    fn begin_delete_mutation(
+        &mut self,
+        panel_generation: u64,
+        id: u64,
+        content_hash: [u8; 32],
+    ) -> UiAction {
+        if !self.panel_visible
+            || panel_generation != self.panel_generation
+            || self.pending_pin_mutation.is_some()
+            || self.pending_delete_mutation.is_some()
+            || self.next_delete_mutation_token == u64::MAX
+        {
+            return UiAction::None;
+        }
+        if !self
+            .snapshot
+            .items
+            .iter()
+            .any(|item| item.id == id && item.content_hash == content_hash)
+        {
+            return UiAction::None;
+        }
+
+        let request = DeleteMutationRequest {
+            mutation_token: self.next_delete_mutation_token,
+            panel_generation,
+            id,
+            content_hash,
+        };
+        self.next_delete_mutation_token += 1;
+        self.pending_delete_mutation = Some(request);
+        self.delete_error_visible = false;
+        UiAction::QueueDelete(request)
+    }
+
+    /// 只接受与活动删除四元身份完全一致的结果；不要求当前面板仍处于旧会话。
+    fn apply_delete_mutation_result(&mut self, result: DeleteMutationResult) {
+        let Some(pending) = self.pending_delete_mutation else {
+            return;
+        };
+        if result.mutation_token != pending.mutation_token
+            || result.panel_generation != pending.panel_generation
+            || result.id != pending.id
+            || result.content_hash != pending.content_hash
+        {
+            return;
+        }
+
+        self.pending_delete_mutation = None;
+        match result.outcome {
+            Ok(()) => {
+                self.delete_error_visible = false;
+                let previous_selected_index = self.snapshot.selected_index;
+                let selected_identity = previous_selected_index
+                    .and_then(|index| self.snapshot.items.get(index))
+                    .map(|item| (item.id, item.content_hash));
+                self.snapshot.items.retain(|item| {
+                    item.id != result.id || item.content_hash != result.content_hash
+                });
+                self.history.remove(result.id, result.content_hash);
+                self.snapshot.selected_index =
+                    selected_identity.and_then(|(selected_id, selected_hash)| {
+                        self.snapshot.items.iter().position(|item| {
+                            item.id == selected_id && item.content_hash == selected_hash
+                        })
+                    });
+                if self.snapshot.selected_index.is_none() && !self.snapshot.items.is_empty() {
+                    // 删除当前选中项时尽量保留相邻位置，末项删除则夹到新的末项。
+                    self.snapshot.selected_index = Some(
+                        previous_selected_index
+                            .unwrap_or(0)
+                            .min(self.snapshot.items.len().saturating_sub(1)),
+                    );
+                }
+                self.select_first_if_needed();
+                self.search.cancel();
+                // 先推进数据集拒绝旧首页/续页，再按当前筛选查询数据库最终状态。
+                self.begin_history_dataset(self.panel_visible);
+            }
+            Err(failure) => {
+                self.delete_error_visible = true;
+                if matches!(
+                    failure,
+                    DeleteMutationFailure::IdentityChanged | DeleteMutationFailure::NotDeletable
+                ) {
+                    self.search.cancel();
+                    self.begin_history_dataset(self.panel_visible);
+                }
+            }
+        }
+    }
+
+    /// 删除请求未进入后台单槽时清除 pending，保留卡片并显示固定失败提示。
+    fn mark_delete_submission_failed(&mut self, request: &DeleteMutationRequest) {
+        if self.pending_delete_mutation.as_ref() == Some(request) {
+            self.pending_delete_mutation = None;
+            self.delete_error_visible = true;
+        }
+    }
+
     /// 清空当前搜索接缝并恢复完整内存历史；每次新一轮面板打开都从此状态开始。
     fn reset_search_state(&mut self) {
         self.search.cancel();
@@ -493,6 +612,7 @@ impl UiState {
         self.history_was_near_bottom = false;
         self.snapshot.selected_index = None;
         self.pin_error_visible = false;
+        self.delete_error_visible = false;
         self.rebuild_visible_snapshot(None);
     }
 
@@ -813,6 +933,8 @@ impl UiState {
             quitting: self.quitting,
             pending_pin_mutation: self.pending_pin_mutation,
             pin_error_visible: self.pin_error_visible,
+            pending_delete_mutation: self.pending_delete_mutation,
+            delete_error_visible: self.delete_error_visible,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -860,6 +982,10 @@ pub struct UiStateSnapshot {
     pub pending_pin_mutation: Option<PinMutationRequest>,
     /// 固定收藏失败提示当前是否可见。
     pub pin_error_visible: bool,
+    /// 当前唯一在途删除请求；测试只使用稳定身份，不包含正文。
+    pub pending_delete_mutation: Option<DeleteMutationRequest>,
+    /// 固定删除失败提示当前是否可见。
+    pub delete_error_visible: bool,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
@@ -917,6 +1043,16 @@ pub fn bind_app_window(window: &AppWindow) {
         };
         if let Err(error) = post_ui_event(event) {
             eprintln!("收藏事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_delete_item_requested(|index| {
+        // 删除按钮只传可见索引；UI 线程同步冻结 ID 与哈希后才允许进入后台。
+        let Some(event) = resolve_delete_item(index) else {
+            return;
+        };
+        if let Err(error) = post_ui_event(event) {
+            eprintln!("删除事件无法进入 UI 事件队列：{error}");
         }
     });
 
@@ -1049,6 +1185,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             mut history_retry_required,
             mut pending_pin_mutation,
             mut pin_error_visible,
+            mut pending_delete_mutation,
+            mut delete_error_visible,
             request,
         ) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -1065,6 +1203,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.history_retry_required,
                 state.pending_pin_mutation,
                 state.pin_error_visible,
+                state.pending_delete_mutation,
+                state.delete_error_visible,
                 state.take_pending_history_request(),
             )
         });
@@ -1101,6 +1241,22 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 });
             }
         }
+        if let UiAction::QueueDelete(delete_request) = action {
+            let submitted = UI_DELETE_MUTATIONS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_submit(delete_request).is_ok())
+            });
+            if !submitted {
+                UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.mark_delete_submission_failed(&delete_request);
+                    snapshot = state.snapshot.clone();
+                    pending_delete_mutation = state.pending_delete_mutation;
+                    delete_error_visible = state.delete_error_visible;
+                });
+            }
+        }
         // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
         let refresh_model = may_refresh_model && action != UiAction::Reassert;
 
@@ -1130,10 +1286,16 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             set_window_search_state(&window, &search_text, search_filter, search_status);
             window.set_history_retry_required(history_retry_required);
             window.set_pin_error_visible(pin_error_visible);
+            window.set_delete_error_visible(delete_error_visible);
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
-                set_window_snapshot(&window, &snapshot, pending_pin_mutation.as_ref());
+                set_window_snapshot(
+                    &window,
+                    &snapshot,
+                    pending_pin_mutation.as_ref(),
+                    pending_delete_mutation.as_ref(),
+                );
             }
             // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
             window.set_selected_index(
@@ -1194,6 +1356,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 UiAction::SelectItem => {}
                 UiAction::QueueCopy { .. } => {}
                 UiAction::QueuePin(_) => {}
+                UiAction::QueueDelete(_) => {}
                 UiAction::ScheduleSearch { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
@@ -1293,6 +1456,7 @@ fn resolve_pin_item(index: i32) -> Option<UiEvent> {
         let state = state.borrow();
         if !state.panel_visible
             || state.pending_pin_mutation.is_some()
+            || state.pending_delete_mutation.is_some()
             || index >= selection_limit(&state.snapshot)
         {
             return None;
@@ -1307,11 +1471,33 @@ fn resolve_pin_item(index: i32) -> Option<UiEvent> {
     })
 }
 
+/// 将删除按钮索引同步解析为稳定身份；任一历史 mutation 在途时拒绝新请求。
+fn resolve_delete_item(index: i32) -> Option<UiEvent> {
+    let index = usize::try_from(index).ok()?;
+    UI_STATE.with(|state| {
+        let state = state.borrow();
+        if !state.panel_visible
+            || state.pending_pin_mutation.is_some()
+            || state.pending_delete_mutation.is_some()
+            || index >= selection_limit(&state.snapshot)
+        {
+            return None;
+        }
+        let item = state.snapshot.items.get(index)?;
+        Some(UiEvent::DeleteItem {
+            panel_generation: state.panel_generation,
+            id: item.id,
+            content_hash: item.content_hash,
+        })
+    })
+}
+
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
 fn set_window_snapshot(
     window: &AppWindow,
     snapshot: &UiSnapshot,
     pending_pin: Option<&PinMutationRequest>,
+    pending_delete: Option<&DeleteMutationRequest>,
 ) {
     let cards = visible_snapshot_items(snapshot)
         .map(|item| crate::ClipboardCard {
@@ -1320,6 +1506,9 @@ fn set_window_snapshot(
             relative_time: SharedString::from(item.relative_time.as_str()),
             is_pinned: item.is_pinned,
             pin_pending: pending_pin.is_some_and(|pending| {
+                pending.id == item.id && pending.content_hash == item.content_hash
+            }),
+            delete_pending: pending_delete.is_some_and(|pending| {
                 pending.id == item.id && pending.content_hash == item.content_hash
             }),
         })
@@ -1490,7 +1679,9 @@ mod tests {
         UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
-    use crate::history_mutation::{PinMutationFailure, PinMutationResult};
+    use crate::history_mutation::{
+        DeleteMutationFailure, DeleteMutationResult, PinMutationFailure, PinMutationResult,
+    };
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
     use std::time::{Duration, Instant};
 
@@ -2806,6 +2997,279 @@ mod tests {
             }),
         ));
         assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
+    }
+
+    /// 删除点击只建立 pending；事务成功前卡片不能从当前快照消失。
+    #[test]
+    fn 删除点击不乐观移除且重复点击被拒绝() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+
+        let action = state.apply(UiEvent::DeleteItem {
+            panel_generation: generation,
+            id: 1,
+            content_hash: [0; 32],
+        });
+        let UiAction::QueueDelete(request) = action else {
+            panic!("合法删除点击必须生成后台请求");
+        };
+        assert_eq!(request.mutation_token, 1);
+        assert_eq!(state.snapshot.items.len(), 2);
+        assert_eq!(state.pending_delete_mutation, Some(request));
+        assert_eq!(
+            state.apply(UiEvent::DeleteItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::None
+        );
+        assert_eq!(state.snapshot.items.len(), 2);
+    }
+
+    /// 收藏与删除必须双向共享全局 mutation 锁，避免两个独立桥产生交错结果。
+    #[test]
+    fn 收藏与删除请求双向互斥() {
+        let mut pin_first = UiState::default();
+        pin_first.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        pin_first.apply(UiEvent::OpenPanel);
+        let generation = pin_first.panel_generation();
+        assert!(matches!(
+            pin_first.apply(UiEvent::PinItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+                is_pinned: true,
+            }),
+            UiAction::QueuePin(_)
+        ));
+        assert_eq!(
+            pin_first.apply(UiEvent::DeleteItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::None
+        );
+
+        let mut delete_first = UiState::default();
+        delete_first.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        delete_first.apply(UiEvent::OpenPanel);
+        let generation = delete_first.panel_generation();
+        assert!(matches!(
+            delete_first.apply(UiEvent::DeleteItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::QueueDelete(_)
+        ));
+        assert_eq!(
+            delete_first.apply(UiEvent::PinItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+                is_pinned: true,
+            }),
+            UiAction::None
+        );
+    }
+
+    /// 删除入队失败必须清 pending、保留原卡片并展示固定失败提示。
+    #[test]
+    fn 删除入队失败恢复按钮且保留记录() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let UiAction::QueueDelete(request) = state.apply(UiEvent::DeleteItem {
+            panel_generation: state.panel_generation(),
+            id: 1,
+            content_hash: [0; 32],
+        }) else {
+            panic!("合法删除点击必须生成后台请求");
+        };
+
+        state.mark_delete_submission_failed(&request);
+        assert!(state.pending_delete_mutation.is_none());
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert!(state.delete_error_visible);
+    }
+
+    /// 删除结果必须匹配 pending；隐藏重开不能吞掉已提交成功。
+    #[test]
+    fn 删除结果隔离迟到身份并允许隐藏期间完成() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_generation = state.panel_generation();
+        let UiAction::QueueDelete(request) = state.apply(UiEvent::DeleteItem {
+            panel_generation: old_generation,
+            id: 1,
+            content_hash: [0; 32],
+        }) else {
+            panic!("合法删除点击必须生成后台请求");
+        };
+
+        for stale in [
+            DeleteMutationResult {
+                mutation_token: request.mutation_token + 1,
+                panel_generation: request.panel_generation,
+                id: request.id,
+                content_hash: request.content_hash,
+                outcome: Ok(()),
+            },
+            DeleteMutationResult {
+                mutation_token: request.mutation_token,
+                panel_generation: request.panel_generation + 1,
+                id: request.id,
+                content_hash: request.content_hash,
+                outcome: Ok(()),
+            },
+            DeleteMutationResult {
+                mutation_token: request.mutation_token,
+                panel_generation: request.panel_generation,
+                id: request.id,
+                content_hash: [9; 32],
+                outcome: Ok(()),
+            },
+        ] {
+            state.apply(UiEvent::DeleteMutationCompleted(stale));
+            assert_eq!(state.pending_delete_mutation, Some(request));
+            assert_eq!(state.snapshot.items.len(), 2);
+        }
+
+        state.apply(UiEvent::HidePanel {
+            generation: old_generation,
+        });
+        state.apply(UiEvent::OpenPanel);
+        state.apply(UiEvent::DeleteMutationCompleted(DeleteMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            outcome: Ok(()),
+        }));
+        assert!(state.pending_delete_mutation.is_none());
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(state.snapshot.items[0].id, 2);
+        assert_eq!(state.snapshot.selected_index, Some(0));
+    }
+
+    /// 存储失败只清 pending 和显示固定状态，当前记录与缓存都必须保留。
+    #[test]
+    fn 删除失败保持记录() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let UiAction::QueueDelete(request) = state.apply(UiEvent::DeleteItem {
+            panel_generation: state.panel_generation(),
+            id: 1,
+            content_hash: [0; 32],
+        }) else {
+            panic!("合法删除点击必须生成后台请求");
+        };
+
+        state.apply(UiEvent::DeleteMutationCompleted(DeleteMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            outcome: Err(DeleteMutationFailure::StorageUnavailable),
+        }));
+        assert!(state.pending_delete_mutation.is_none());
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(state.history.items().len(), 1);
+        assert!(state.delete_error_visible);
+    }
+
+    /// 深分页删除要立即移除目标，并通过新数据集代次拒绝删除前的旧查询结果。
+    #[test]
+    fn 删除深分页记录并拒绝旧查询复活() {
+        let items = (0..150).map(test_item).collect::<Vec<_>>();
+        let target = items[120].clone();
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items,
+            selected_index: Some(120),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let old_request = state
+            .take_pending_history_request()
+            .expect("打开面板应存在旧首页请求");
+        // 打开面板会按产品契约先选中第一条；这里模拟用户已滚动并选中深分页目标。
+        state.snapshot.selected_index = Some(120);
+
+        let UiAction::QueueDelete(request) = state.apply(UiEvent::DeleteItem {
+            panel_generation: state.panel_generation(),
+            id: target.id,
+            content_hash: target.content_hash,
+        }) else {
+            panic!("深分页记录必须可删除");
+        };
+        state.apply(UiEvent::DeleteMutationCompleted(DeleteMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            id: request.id,
+            content_hash: request.content_hash,
+            outcome: Ok(()),
+        }));
+        assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
+        assert_eq!(state.snapshot.selected_index, Some(120));
+        assert!(state.take_pending_history_request().is_some());
+
+        state.apply_history_page_result(page_result(
+            &old_request,
+            Ok(UiHistoryPage {
+                items: vec![target.clone()],
+                next_cursor: None,
+            }),
+        ));
+        assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
+    }
+
+    /// 删除按钮索引必须在排队前同步冻结 ID、哈希和当前面板代次。
+    #[test]
+    fn 删除按钮索引同步解析为稳定身份() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), test_item(1)],
+                selected_index: None,
+            }));
+            state.apply(UiEvent::OpenPanel);
+        });
+
+        assert_eq!(
+            super::resolve_delete_item(1),
+            Some(UiEvent::DeleteItem {
+                panel_generation: 1,
+                id: 2,
+                content_hash: [1; 32],
+            })
+        );
+        assert_eq!(super::resolve_delete_item(-1), None);
+        assert_eq!(super::resolve_delete_item(2), None);
     }
 
     /// 收藏按钮索引必须在排队前同步冻结身份和相反的明确状态。

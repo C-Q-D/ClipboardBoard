@@ -35,6 +35,7 @@ fn card(label: &str) -> ClipboardCard {
         relative_time: SharedString::from("刚刚"),
         is_pinned: false,
         pin_pending: false,
+        delete_pending: false,
     }
 }
 

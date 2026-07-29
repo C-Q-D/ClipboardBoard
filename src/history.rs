@@ -106,6 +106,21 @@ impl MemoryHistory {
         true
     }
 
+    /// 按数据库 ID 和内容哈希删除一条缓存摘要；身份不匹配时保持无副作用。
+    ///
+    /// 返回值只表示当前缓存是否命中；数据库事务结果仍是删除成功的唯一判据。
+    pub fn remove(&mut self, id: u64, content_hash: [u8; 32]) -> bool {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.id == id && item.content_hash == content_hash)
+        else {
+            return false;
+        };
+        self.items.remove(index);
+        true
+    }
+
     /// 以只读切片形式暴露当前顺序，调用方不能绕过协调器修改去重状态。
     pub fn items(&self) -> &[UiClipboardItem] {
         &self.items
@@ -260,5 +275,19 @@ mod tests {
         assert!(!history.set_pinned(21, [99; 32], true));
         assert!(history.set_pinned(21, [21; 32], true));
         assert!(history.items()[0].is_pinned);
+    }
+
+    /// 删除缓存摘要必须同时校验 ID 和哈希，错误身份不能移除任何其他记录。
+    #[test]
+    fn 按稳定身份删除缓存摘要() {
+        let mut history = MemoryHistory::new(10);
+        history.record(item(31, "目标", "刚刚", false));
+        history.record(item(32, "保留", "刚刚", false));
+
+        assert!(!history.remove(99, [31; 32]));
+        assert!(!history.remove(31, [99; 32]));
+        assert!(history.remove(31, [31; 32]));
+        assert_eq!(history.items().len(), 1);
+        assert_eq!(history.items()[0].id, 32);
     }
 }

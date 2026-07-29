@@ -899,4 +899,27 @@ mod tests {
         drop(storage);
         std::fs::remove_dir_all(directory).expect("清理查询测试目录失败");
     }
+
+    /// 非文本摘要不能进入当前文本卡片模型，删除按钮因此不会绕过图片生命周期门禁。
+    #[test]
+    fn 非文本摘要不能转换为界面卡片() {
+        let summary = crate::storage::HistorySummary {
+            id: 1,
+            item_type: "image".to_owned(),
+            preview_text: "图片预览".to_owned(),
+            content_hash: [9; 32],
+            source_exe: None,
+            source_app: None,
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 1,
+            last_used_at: None,
+        };
+
+        assert_eq!(
+            ui_item_from_summary(&summary, 1),
+            Err(HistoryQueryFailure::InvalidSummary)
+        );
+    }
 }

@@ -16,6 +16,8 @@ export struct ClipboardCard {
     is_pinned: bool,
     // 当前卡片是否正在等待收藏事务结果，用于禁用重复点击。
     pin_pending: bool,
+    // 当前卡片是否正在等待删除事务结果；pending 期间卡片仍然可见。
+    delete_pending: bool,
 }
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -39,6 +41,8 @@ export component AppWindow inherits Window {
     callback copy-item-requested(index: int);
     // 收藏按钮只提交当前索引，Rust 同步解析稳定身份并生成明确期望状态。
     callback pin-item-requested(index: int);
+    // 删除按钮只提交当前索引，Rust 必须等待 SQLite 成功后才移除卡片。
+    callback delete-item-requested(index: int);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -64,6 +68,8 @@ export component AppWindow inherits Window {
     in property <bool> history-retry-required: false;
     // 收藏失败只展示固定文案，不接收 SQLite 或正文错误详情。
     in property <bool> pin-error-visible: false;
+    // 删除失败只展示固定文案，不接收 SQLite、哈希或正文错误详情。
+    in property <bool> delete-error-visible: false;
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -222,7 +228,7 @@ export component AppWindow inherits Window {
                             border-radius: 10px;
 
                             VerticalLayout {
-                                width: parent.width - 100px;
+                                width: parent.width - 144px;
                                 height: parent.height;
                                 padding: 14px;
                                 spacing: 8px;
@@ -258,10 +264,39 @@ export component AppWindow inherits Window {
                             }
 
                             card-touch := TouchArea {
-                                // 右侧 100px 属于收藏和复制按钮，主体选择区与操作区不重叠。
-                                width: parent.width - 100px;
+                                // 右侧 144px 属于删除、收藏和复制按钮，主体选择区与操作区不重叠。
+                                width: parent.width - 144px;
                                 clicked => {
                                     card-selection-requested(index);
+                                }
+                            }
+
+                            delete-button := Rectangle {
+                                x: parent.width - 138px;
+                                y: 30px;
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 6px;
+                                background: delete-touch.pressed
+                                    ? #f5f5f5
+                                    : delete-touch.has-hover ? #303030 : #242424;
+                                border-width: 1px;
+                                border-color: #4a4a4a;
+
+                                Text {
+                                    text: card.delete_pending ? "…" : "删";
+                                    color: delete-touch.pressed ? #080808 : #f5f5f5;
+                                    font-size: card.delete_pending ? 15px : 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                delete-touch := TouchArea {
+                                    clicked => {
+                                        if (!card.delete_pending) {
+                                            delete-item-requested(index);
+                                        }
+                                    }
                                 }
                             }
 
@@ -344,6 +379,13 @@ export component AppWindow inherits Window {
 
                 if pin-error-visible: Text {
                     text: "收藏更新失败，请重试";
+                    color: #d99b6c;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                if delete-error-visible: Text {
+                    text: "删除失败，请重试";
                     color: #d99b6c;
                     font-size: 13px;
                     horizontal-alignment: center;

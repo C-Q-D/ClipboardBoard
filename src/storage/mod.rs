@@ -1,7 +1,7 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、单条文本删除、
-//! 筛选摘要查询和复合游标；清理和 UI 接线由其他模块实现。
+//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、文本删除与清空、
+//! 筛选摘要查询和复合游标；清空 UI 接线由其他模块实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
 
@@ -9,9 +9,9 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    DeleteHistoryInput, DeleteHistoryResult, HistoryCursor, HistoryPage, HistoryPayload,
-    HistoryQuery, HistorySummary, SetPinnedInput, SetPinnedResult, StorageClient, StorageExecutor,
-    StorageStatus, TextUpsertInput, TextUpsertResult,
+    ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult, HistoryCursor, HistoryPage,
+    HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput, SetPinnedResult, StorageClient,
+    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -68,6 +68,8 @@ pub enum StorageError {
         /// SQLite 报告的实际影响行数。
         affected: usize,
     },
+    /// 进程内存储操作修订号已经耗尽；必须在执行 SQL 前拒绝以避免顺序身份回绕。
+    MutationRevisionExhausted,
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
 }
@@ -105,6 +107,7 @@ impl fmt::Display for StorageError {
             Self::HistoryDeleteAffectedRows { id, affected } => {
                 write!(formatter, "历史记录 {id} 删除影响行数异常：{affected}")
             }
+            Self::MutationRevisionExhausted => write!(formatter, "存储操作修订号已经耗尽"),
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }
     }

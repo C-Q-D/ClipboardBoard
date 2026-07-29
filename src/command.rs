@@ -295,6 +295,7 @@ mod tests {
     #[test]
     fn 持久化结果使用最终字段和来源优先级() {
         let result = TextUpsertResult {
+            mutation_revision: 1,
             id: 9,
             content_hash: [3; 32],
             preview_text: "数据库预览".to_owned(),
@@ -321,6 +322,7 @@ mod tests {
     #[test]
     fn 不可转换的持久化结果被拒绝() {
         let result = TextUpsertResult {
+            mutation_revision: 1,
             id: -1,
             content_hash: [4; 32],
             preview_text: "错误 DTO".to_owned(),

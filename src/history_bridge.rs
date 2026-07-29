@@ -442,6 +442,7 @@ mod tests {
             4,
             |_input| {
                 Ok(TextUpsertResult {
+                    mutation_revision: 1,
                     id: -1,
                     content_hash: [2; 32],
                     preview_text: "DTO 错误".to_owned(),

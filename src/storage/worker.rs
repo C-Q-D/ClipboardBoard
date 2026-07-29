@@ -105,6 +105,8 @@ pub struct TextUpsertInput {
 /// 文本历史事务写入后返回的稳定快照，不暴露 SQLite 连接或游标。
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TextUpsertResult {
+    /// 唯一存储线程为本次成功事务分配的进程内单调修订号。
+    pub mutation_revision: u64,
     /// 历史记录的数据库主键。
     pub id: i64,
     /// 本次写入使用的内容哈希。
@@ -167,6 +169,15 @@ pub struct DeleteHistoryResult {
     pub content_hash: [u8; 32],
     /// 本次事务是否实际删除了一行；`false` 表示目标此前已经不存在。
     pub was_deleted: bool,
+}
+
+/// 清空未收藏文本事务提交后的有限结果；不携带任何剪贴板正文或稳定身份。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ClearUnpinnedTextResult {
+    /// 本次事务实际删除的未收藏文本行数；零表示幂等成功。
+    pub deleted_count: u64,
+    /// 唯一存储线程为本次成功事务分配的进程内单调修订号。
+    pub mutation_revision: u64,
 }
 
 /// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
@@ -288,6 +299,11 @@ enum StorageCommand {
         /// 返回事务提交后的有限删除结果。
         reply: SyncSender<Result<DeleteHistoryResult, StorageError>>,
     },
+    /// 在 worker 的唯一连接上用单个事务清空所有未收藏文本。
+    ClearUnpinnedText {
+        /// 返回删除数量和存储线性化修订号。
+        reply: SyncSender<Result<ClearUnpinnedTextResult, StorageError>>,
+    },
     /// 在 worker 的唯一连接上读取一页历史摘要。
     ListHistory {
         /// 已通过页大小校验的筛选和分页请求。
@@ -323,6 +339,14 @@ enum StorageCommand {
         /// panic 会丢弃回执发送端，使等待客户端稳定解除阻塞。
         reply: SyncSender<Result<(), StorageError>>,
     },
+    /// 测试专用故障注入：把操作修订号推进到指定值，以验证耗尽前拒绝语义。
+    #[cfg(test)]
+    TestSetMutationRevision {
+        /// 下一条 mutation 将从此值执行 checked_add。
+        revision: u64,
+        /// 设置完成后的同步回执。
+        reply: SyncSender<Result<(), StorageError>>,
+    },
 }
 
 /// 在线程内部持有 SQLite 连接和迁移后的不可变元数据。
@@ -333,6 +357,8 @@ struct StorageState {
     connection_thread_id: ThreadId,
     /// 迁移提交后固定的 schema 版本。
     schema_version: i64,
+    /// 捕获 upsert 与清空事务共享的进程内单调线性化修订号。
+    storage_mutation_revision: u64,
 }
 
 /// 共享命令入口的生命周期；所有克隆客户端必须经过同一把门禁检查。
@@ -456,6 +482,11 @@ impl StorageExecutor {
         input: DeleteHistoryInput,
     ) -> Result<DeleteHistoryResult, StorageError> {
         self.client().delete_history(input)
+    }
+
+    /// 使用单个事务删除全部未收藏文本；收藏和非文本记录保持不变。
+    pub fn clear_unpinned_text(&self) -> Result<ClearUnpinnedTextResult, StorageError> {
+        self.client().clear_unpinned_text()
     }
 
     /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
@@ -611,6 +642,17 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 在共享 worker 上用单个事务删除全部未收藏文本。
+    pub fn clear_unpinned_text(&self) -> Result<ClearUnpinnedTextResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::ClearUnpinnedText {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 在共享 worker 上事务性插入或更新文本历史。
     pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
         let (reply_sender, reply_receiver) = sync_channel(1);
@@ -730,6 +772,19 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 测试专用：把 worker 的操作修订号设置为指定值。
+    #[cfg(test)]
+    fn test_set_mutation_revision(&self, revision: u64) -> Result<(), StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::TestSetMutationRevision {
+            revision,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 测试专用：暴露“已取得门禁”和“已完成入队”两个确定性时点。
     #[cfg(test)]
     fn test_status_with_admission(
@@ -792,13 +847,28 @@ fn storage_thread(
                 let _ = reply.send(inspect_state(&mut state));
             }
             StorageCommand::UpsertText { input, reply } => {
-                let _ = reply.send(upsert_text(&mut state.connection, input));
+                let result = reserve_mutation_revision(&state).and_then(|revision| {
+                    upsert_text(&mut state.connection, input, revision).inspect(|_| {
+                        // 只有事务已经提交成功，才能公开并安装预留的修订号。
+                        state.storage_mutation_revision = revision;
+                    })
+                });
+                let _ = reply.send(result);
             }
             StorageCommand::SetPinned { input, reply } => {
                 let _ = reply.send(set_history_pinned(&mut state.connection, input));
             }
             StorageCommand::DeleteHistory { input, reply } => {
                 let _ = reply.send(delete_history(&mut state.connection, input));
+            }
+            StorageCommand::ClearUnpinnedText { reply } => {
+                let result = reserve_mutation_revision(&state).and_then(|revision| {
+                    clear_unpinned_text(&mut state.connection, revision).inspect(|_| {
+                        // 删除零条也是成功的线性化事务，仍须安装新修订号。
+                        state.storage_mutation_revision = revision;
+                    })
+                });
+                let _ = reply.send(result);
             }
             StorageCommand::ListHistory { query, reply } => {
                 let _ = reply.send(query_history_summaries(&state.connection, query));
@@ -826,6 +896,11 @@ fn storage_thread(
                 drop(reply);
                 panic!("测试注入的存储 worker panic");
             }
+            #[cfg(test)]
+            StorageCommand::TestSetMutationRevision { revision, reply } => {
+                state.storage_mutation_revision = revision;
+                let _ = reply.send(Ok(()));
+            }
         }
     }
 }
@@ -847,7 +922,16 @@ fn initialize_connection(
         connection,
         connection_thread_id,
         schema_version,
+        storage_mutation_revision: 0,
     })
+}
+
+/// 在任何 SQL 执行前预留下一操作修订号；耗尽时数据库必须保持不变。
+fn reserve_mutation_revision(state: &StorageState) -> Result<u64, StorageError> {
+    state
+        .storage_mutation_revision
+        .checked_add(1)
+        .ok_or(StorageError::MutationRevisionExhausted)
 }
 
 /// 在实际连接上执行 `SELECT 1` 和记录数查询，绑定线程证据与连接所有权。
@@ -877,6 +961,7 @@ fn inspect_state(state: &mut StorageState) -> Result<StorageStatus, StorageError
 fn upsert_text(
     connection: &mut Connection,
     input: TextUpsertInput,
+    mutation_revision: u64,
 ) -> Result<TextUpsertResult, StorageError> {
     let TextUpsertInput {
         content_hash,
@@ -911,6 +996,7 @@ WHERE content_hash = ?1
         params![content_hash_blob.as_slice()],
         |row| {
             Ok(TextUpsertResult {
+                mutation_revision,
                 id: row.get(0)?,
                 content_hash,
                 preview_text: row.get(1)?,
@@ -927,6 +1013,25 @@ WHERE content_hash = ?1
 
     transaction.commit()?;
     Ok(result)
+}
+
+/// 使用单个 SQLite 事务只删除未收藏文本，并返回有限删除数量与线性化修订号。
+fn clear_unpinned_text(
+    connection: &mut Connection,
+    mutation_revision: u64,
+) -> Result<ClearUnpinnedTextResult, StorageError> {
+    let transaction = connection.transaction()?;
+    let deleted_count = transaction.execute(
+        "DELETE FROM clipboard_items WHERE item_type = 'text' AND is_pinned = 0",
+        [],
+    )?;
+    transaction.commit()?;
+
+    Ok(ClearUnpinnedTextResult {
+        // rusqlite 的影响行数是 usize；Rust 支持目标的 usize 不宽于 u64。
+        deleted_count: deleted_count as u64,
+        mutation_revision,
+    })
 }
 
 /// 在同一事务内校验稳定身份、写入明确收藏状态并读取最终值。
@@ -1564,6 +1669,176 @@ mod tests {
         remove_directory(&directory);
     }
 
+    /// 同一 worker 内重复哈希复用旧 ID，但成功事务修订号仍必须严格递增。
+    #[test]
+    fn mutation_revision_orders_duplicate_upsert_and_clear() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor
+            .upsert_text(text_input(51, "原正文", "原预览", 100))
+            .expect("首次写入失败");
+        let duplicate = executor
+            .upsert_text(text_input(51, "重复正文", "重复预览", 200))
+            .expect("重复写入失败");
+        let cleared = executor.clear_unpinned_text().expect("清空未收藏失败");
+
+        assert_eq!(first.id, duplicate.id);
+        assert_eq!(first.mutation_revision, 1);
+        assert_eq!(duplicate.mutation_revision, 2);
+        assert_eq!(cleared.mutation_revision, 3);
+        assert_eq!(cleared.deleted_count, 1);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 清空事务只删除未收藏文本，收藏文本和非文本记录必须跨重启保留。
+    #[test]
+    fn clear_unpinned_text_preserves_pinned_and_non_text_rows() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let unpinned = executor
+            .upsert_text(text_input(52, "待清空", "待清空", 100))
+            .expect("写入未收藏文本失败");
+        let pinned = executor
+            .upsert_text(text_input(53, "保留收藏", "保留收藏", 200))
+            .expect("写入收藏文本失败");
+        executor
+            .set_history_pinned(SetPinnedInput {
+                id: pinned.id,
+                content_hash: pinned.content_hash,
+                is_pinned: true,
+            })
+            .expect("设置收藏失败");
+        {
+            let connection = Connection::open(&database_path).expect("打开混合类型数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items
+                     (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
+                     VALUES ('image', '图片预览', ?1, 0, 300, 300)",
+                    params![test_hash(54).as_slice()],
+                )
+                .expect("写入非文本记录失败");
+        }
+
+        let result = executor.clear_unpinned_text().expect("清空未收藏失败");
+        assert_eq!(result.deleted_count, 1);
+        assert!(executor
+            .get_history_payload(unpinned.id)
+            .expect("查询已删除文本失败")
+            .is_none());
+        assert!(executor
+            .get_history_payload(pinned.id)
+            .expect("查询收藏文本失败")
+            .is_some());
+        drop(executor);
+
+        let connection = Connection::open(&database_path).expect("重启后打开数据库失败");
+        let remaining: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT item_type FROM clipboard_items ORDER BY id")
+                .expect("准备剩余类型查询失败");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("查询剩余类型失败")
+                .collect::<Result<_, _>>()
+                .expect("读取剩余类型失败")
+        };
+        assert_eq!(remaining, vec!["text".to_owned(), "image".to_owned()]);
+        drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 清空 SQL 失败必须回滚全部删除，不推进修订号，并允许 worker 继续处理后续命令。
+    #[test]
+    fn clear_unpinned_text_rolls_back_and_reuses_reserved_revision_after_failure() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(55, "回滚正文", "回滚预览", 100))
+            .expect("写入回滚记录失败");
+        {
+            let connection = Connection::open(&database_path).expect("打开故障注入数据库失败");
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER abort_unpinned_clear
+                     BEFORE DELETE ON clipboard_items
+                     WHEN OLD.item_type = 'text' AND OLD.is_pinned = 0
+                     BEGIN
+                         SELECT RAISE(ABORT, 'clear blocked');
+                     END;",
+                )
+                .expect("创建清空故障触发器失败");
+        }
+
+        assert!(matches!(
+            executor.clear_unpinned_text(),
+            Err(StorageError::Sqlite(_))
+        ));
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("查询回滚记录失败")
+            .is_some());
+        {
+            let connection = Connection::open(&database_path).expect("重新打开故障注入数据库失败");
+            connection
+                .execute_batch("DROP TRIGGER abort_unpinned_clear;")
+                .expect("删除清空故障触发器失败");
+        }
+        let retry = executor.clear_unpinned_text().expect("故障后重试清空失败");
+        assert_eq!(retry.deleted_count, 1);
+        assert_eq!(retry.mutation_revision, inserted.mutation_revision + 1);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 修订号耗尽必须在执行 DELETE 前拒绝，数据库内容不能发生部分变化。
+    #[test]
+    fn clear_unpinned_text_rejects_revision_exhaustion_before_sql() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(56, "耗尽正文", "耗尽预览", 100))
+            .expect("写入耗尽测试记录失败");
+        executor
+            .client()
+            .test_set_mutation_revision(u64::MAX)
+            .expect("设置耗尽修订号失败");
+
+        assert!(matches!(
+            executor.clear_unpinned_text(),
+            Err(StorageError::MutationRevisionExhausted)
+        ));
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("查询耗尽测试记录失败")
+            .is_some());
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 没有未收藏文本时重复清空仍是成功事务，并分配新的单调修订号。
+    #[test]
+    fn clear_unpinned_text_is_idempotent_with_monotonic_revision() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let first = executor.clear_unpinned_text().expect("首次空清理失败");
+        let second = executor.clear_unpinned_text().expect("重复空清理失败");
+
+        assert_eq!(first.deleted_count, 0);
+        assert_eq!(second.deleted_count, 0);
+        assert_eq!(first.mutation_revision, 1);
+        assert_eq!(second.mutation_revision, 2);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
     /// 收藏写入必须提交到磁盘、支持幂等重试，并在重复复制后继续保留。
     #[test]
     fn set_pinned_persists_is_idempotent_and_survives_duplicate_upsert() {
@@ -1885,7 +2160,7 @@ mod tests {
         remove_directory(&directory);
     }
 
-    /// 验证触发器使更新事务整体回滚，且失败后 worker 仍可继续执行状态探针。
+    /// 验证触发器使更新事务整体回滚，且失败不消耗修订号、worker 仍可继续写入。
     #[test]
     fn text_upsert_rolls_back_on_update_error_and_keeps_worker_alive() {
         let directory = temporary_directory();
@@ -1926,6 +2201,16 @@ mod tests {
                 .clipboard_item_count,
             1
         );
+        {
+            let connection = Connection::open(&database_path).expect("重新打开回滚数据库失败");
+            connection
+                .execute_batch("DROP TRIGGER fail_text_update;")
+                .expect("删除回滚触发器失败");
+        }
+        let recovered = executor
+            .upsert_text(text_input(32, "恢复正文", "恢复预览", 100))
+            .expect("回滚后继续写入失败");
+        assert_eq!(recovered.mutation_revision, 1);
         drop(executor);
 
         let connection = Connection::open(&database_path).expect("回滚后重新打开数据库失败");
@@ -1963,6 +2248,36 @@ mod tests {
             )
         );
         drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// upsert 在修订号耗尽时必须先于 SQL 拒绝，既不插入新行也不更新旧行。
+    #[test]
+    fn text_upsert_rejects_revision_exhaustion_before_sql() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(33, "耗尽原文", "耗尽预览", 100))
+            .expect("写入耗尽原记录失败");
+        executor
+            .client()
+            .test_set_mutation_revision(u64::MAX)
+            .expect("设置耗尽修订号失败");
+
+        assert!(matches!(
+            executor.upsert_text(text_input(33, "不得更新", "不得更新", 200)),
+            Err(StorageError::MutationRevisionExhausted)
+        ));
+        let payload = executor
+            .get_history_payload(inserted.id)
+            .expect("查询耗尽原记录失败")
+            .expect("耗尽原记录不应消失");
+        assert_eq!(payload.text_content.as_deref(), Some("耗尽原文"));
+        assert_eq!(payload.preview_text, "耗尽预览");
+        assert_eq!(payload.copy_count, 1);
+        assert_eq!(payload.copied_at, 100);
+
+        drop(executor);
         remove_directory(&directory);
     }
 

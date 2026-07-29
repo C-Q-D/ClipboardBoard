@@ -9,8 +9,9 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, StorageClient,
-    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
+    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput,
+    SetPinnedResult, StorageClient, StorageExecutor, StorageStatus, TextUpsertInput,
+    TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -50,6 +51,11 @@ pub enum StorageError {
         /// SQLite 实际返回的哈希字节数。
         length: usize,
     },
+    /// 收藏变更使用的 ID 与内容哈希不再指向同一条记录，禁止修改可能被复用的身份。
+    HistoryIdentityMismatch {
+        /// 调用方提交的历史记录 ID；错误不包含正文或哈希内容。
+        id: i64,
+    },
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
 }
@@ -77,6 +83,9 @@ impl fmt::Display for StorageError {
             }
             Self::InvalidContentHashLength { id, length } => {
                 write!(formatter, "历史摘要 {id} 的内容哈希长度无效：{length}")
+            }
+            Self::HistoryIdentityMismatch { id } => {
+                write!(formatter, "历史记录 {id} 的稳定身份已失效")
             }
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }

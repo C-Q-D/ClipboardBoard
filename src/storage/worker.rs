@@ -127,6 +127,28 @@ pub struct TextUpsertResult {
     pub last_used_at: Option<i64>,
 }
 
+/// 收藏状态写入的最小拥有型输入；明确期望状态使重试保持幂等。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SetPinnedInput {
+    /// 历史记录数据库主键。
+    pub id: i64,
+    /// 与 ID 一起校验的固定内容哈希，防止陈旧卡片修改其他记录。
+    pub content_hash: [u8; 32],
+    /// 事务提交后的明确收藏状态，禁止使用盲切换语义。
+    pub is_pinned: bool,
+}
+
+/// 收藏事务提交后返回的有限稳定结果；不携带剪贴板正文。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SetPinnedResult {
+    /// 已成功更新的历史记录 ID。
+    pub id: i64,
+    /// 已校验的内容哈希，供上层隔离迟到结果。
+    pub content_hash: [u8; 32],
+    /// 数据库事务最终提交的收藏状态。
+    pub is_pinned: bool,
+}
+
 /// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct HistoryCursor {
@@ -231,6 +253,13 @@ enum StorageCommand {
         input: TextUpsertInput,
         /// 返回同一事务中读取的最终稳定快照。
         reply: SyncSender<Result<TextUpsertResult, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上按稳定身份设置明确收藏状态。
+    SetPinned {
+        /// 不含正文的稳定身份和期望状态。
+        input: SetPinnedInput,
+        /// 返回事务提交后的有限结果。
+        reply: SyncSender<Result<SetPinnedResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上读取一页历史摘要。
     ListHistory {
@@ -384,6 +413,14 @@ impl StorageExecutor {
     /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
     pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
         self.client().upsert_text(input)
+    }
+
+    /// 按 ID 和内容哈希事务性设置明确收藏状态。
+    pub fn set_history_pinned(
+        &self,
+        input: SetPinnedInput,
+    ) -> Result<SetPinnedResult, StorageError> {
+        self.client().set_history_pinned(input)
     }
 
     /// 使用复合游标读取一页历史摘要；页大小在发送命令前固定校验。
@@ -551,6 +588,21 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 在共享 worker 上按稳定身份事务性设置明确收藏状态。
+    pub fn set_history_pinned(
+        &self,
+        input: SetPinnedInput,
+    ) -> Result<SetPinnedResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::SetPinned {
+            input,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 使用复合游标读取一页历史摘要。
     pub fn list_history_summaries(
         &self,
@@ -692,6 +744,9 @@ fn storage_thread(
             StorageCommand::UpsertText { input, reply } => {
                 let _ = reply.send(upsert_text(&mut state.connection, input));
             }
+            StorageCommand::SetPinned { input, reply } => {
+                let _ = reply.send(set_history_pinned(&mut state.connection, input));
+            }
             StorageCommand::ListHistory { query, reply } => {
                 let _ = reply.send(query_history_summaries(&state.connection, query));
             }
@@ -819,6 +874,43 @@ WHERE content_hash = ?1
 
     transaction.commit()?;
     Ok(result)
+}
+
+/// 在同一事务内校验稳定身份、写入明确收藏状态并读取最终值。
+fn set_history_pinned(
+    connection: &mut Connection,
+    input: SetPinnedInput,
+) -> Result<SetPinnedResult, StorageError> {
+    let SetPinnedInput {
+        id,
+        content_hash,
+        is_pinned,
+    } = input;
+    let content_hash_blob = content_hash.to_vec();
+    let pinned_value = if is_pinned { 1_i64 } else { 0_i64 };
+    let transaction = connection.transaction()?;
+
+    // UPDATE 的双条件同时承担身份校验；零行意味着卡片已过期或记录已不存在。
+    let affected = transaction.execute(
+        "UPDATE clipboard_items SET is_pinned = ?1 WHERE id = ?2 AND content_hash = ?3",
+        params![pinned_value, id, content_hash_blob.as_slice()],
+    )?;
+    if affected != 1 {
+        return Err(StorageError::HistoryIdentityMismatch { id });
+    }
+
+    let final_value = transaction.query_row(
+        "SELECT is_pinned FROM clipboard_items WHERE id = ?1 AND content_hash = ?2",
+        params![id, content_hash_blob.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    transaction.commit()?;
+
+    Ok(SetPinnedResult {
+        id,
+        content_hash,
+        is_pinned: final_value,
+    })
 }
 
 /// 从 worker 的唯一连接执行筛选摘要查询，并用多取一行决定 next_cursor。
@@ -992,7 +1084,8 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        HistoryCursor, HistoryQuery, StorageExecutor, TextUpsertInput, COMMAND_QUEUE_CAPACITY,
+        HistoryCursor, HistoryQuery, SetPinnedInput, StorageExecutor, TextUpsertInput,
+        COMMAND_QUEUE_CAPACITY,
     };
     use crate::storage::StorageError;
 
@@ -1358,6 +1451,102 @@ mod tests {
             .expect("读取原始文本失败");
         assert_eq!(stored_text, "old body");
         drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 收藏写入必须提交到磁盘、支持幂等重试，并在重复复制后继续保留。
+    #[test]
+    fn set_pinned_persists_is_idempotent_and_survives_duplicate_upsert() {
+        let directory = temporary_directory();
+        let (id, content_hash) = {
+            let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+            let inserted = executor
+                .upsert_text(text_input(61, "收藏正文", "收藏预览", 100))
+                .expect("写入收藏测试记录失败");
+            let request = SetPinnedInput {
+                id: inserted.id,
+                content_hash: inserted.content_hash,
+                is_pinned: true,
+            };
+
+            let first = executor
+                .set_history_pinned(request.clone())
+                .expect("首次收藏失败");
+            let repeated = executor
+                .set_history_pinned(request)
+                .expect("幂等收藏重试失败");
+            assert!(first.is_pinned);
+            assert_eq!(first, repeated);
+
+            let duplicate = executor
+                .upsert_text(text_input(61, "新正文不覆盖", "新预览不覆盖", 200))
+                .expect("重复复制写入失败");
+            assert!(duplicate.is_pinned);
+            (inserted.id, inserted.content_hash)
+        };
+
+        {
+            let reopened = StorageExecutor::open_at(&directory).expect("重启存储线程失败");
+            let payload = reopened
+                .get_history_payload(id)
+                .expect("重启后读取记录失败")
+                .expect("重启后收藏记录丢失");
+            assert_eq!(payload.content_hash, content_hash);
+            assert!(payload.is_pinned);
+            let unpinned = reopened
+                .set_history_pinned(SetPinnedInput {
+                    id,
+                    content_hash,
+                    is_pinned: false,
+                })
+                .expect("取消收藏失败");
+            assert!(!unpinned.is_pinned);
+        }
+        let reopened = StorageExecutor::open_at(&directory).expect("取消收藏后重启失败");
+        assert!(
+            !reopened
+                .get_history_payload(id)
+                .expect("取消收藏后读取记录失败")
+                .expect("取消收藏后记录丢失")
+                .is_pinned
+        );
+        drop(reopened);
+        remove_directory(&directory);
+    }
+
+    /// 陈旧 ID 或错误哈希都不能修改目标记录，失败结果也不得泄露正文。
+    #[test]
+    fn set_pinned_rejects_stale_identity_without_mutation() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动存储线程失败");
+        let inserted = executor
+            .upsert_text(text_input(62, "身份正文", "身份预览", 300))
+            .expect("写入身份测试记录失败");
+
+        for invalid in [
+            SetPinnedInput {
+                id: inserted.id + 1,
+                content_hash: inserted.content_hash,
+                is_pinned: true,
+            },
+            SetPinnedInput {
+                id: inserted.id,
+                content_hash: test_hash(99),
+                is_pinned: true,
+            },
+        ] {
+            assert!(matches!(
+                executor.set_history_pinned(invalid),
+                Err(StorageError::HistoryIdentityMismatch { .. })
+            ));
+        }
+
+        let payload = executor
+            .get_history_payload(inserted.id)
+            .expect("读取身份测试记录失败")
+            .expect("身份测试记录不存在");
+        assert!(!payload.is_pinned);
+        drop(executor);
         remove_directory(&directory);
     }
 

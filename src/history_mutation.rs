@@ -1,7 +1,7 @@
-//! 此模块提供收藏状态变更的有界异步命令桥。
+//! 此模块提供收藏和单条删除的有界异步命令桥。
 //!
-//! UI 线程只执行非阻塞提交；单一后台 worker 顺序调用受控存储客户端。关闭会拒绝新请求，
-//! 但保留并排空已经接受的请求，确保“点击收藏后立即退出”不会丢失已承诺的事务。
+//! UI 线程只执行非阻塞提交；两个独立后台 worker 均通过唯一存储 worker 串行访问 SQLite。
+//! 关闭会拒绝新请求，但保留并排空已经接受的请求，确保退出不会丢失已承诺的事务。
 
 use std::{
     io,
@@ -9,7 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crate::storage::{SetPinnedInput, StorageClient, StorageError};
+use crate::storage::{DeleteHistoryInput, SetPinnedInput, StorageClient, StorageError};
 
 /// 收藏请求的固定队列容量；UI 同时只允许一个活动 mutation。
 const PIN_MUTATION_QUEUE_CAPACITY: usize = 1;
@@ -208,9 +208,209 @@ fn map_storage_failure(error: StorageError) -> PinMutationFailure {
     }
 }
 
+/// 删除请求的固定队列容量；UI 会在 DEL-03 维持跨收藏和删除的全局 mutation 互斥。
+const DELETE_MUTATION_QUEUE_CAPACITY: usize = 1;
+
+/// 一次单条删除的稳定身份；不携带正文、预览、来源或内容类型。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeleteMutationRequest {
+    /// UI 分配的单调 mutation 令牌，用于隔离迟到结果。
+    pub mutation_token: u64,
+    /// 点击发生时的面板代次；结果与 pending 匹配，但不要求面板仍处于该代次。
+    pub panel_generation: u64,
+    /// 历史记录数据库 ID。
+    pub id: u64,
+    /// 与 ID 同时校验的固定内容哈希。
+    pub content_hash: [u8; 32],
+}
+
+/// 删除 worker 对外暴露的有限失败类别；底层错误详情不会进入 UI。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteMutationFailure {
+    /// ID 与内容哈希不再指向同一条记录，调用方应刷新当前数据集。
+    IdentityChanged,
+    /// 目标存在但不是当前允许删除的文本记录。
+    NotDeletable,
+    /// 存储正在关闭、不可用或返回其他有限外部失败。
+    StorageUnavailable,
+}
+
+/// 删除事务完成结果；完整回显请求身份以便 UI 严格匹配活动 mutation。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteMutationResult {
+    /// UI 分配的单调 mutation 令牌。
+    pub mutation_token: u64,
+    /// 点击发生时的面板代次。
+    pub panel_generation: u64,
+    /// 历史记录数据库 ID。
+    pub id: u64,
+    /// 与 ID 同时校验的固定内容哈希。
+    pub content_hash: [u8; 32],
+    /// 事务成功或有限失败；目标已不存在同样属于成功。
+    pub outcome: Result<(), DeleteMutationFailure>,
+}
+
+/// UI 非阻塞提交删除请求时的有限拒绝原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteMutationSubmitError {
+    /// 单槽已经包含一个等待处理的请求。
+    Full,
+    /// 请求入口已经关闭，不再接受新的变更。
+    Closed,
+}
+
+/// 删除队列的互斥状态；关闭不清空已接受请求。
+struct DeleteQueueState {
+    /// 唯一等待 worker 处理的请求。
+    pending: Option<DeleteMutationRequest>,
+    /// 关闭线性化标志；置位后所有新请求稳定失败。
+    closed: bool,
+}
+
+/// 删除发送端和接收端共享的单槽核心。
+struct DeleteQueueShared {
+    /// 同时保护请求与关闭标志，确保关闭和提交有明确先后。
+    state: Mutex<DeleteQueueState>,
+    /// 请求提交或关闭时唤醒 worker。
+    ready: Condvar,
+}
+
+/// 可克隆的删除请求入口；克隆不拥有 worker 或 SQLite 生命周期。
+#[derive(Clone)]
+pub struct DeleteMutationSender {
+    /// 共享单槽状态。
+    shared: Arc<DeleteQueueShared>,
+}
+
+/// 删除 worker 独占的接收端；只有它可以取出已接受请求。
+pub struct DeleteMutationReceiver {
+    /// 与发送端共享的单槽状态。
+    shared: Arc<DeleteQueueShared>,
+}
+
+/// 创建容量固定为一的单条删除请求通道。
+pub fn delete_mutation_channel() -> (DeleteMutationSender, DeleteMutationReceiver) {
+    debug_assert_eq!(DELETE_MUTATION_QUEUE_CAPACITY, 1);
+    let shared = Arc::new(DeleteQueueShared {
+        state: Mutex::new(DeleteQueueState {
+            pending: None,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+    });
+    (
+        DeleteMutationSender {
+            shared: Arc::clone(&shared),
+        },
+        DeleteMutationReceiver { shared },
+    )
+}
+
+impl DeleteMutationSender {
+    /// 非阻塞提交一个删除请求；满队列或关闭时立即返回有限错误。
+    pub fn try_submit(
+        &self,
+        request: DeleteMutationRequest,
+    ) -> Result<(), DeleteMutationSubmitError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| DeleteMutationSubmitError::Closed)?;
+        if state.closed {
+            return Err(DeleteMutationSubmitError::Closed);
+        }
+        if state.pending.is_some() {
+            return Err(DeleteMutationSubmitError::Full);
+        }
+        state.pending = Some(request);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    /// 关闭请求入口并唤醒 worker；已经接受的单槽请求仍会被处理。
+    pub fn close(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.closed = true;
+            self.shared.ready.notify_all();
+        }
+    }
+}
+
+impl DeleteMutationReceiver {
+    /// 阻塞等待下一请求；关闭且队列排空后返回 `None`。
+    fn receive(&self) -> Option<DeleteMutationRequest> {
+        let mut state = self.shared.state.lock().ok()?;
+        loop {
+            if let Some(request) = state.pending.take() {
+                return Some(request);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.shared.ready.wait(state).ok()?;
+        }
+    }
+}
+
+/// 启动单一删除 worker；已提交事务无论 UI 是否仍可接收结果都必须完成。
+pub fn start_delete_mutation_worker<E>(
+    storage: StorageClient,
+    receiver: DeleteMutationReceiver,
+    mut emit: E,
+) -> io::Result<JoinHandle<()>>
+where
+    E: FnMut(DeleteMutationResult) -> bool + Send + 'static,
+{
+    thread::Builder::new()
+        .name("clipboard-board-delete-mutation".to_owned())
+        .spawn(move || {
+            while let Some(request) = receiver.receive() {
+                let result = execute_delete_mutation(&storage, request);
+                // 结果投递失败只表示 UI 已退出；SQLite 事务已经完成，不能反向回滚。
+                let _ = emit(result);
+            }
+        })
+}
+
+/// 执行一次删除事务并把所有底层错误压缩为有限类别。
+fn execute_delete_mutation(
+    storage: &StorageClient,
+    request: DeleteMutationRequest,
+) -> DeleteMutationResult {
+    let outcome = i64::try_from(request.id)
+        .map_err(|_| DeleteMutationFailure::IdentityChanged)
+        .and_then(|id| {
+            storage
+                .delete_history(DeleteHistoryInput {
+                    id,
+                    content_hash: request.content_hash,
+                })
+                .map(|_| ())
+                .map_err(map_delete_storage_failure)
+        });
+
+    DeleteMutationResult {
+        mutation_token: request.mutation_token,
+        panel_generation: request.panel_generation,
+        id: request.id,
+        content_hash: request.content_hash,
+        outcome,
+    }
+}
+
+/// 将删除存储错误压缩为不泄露 SQL、类型值或正文的有限类别。
+fn map_delete_storage_failure(error: StorageError) -> DeleteMutationFailure {
+    match error {
+        StorageError::HistoryIdentityMismatch { .. } => DeleteMutationFailure::IdentityChanged,
+        StorageError::HistoryItemNotDeletable { .. } => DeleteMutationFailure::NotDeletable,
+        _ => DeleteMutationFailure::StorageUnavailable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! 此测试模块验证单槽边界、关闭排空和有限结果映射。
+    //! 此测试模块验证收藏与删除桥的单槽边界、关闭排空和有限结果映射。
 
     use std::{
         fs,
@@ -221,9 +421,12 @@ mod tests {
         },
     };
 
+    use rusqlite::{params, Connection};
+
     use super::{
-        pin_mutation_channel, start_pin_mutation_worker, PinMutationFailure, PinMutationRequest,
-        PinMutationSubmitError,
+        delete_mutation_channel, pin_mutation_channel, start_delete_mutation_worker,
+        start_pin_mutation_worker, DeleteMutationFailure, DeleteMutationRequest,
+        DeleteMutationSubmitError, PinMutationFailure, PinMutationRequest, PinMutationSubmitError,
     };
     use crate::storage::{StorageExecutor, TextUpsertInput};
 
@@ -233,7 +436,7 @@ mod tests {
     fn temporary_directory() -> PathBuf {
         let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "clipboard-board-fav02-{}-{sequence}",
+            "clipboard-board-history-mutation-{}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("创建收藏桥测试目录失败");
@@ -248,6 +451,16 @@ mod tests {
             id,
             content_hash: hash,
             is_pinned: true,
+        }
+    }
+
+    /// 构造不含正文的稳定删除请求。
+    fn delete_request(token: u64, id: u64, hash: [u8; 32]) -> DeleteMutationRequest {
+        DeleteMutationRequest {
+            mutation_token: token,
+            panel_generation: 5,
+            id,
+            content_hash: hash,
         }
     }
 
@@ -343,5 +556,188 @@ mod tests {
         assert_eq!(result.outcome, Err(PinMutationFailure::IdentityChanged));
         drop(executor);
         fs::remove_dir_all(directory).expect("清理收藏桥测试目录失败");
+    }
+
+    /// 删除单槽满时必须立即拒绝第二个请求，关闭后也必须稳定拒绝。
+    #[test]
+    fn delete_bounded_channel_rejects_full_and_closed_without_blocking() {
+        let (sender, _receiver) = delete_mutation_channel();
+        sender
+            .try_submit(delete_request(1, 1, [1; 32]))
+            .expect("首个删除请求应进入单槽");
+        assert_eq!(
+            sender.try_submit(delete_request(2, 2, [2; 32])),
+            Err(DeleteMutationSubmitError::Full)
+        );
+        sender.close();
+        assert_eq!(
+            sender.try_submit(delete_request(3, 3, [3; 32])),
+            Err(DeleteMutationSubmitError::Closed)
+        );
+    }
+
+    /// 关闭桥后已接受的删除仍须提交，重启存储后目标记录不能恢复。
+    #[test]
+    fn delete_close_drains_accepted_request_before_worker_exit() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动删除桥存储线程失败");
+        let inserted = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: [21; 32],
+                text_content: "只在 SQLite 中保存的删除正文".to_owned(),
+                preview_text: "删除桥预览".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 1,
+            })
+            .expect("写入删除桥测试记录失败");
+        let (sender, receiver) = delete_mutation_channel();
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker = start_delete_mutation_worker(executor.client(), receiver, move |result| {
+            result_sender.send(result).is_ok()
+        })
+        .expect("启动删除 worker 失败");
+
+        sender
+            .try_submit(delete_request(
+                19,
+                u64::try_from(inserted.id).expect("测试 ID 应为正数"),
+                inserted.content_hash,
+            ))
+            .expect("提交删除请求失败");
+        sender.close();
+        worker.join().expect("删除 worker 异常退出");
+
+        let result = result_receiver.recv().expect("未收到删除结果");
+        assert_eq!(result.mutation_token, 19);
+        assert_eq!(result.panel_generation, 5);
+        assert_eq!(result.id, u64::try_from(inserted.id).unwrap());
+        assert_eq!(result.content_hash, inserted.content_hash);
+        assert_eq!(result.outcome, Ok(()));
+        let inserted_id = inserted.id;
+        drop(executor);
+
+        let reopened = StorageExecutor::open_at(&directory).expect("删除后重启存储线程失败");
+        assert!(reopened
+            .get_history_payload(inserted_id)
+            .expect("重启后读取删除结果失败")
+            .is_none());
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("清理删除桥测试目录失败");
+    }
+
+    /// 删除桥必须把身份错配和非文本门禁压缩为两个稳定有限类别。
+    #[test]
+    fn delete_failure_mapping_is_finite_and_preserves_request_identity() {
+        let directory = temporary_directory();
+        {
+            // 先由正式存储入口完成迁移，再用测试连接预置未来类型记录。
+            let executor =
+                StorageExecutor::open_at(&directory).expect("初始化删除失败映射数据库失败");
+            drop(executor);
+        }
+        let image_id = {
+            let database_path = directory.join("clipboard.db");
+            let connection = Connection::open(&database_path).expect("打开删除失败映射数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items \
+                     (item_type, preview_text, content_hash, created_at, copied_at) \
+                     VALUES ('image', '图片预览', ?1, 1, 1)",
+                    params![[22_u8; 32].as_slice()],
+                )
+                .expect("写入非文本记录失败");
+            connection.last_insert_rowid()
+        };
+        let executor = StorageExecutor::open_at(&directory).expect("启动失败映射存储线程失败");
+        let text = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: [23; 32],
+                text_content: "身份测试正文".to_owned(),
+                preview_text: "身份测试预览".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 2,
+            })
+            .expect("写入身份测试文本失败");
+        let (sender, receiver) = delete_mutation_channel();
+        let (result_sender, result_receiver) = sync_channel(2);
+        let worker = start_delete_mutation_worker(executor.client(), receiver, move |result| {
+            result_sender.send(result).is_ok()
+        })
+        .expect("启动失败映射删除 worker 失败");
+
+        let stale = delete_request(
+            31,
+            u64::try_from(text.id).expect("文本测试 ID 应为正数"),
+            [99; 32],
+        );
+        sender.try_submit(stale).expect("提交陈旧删除请求失败");
+        let stale_result = result_receiver.recv().expect("未收到身份错配结果");
+        assert_eq!(stale_result.mutation_token, stale.mutation_token);
+        assert_eq!(stale_result.panel_generation, stale.panel_generation);
+        assert_eq!(stale_result.id, stale.id);
+        assert_eq!(stale_result.content_hash, stale.content_hash);
+        assert_eq!(
+            stale_result.outcome,
+            Err(DeleteMutationFailure::IdentityChanged)
+        );
+
+        let non_text = delete_request(
+            32,
+            u64::try_from(image_id).expect("图片测试 ID 应为正数"),
+            [22; 32],
+        );
+        sender.try_submit(non_text).expect("提交非文本删除请求失败");
+        sender.close();
+        worker.join().expect("失败映射删除 worker 异常退出");
+        let non_text_result = result_receiver.recv().expect("未收到非文本门禁结果");
+        assert_eq!(non_text_result.mutation_token, non_text.mutation_token);
+        assert_eq!(non_text_result.id, non_text.id);
+        assert_eq!(
+            non_text_result.outcome,
+            Err(DeleteMutationFailure::NotDeletable)
+        );
+        drop(executor);
+        fs::remove_dir_all(directory).expect("清理删除失败映射目录失败");
+    }
+
+    /// UI 结果接收端消失不能阻塞删除提交或 worker 退出。
+    #[test]
+    fn delete_emit_false_does_not_undo_committed_transaction() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动投递失败测试存储线程失败");
+        let inserted = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: [24; 32],
+                text_content: "投递失败正文".to_owned(),
+                preview_text: "投递失败预览".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 3,
+            })
+            .expect("写入投递失败测试记录失败");
+        let (sender, receiver) = delete_mutation_channel();
+        let worker = start_delete_mutation_worker(executor.client(), receiver, |_result| false)
+            .expect("启动投递失败删除 worker 失败");
+        sender
+            .try_submit(delete_request(
+                41,
+                u64::try_from(inserted.id).expect("测试 ID 应为正数"),
+                inserted.content_hash,
+            ))
+            .expect("提交投递失败删除请求失败");
+        sender.close();
+        worker.join().expect("投递失败删除 worker 异常退出");
+        let inserted_id = inserted.id;
+        drop(executor);
+
+        let reopened = StorageExecutor::open_at(&directory).expect("投递失败后重启存储线程失败");
+        assert!(reopened
+            .get_history_payload(inserted_id)
+            .expect("投递失败后读取记录失败")
+            .is_none());
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("清理投递失败测试目录失败");
     }
 }

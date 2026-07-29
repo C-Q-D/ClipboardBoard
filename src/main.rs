@@ -8,7 +8,8 @@
 use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
 use clipboard_board::app::{
-    bind_app_window, bind_copy_request_inbox, bind_history_query_bridge, bind_pin_mutation_sender,
+    bind_app_window, bind_copy_request_inbox, bind_delete_mutation_sender,
+    bind_history_query_bridge, bind_pin_mutation_sender,
 };
 #[cfg(windows)]
 use clipboard_board::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
@@ -19,7 +20,10 @@ use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::run_clipboard_pump;
 #[cfg(windows)]
-use clipboard_board::history_mutation::{pin_mutation_channel, start_pin_mutation_worker};
+use clipboard_board::history_mutation::{
+    delete_mutation_channel, pin_mutation_channel, start_delete_mutation_worker,
+    start_pin_mutation_worker,
+};
 #[cfg(windows)]
 use clipboard_board::history_query::{
     history_request_channel, history_result_channel, start_history_query_worker,
@@ -103,9 +107,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(error.into());
             }
         };
+    let (delete_mutations, delete_mutation_receiver) = delete_mutation_channel();
+    bind_delete_mutation_sender(delete_mutations.clone());
+    let delete_mutation_worker =
+        match start_delete_mutation_worker(storage.client(), delete_mutation_receiver, |result| {
+            post_ui_event(UiEvent::DeleteMutationCompleted(result)).is_ok()
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                delete_mutations.close();
+                pin_mutations.close();
+                history_requests.close();
+                history_results.close();
+                let _ = hotkey_manager.stop();
+                let _ = capture_pump.join();
+                let _ = history_query_worker.join();
+                let _ = pin_mutation_worker.join();
+                return Err(error.into());
+            }
+        };
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
+    delete_mutations.close();
     pin_mutations.close();
     history_requests.close();
     history_results.close();
@@ -124,6 +148,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "收藏变更线程异常退出")
         .map(|_| ());
+    let delete_mutation_result = delete_mutation_worker
+        .join()
+        .map_err(|_| "删除变更线程异常退出")
+        .map(|_| ());
     // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
     let storage_result = storage
         .begin_closing()
@@ -135,6 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture_pump_result?;
     history_query_result?;
     pin_mutation_result?;
+    delete_mutation_result?;
     storage_result?;
     Ok(())
 }

@@ -8,7 +8,9 @@
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
-use crate::history_mutation::{PinMutationRequest, PinMutationResult, PinMutationSender};
+use crate::history_mutation::{
+    DeleteMutationSender, PinMutationRequest, PinMutationResult, PinMutationSender,
+};
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
     HistoryRequestSender, HistoryResultReceiver, MAX_LOADED_ITEMS,
@@ -287,6 +289,10 @@ impl UiState {
             UiEvent::HistoryQueryWake => UiAction::None,
             UiEvent::PinMutationCompleted(result) => {
                 self.apply_pin_mutation_result(result);
+                UiAction::None
+            }
+            UiEvent::DeleteMutationCompleted(_result) => {
+                // DEL-02 只贯通后台结果；DEL-03 建立 pending 后再消费并改变快照。
                 UiAction::None
             }
             UiEvent::HistoryViewportChanged {
@@ -827,6 +833,8 @@ thread_local! {
     static UI_HISTORY_RESULTS: RefCell<Option<HistoryResultReceiver>> = const { RefCell::new(None) };
     /// UI 线程只持有收藏请求发送端；SQLite 和 worker 生命周期仍由主线程拥有。
     static UI_PIN_MUTATIONS: RefCell<Option<PinMutationSender>> = const { RefCell::new(None) };
+    /// UI 线程只持有删除请求发送端；DEL-03 会通过该单槽执行非阻塞提交。
+    static UI_DELETE_MUTATIONS: RefCell<Option<DeleteMutationSender>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -968,6 +976,13 @@ pub fn bind_pin_mutation_sender(sender: PinMutationSender) {
     });
 }
 
+/// 在 UI 线程绑定单条删除的非阻塞单槽发送端。
+pub fn bind_delete_mutation_sender(sender: DeleteMutationSender) {
+    UI_DELETE_MUTATIONS.with(|slot| {
+        *slot.borrow_mut() = Some(sender);
+    });
+}
+
 /// 关闭查询双向桥；Quit 调用后 worker 不再接受排队请求，迟到结果也不再唤醒 UI。
 fn close_history_query_bridge() {
     UI_HISTORY_REQUESTS.with(|slot| {
@@ -985,6 +1000,15 @@ fn close_history_query_bridge() {
 /// 关闭收藏请求入口；已经进入单槽的请求由 worker 排空后退出。
 fn close_pin_mutation_bridge() {
     UI_PIN_MUTATIONS.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            sender.close();
+        }
+    });
+}
+
+/// 关闭删除请求入口；已经进入单槽的请求由 worker 排空后退出。
+fn close_delete_mutation_bridge() {
+    UI_DELETE_MUTATIONS.with(|slot| {
         if let Some(sender) = slot.borrow().as_ref() {
             sender.close();
         }
@@ -1085,6 +1109,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             close_copy_request_gate();
             close_history_query_bridge();
             close_pin_mutation_bridge();
+            close_delete_mutation_bridge();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");

@@ -860,14 +860,14 @@ mod tests {
                 StorageExecutor::open_at(&directory).expect("初始化删除失败映射数据库失败");
             drop(executor);
         }
-        let image_id = {
+        let non_text_id = {
             let database_path = directory.join("clipboard.db");
             let connection = Connection::open(&database_path).expect("打开删除失败映射数据库失败");
             connection
                 .execute(
                     "INSERT INTO clipboard_items \
                      (item_type, preview_text, content_hash, created_at, copied_at) \
-                     VALUES ('image', '图片预览', ?1, 1, 1)",
+                     VALUES ('binary', '非文本预览', ?1, 1, 1)",
                     params![[22_u8; 32].as_slice()],
                 )
                 .expect("写入非文本记录失败");
@@ -909,7 +909,7 @@ mod tests {
 
         let non_text = delete_request(
             32,
-            u64::try_from(image_id).expect("图片测试 ID 应为正数"),
+            u64::try_from(non_text_id).expect("非文本测试 ID 应为正数"),
             [22; 32],
         );
         sender.try_submit(non_text).expect("提交非文本删除请求失败");
@@ -1022,7 +1022,7 @@ mod tests {
                 .execute(
                     "INSERT INTO clipboard_items
                      (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
-                     VALUES ('image', '保留图片', ?1, 0, 3, 3)",
+                     VALUES ('binary', '保留非文本', ?1, 0, 3, 3)",
                     params![[36_u8; 32].as_slice()],
                 )
                 .expect("写入清空桥图片行失败");
@@ -1161,7 +1161,7 @@ mod tests {
                 .execute(
                     "INSERT INTO clipboard_items
                      (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
-                     VALUES ('image', '图片', ?1, 0, 2, 2)",
+                     VALUES ('binary', '非文本', ?1, 0, 2, 2)",
                     params![[34_u8; 32].as_slice()],
                 )
                 .expect("写入桥测试图片行失败");

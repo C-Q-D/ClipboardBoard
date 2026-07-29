@@ -276,7 +276,7 @@ mod tests {
         let connection = Connection::open(storage.database_path()).expect("打开注入连接失败");
         connection
             .execute(
-                "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, source_exe, source_app, copy_count, is_pinned, created_at, copied_at, last_used_at) VALUES ('image', NULL, '图片', ?1, NULL, NULL, 1, 0, 1, 1, NULL)",
+                "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, source_exe, source_app, copy_count, is_pinned, created_at, copied_at, last_used_at) VALUES ('binary', NULL, '非文本', ?1, NULL, NULL, 1, 0, 1, 1, NULL)",
                 params![vec![8_u8; 32]],
             )
             .expect("预置不兼容记录失败");
@@ -286,14 +286,14 @@ mod tests {
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].preview, "可恢复文本");
         let connection = Connection::open(storage.database_path()).expect("重新打开混合数据库失败");
-        let image_count: i64 = connection
+        let non_text_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM clipboard_items WHERE item_type = 'image'",
+                "SELECT COUNT(*) FROM clipboard_items WHERE item_type = 'binary'",
                 [],
                 |row| row.get(0),
             )
-            .expect("查询保留图片失败");
-        assert_eq!(image_count, 1);
+            .expect("查询保留非文本记录失败");
+        assert_eq!(non_text_count, 1);
     }
 
     /// 哈希长度不正确时必须拒绝 payload，不能截断或补零制造身份。

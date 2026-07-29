@@ -1394,7 +1394,7 @@ mod tests {
         }
     }
 
-    /// 验证打开执行器只有在 v1 迁移提交后才返回，并且重复打开保持幂等。
+    /// 验证打开执行器只有在 v2 迁移提交后才返回，并且重复打开保持幂等。
     #[test]
     fn executor_migrates_and_reopens_idempotently() {
         let directory = temporary_directory();
@@ -1402,7 +1402,7 @@ mod tests {
             let executor = StorageExecutor::open_at(&directory).expect("首次启动存储线程失败");
             let executor = executor;
             let status = executor.status().expect("读取首次存储状态失败");
-            assert_eq!(status.schema_version, 1);
+            assert_eq!(status.schema_version, 2);
             assert_eq!(status.probe_result, 1);
             assert_eq!(status.clipboard_item_count, 0);
         }
@@ -1413,7 +1413,7 @@ mod tests {
                     .status()
                     .expect("读取重复存储状态失败")
                     .schema_version,
-                1
+                2
             );
         }
         remove_directory(&directory);
@@ -1772,7 +1772,7 @@ mod tests {
                 .execute(
                     "INSERT INTO clipboard_items
                      (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
-                     VALUES ('image', '图片预览', ?1, 0, 300, 300)",
+                     VALUES ('binary', '非文本预览', ?1, 0, 300, 300)",
                     params![test_hash(54).as_slice()],
                 )
                 .expect("写入非文本记录失败");
@@ -1801,7 +1801,7 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .expect("读取剩余类型失败")
         };
-        assert_eq!(remaining, vec!["text".to_owned(), "image".to_owned()]);
+        assert_eq!(remaining, vec!["text".to_owned(), "binary".to_owned()]);
         drop(connection);
         remove_directory(&directory);
     }
@@ -1919,7 +1919,7 @@ mod tests {
                 .execute(
                     "INSERT INTO clipboard_items
                      (item_type, preview_text, content_hash, is_pinned, created_at, copied_at)
-                     VALUES ('image', '收藏图片', ?1, 1, 300, 300)",
+                     VALUES ('binary', '收藏非文本', ?1, 1, 300, 300)",
                     params![test_hash(59).as_slice()],
                 )
                 .expect("写入收藏图片测试行失败");
@@ -2232,7 +2232,7 @@ mod tests {
                 .execute(
                     "INSERT INTO clipboard_items \
                      (item_type, preview_text, content_hash, created_at, copied_at) \
-                     VALUES ('image', '图片预览', ?1, 1, 1)",
+                     VALUES ('binary', '非文本预览', ?1, 1, 1)",
                     params![test_hash(73).as_slice()],
                 )
                 .expect("写入非文本测试记录失败");
@@ -2674,7 +2674,7 @@ mod tests {
                 .expect("设置文本收藏状态失败");
             connection
                 .execute(
-                    "INSERT INTO clipboard_items (item_type, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', '截图', ?1, 1, 1, 250, 250)",
+                    "INSERT INTO clipboard_items (item_type, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('binary', '二进制', ?1, 1, 1, 250, 250)",
                     params![vec![0x54_u8; 32]],
                 )
                 .expect("写入图片筛选记录失败");
@@ -2705,15 +2705,15 @@ mod tests {
             vec![2]
         );
 
-        let image = executor
+        let binary = executor
             .query_history_summaries(HistoryQuery {
-                item_type: Some("image".to_owned()),
+                item_type: Some("binary".to_owned()),
                 limit: 10,
                 ..HistoryQuery::default()
             })
             .expect("类型查询失败");
         assert_eq!(
-            image.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            binary.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![4]
         );
 
@@ -2905,7 +2905,7 @@ mod tests {
             crate::storage::migration::migrate(&mut connection).expect("非文本数据库迁移失败");
             connection
                 .execute(
-                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('image', NULL, 'image preview', ?1, 1, 1, 10, 20)",
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('binary', NULL, 'binary preview', ?1, 1, 1, 10, 20)",
                     params![vec![1_u8; 32]],
                 )
                 .expect("写入非文本测试记录失败");
@@ -2916,14 +2916,14 @@ mod tests {
             .list_history_summaries(None, 10)
             .expect("读取非文本摘要失败");
         assert_eq!(summaries.items.len(), 1);
-        assert_eq!(summaries.items[0].item_type, "image");
+        assert_eq!(summaries.items[0].item_type, "binary");
         assert!(summaries.items[0].is_pinned);
 
         let payload = executor
             .get_history_payload(1)
             .expect("读取非文本 payload 失败")
             .expect("非文本记录不存在");
-        assert_eq!(payload.item_type, "image");
+        assert_eq!(payload.item_type, "binary");
         assert_eq!(payload.text_content, None);
         assert_eq!(payload.content_hash, vec![1; 32]);
         assert_eq!(payload.source_exe, None);
@@ -2973,14 +2973,14 @@ mod tests {
         {
             let connection = Connection::open(&database_path).expect("创建未来版本数据库失败");
             connection
-                .pragma_update(None, "user_version", 2)
+                .pragma_update(None, "user_version", 3)
                 .expect("写入未来版本失败");
         }
 
         let result = StorageExecutor::open_at(&directory);
         assert!(matches!(
             result,
-            Err(crate::storage::StorageError::UnsupportedSchemaVersion(2))
+            Err(crate::storage::StorageError::UnsupportedSchemaVersion(3))
         ));
         remove_directory(&directory);
     }

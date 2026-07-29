@@ -1,6 +1,6 @@
 //! 此模块定义本地 SQLite 存储层的错误边界和单线程执行器公共接缝。
 //!
-//! 当前模块负责连接创建、v1 迁移、线程归属探针、文本事务写入、单条删除、
+//! 当前模块负责连接创建、v2 迁移、线程归属探针、文本事务写入、单条删除、
 //! 分范围清空、筛选摘要查询和复合游标；清空 UI 接线由其他模块实现。
 
 use std::{ffi::OsString, fmt, io, path::PathBuf};
@@ -26,7 +26,7 @@ pub enum StorageError {
     MissingLocalAppData,
     /// 数据库声明了当前程序尚未支持的 schema 版本。
     UnsupportedSchemaVersion(i64),
-    /// 已有表、字段或索引与固定 v1 契约不兼容。
+    /// 已有表、字段、索引、外键或数据与当前 schema 契约不兼容。
     IncompatibleSchema(String),
     /// 存储线程在初始化阶段提前退出，调用方无法取得就绪结果。
     InitializationChannelClosed,
@@ -86,7 +86,7 @@ impl fmt::Display for StorageError {
                 write!(formatter, "不支持的 SQLite schema 版本：{version}")
             }
             Self::IncompatibleSchema(detail) => {
-                write!(formatter, "SQLite v1 schema 不兼容：{detail}")
+                write!(formatter, "SQLite schema 不兼容：{detail}")
             }
             Self::InitializationChannelClosed => write!(formatter, "存储线程未返回初始化结果"),
             Self::ChannelClosed => write!(formatter, "存储线程命令通道已关闭"),

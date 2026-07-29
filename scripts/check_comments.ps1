@@ -20,6 +20,7 @@ $requiredFiles = @(
     'src/domain/mod.rs',
     'src/domain/clipboard_item.rs',
     'src/domain/hash.rs',
+    'src/domain/image_metadata.rs',
     'src/history.rs',
     'src/storage/mod.rs',
     'src/storage/migration.rs',

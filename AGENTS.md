@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划，等待用户验证清空全部 |
+| ATOMIC-IMAGE-PERSISTENCE-001 | 原子开发 | [图片持久化契约原子计划](docs/planning/图片持久化契约原子计划.md) |
 
 <!-- codex-plan-index:end -->

@@ -50,7 +50,7 @@ fn 清空未收藏需要二次确认且处理中禁用入口() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    click(&window, 482.0, 128.0);
+    click(&window, 380.0, 128.0);
     assert_eq!(requests.get(), 1);
     assert_eq!(cancellations.get(), 0);
     assert_eq!(confirmations.get(), 0);
@@ -63,6 +63,10 @@ fn 清空未收藏需要二次确认且处理中禁用入口() {
 
     window.set_clear_unpinned_confirmation_visible(false);
     window.set_clear_unpinned_pending(true);
-    click(&window, 482.0, 128.0);
+    window.set_history_mutation_pending(true);
+    click(&window, 380.0, 128.0);
     assert_eq!(requests.get(), 1);
+    window.set_clear_unpinned_confirmation_visible(true);
+    click(&window, 490.0, 176.0);
+    assert_eq!(confirmations.get(), 1);
 }

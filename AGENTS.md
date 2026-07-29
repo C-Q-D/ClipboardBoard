@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| `ATOMIC-WCB-CLEAR-ALL-001` | 原子开发 | [清空全部原子计划](docs/planning/清空全部原子计划.md) |
+| — | — | 当前无活动计划，等待用户验证清空全部 |
 
 <!-- codex-plan-index:end -->

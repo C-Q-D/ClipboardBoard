@@ -49,6 +49,14 @@ export component AppWindow inherits Window {
     callback clear-unpinned-cancelled();
     // 二次确认后才允许 Rust 提交清空未收藏事务。
     callback clear-unpinned-confirmed();
+    // 带文字的危险入口只打开清空全部强确认区。
+    callback clear-all-requested();
+    // 强确认输入变化交给 Rust reducer 保存并再次校验。
+    callback clear-all-confirmation-text-changed(text: string);
+    // 取消强确认不得提交后台事务。
+    callback clear-all-cancelled();
+    // 点击确认时连同当前输入文字发送，Rust 不信任 enabled 并会再次精确校验。
+    callback clear-all-confirmed(text: string);
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -80,6 +88,13 @@ export component AppWindow inherits Window {
     in property <bool> clear-unpinned-confirmation-visible: false;
     in property <bool> clear-unpinned-pending: false;
     in property <bool> clear-unpinned-error-visible: false;
+    // 清空全部拥有独立确认文字和错误状态；pending 与另一清空范围共享。
+    in property <bool> clear-all-confirmation-visible: false;
+    in-out property <string> clear-all-confirmation-text: "";
+    in property <bool> clear-all-pending: false;
+    in property <bool> clear-all-error-visible: false;
+    // 收藏、删除和两种清空共享的视觉互斥；Rust reducer 仍负责最终权限校验。
+    in property <bool> history-mutation-pending: false;
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -145,8 +160,9 @@ export component AppWindow inherits Window {
                 // 避免不可见的零高度控件因外层 spacing 令历史卡片整体下移。
                 VerticalLayout {
                     height: 30px
-                        + (clear-unpinned-confirmation-visible ? 56px : 0px)
-                        + (clear-unpinned-error-visible ? 30px : 0px);
+                        + (clear-all-confirmation-visible ? 110px
+                            : clear-unpinned-confirmation-visible ? 56px : 0px)
+                        + ((clear-unpinned-error-visible || clear-all-error-visible) ? 30px : 0px);
                     spacing: 12px;
 
                     HorizontalLayout {
@@ -209,9 +225,9 @@ export component AppWindow inherits Window {
                             border-color: #3a3a3a;
                             background: #141414;
                             clear-touch := TouchArea {
-                                enabled: !clear-unpinned-pending;
+                                enabled: !history-mutation-pending;
                                 clicked => {
-                                    if (!clear-unpinned-pending) {
+                                    if (!history-mutation-pending) {
                                         clear-unpinned-requested();
                                     }
                                 }
@@ -224,18 +240,43 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
+
+                        Rectangle {
+                            width: 92px;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #7a3434;
+                            background: #1b1111;
+                            TouchArea {
+                                enabled: !history-mutation-pending;
+                                clicked => {
+                                    if (!history-mutation-pending) {
+                                        clear-all-requested();
+                                    }
+                                }
+                            }
+                            Text {
+                                text: clear-all-pending ? "清空中…" : "清空全部";
+                                color: clear-all-pending ? #666666 : #ff9a9a;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
 
-                    // 二次确认使用面板内联区域，避免系统弹窗打断置顶和键盘上下文。
+                    // 两种确认共享一个布局槽，避免隐藏控件改变默认卡片位置。
                     Rectangle {
-                        visible: clear-unpinned-confirmation-visible;
-                        height: clear-unpinned-confirmation-visible ? 44px : 0px;
+                        visible: clear-unpinned-confirmation-visible || clear-all-confirmation-visible;
+                        height: clear-all-confirmation-visible ? 98px
+                            : clear-unpinned-confirmation-visible ? 44px : 0px;
                         border-radius: 6px;
                         border-width: 1px;
-                        border-color: #3a3a3a;
-                        background: #141414;
+                        border-color: clear-all-confirmation-visible ? #7a3434 : #3a3a3a;
+                        background: clear-all-confirmation-visible ? #1b1111 : #141414;
 
                         HorizontalLayout {
+                            visible: clear-unpinned-confirmation-visible;
                             padding-left: 12px;
                             padding-right: 8px;
                             spacing: 8px;
@@ -271,7 +312,12 @@ export component AppWindow inherits Window {
                                 border-radius: 5px;
                                 background: #f2f2f2;
                                 TouchArea {
-                                    clicked => { clear-unpinned-confirmed(); }
+                                    enabled: !history-mutation-pending;
+                                    clicked => {
+                                        if (!history-mutation-pending) {
+                                            clear-unpinned-confirmed();
+                                        }
+                                    }
                                 }
                                 Text {
                                     text: "确认清空";
@@ -282,12 +328,79 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+
+                        VerticalLayout {
+                            visible: clear-all-confirmation-visible;
+                            padding: 10px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "将删除全部记录，包括已收藏记录";
+                                color: #ffb0b0;
+                                font-size: 12px;
+                            }
+
+                            HorizontalLayout {
+                                height: 38px;
+                                spacing: 8px;
+
+                                clear-all-input := LineEdit {
+                                    horizontal-stretch: 1;
+                                    placeholder-text: "输入“清空全部”";
+                                    text: clear-all-confirmation-text;
+                                    edited(text) => {
+                                        clear-all-confirmation-text-changed(text);
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 58px;
+                                    border-radius: 5px;
+                                    background: #2a1c1c;
+                                    TouchArea {
+                                        clicked => { clear-all-cancelled(); }
+                                    }
+                                    Text {
+                                        text: "取消";
+                                        color: #d0aaaa;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 76px;
+                                    border-radius: 5px;
+                                    background: clear-all-confirmation-text == "清空全部"
+                                        ? #f05d5d : #4b2b2b;
+                                    TouchArea {
+                                        enabled: !history-mutation-pending
+                                            && clear-all-confirmation-text == "清空全部";
+                                        clicked => {
+                                            if (!history-mutation-pending
+                                                && clear-all-confirmation-text == "清空全部") {
+                                                clear-all-confirmed(clear-all-confirmation-text);
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: "确认清空";
+                                        color: clear-all-confirmation-text == "清空全部"
+                                            ? #160808 : #8c6666;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     Text {
-                        visible: clear-unpinned-error-visible;
-                        height: clear-unpinned-error-visible ? 18px : 0px;
-                        text: "清空失败，请重试";
+                        visible: clear-unpinned-error-visible || clear-all-error-visible;
+                        height: (clear-unpinned-error-visible || clear-all-error-visible) ? 18px : 0px;
+                        text: clear-all-error-visible ? "清空全部失败，请重试" : "清空失败，请重试";
                         color: #ff8e8e;
                         font-size: 12px;
                     }
@@ -402,8 +515,9 @@ export component AppWindow inherits Window {
                                 }
 
                                 delete-touch := TouchArea {
+                                    enabled: !history-mutation-pending && !card.delete_pending;
                                     clicked => {
-                                        if (!card.delete_pending) {
+                                        if (!history-mutation-pending && !card.delete_pending) {
                                             delete-item-requested(index);
                                         }
                                     }
@@ -431,8 +545,9 @@ export component AppWindow inherits Window {
                                 }
 
                                 pin-touch := TouchArea {
+                                    enabled: !history-mutation-pending && !card.pin_pending;
                                     clicked => {
-                                        if (!card.pin_pending) {
+                                        if (!history-mutation-pending && !card.pin_pending) {
                                             pin-item-requested(index);
                                         }
                                     }

@@ -262,6 +262,19 @@ pub enum UiEvent {
         /// 确认发生时的面板打开代次。
         panel_generation: u64,
     },
+    /// 用户点击带文字的清空全部危险入口；该事件只打开强确认区。
+    ClearAllRequested,
+    /// 强确认输入变化；只保存固定短语输入，不访问存储。
+    ClearAllConfirmationTextChanged(String),
+    /// 用户取消清空全部强确认；不得产生后台请求。
+    ClearAllCancelled,
+    /// 用户尝试确认清空全部；reducer 必须再次精确校验输入文字。
+    ClearAllConfirmed {
+        /// 确认发生时的面板打开代次。
+        panel_generation: u64,
+        /// 确认点击时输入框的完整值；不得自动 trim 或宽松匹配。
+        confirmation_text: String,
+    },
 }
 
 #[cfg(all(test, windows))]

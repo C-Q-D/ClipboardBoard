@@ -9,8 +9,9 @@ use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::history_mutation::{
-    DeleteMutationFailure, DeleteMutationRequest, DeleteMutationResult, DeleteMutationSender,
-    PinMutationRequest, PinMutationResult, PinMutationSender,
+    ClearUnpinnedMutationSender, DeleteMutationFailure, DeleteMutationRequest,
+    DeleteMutationResult, DeleteMutationSender, PinMutationRequest, PinMutationResult,
+    PinMutationSender,
 };
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
@@ -305,6 +306,10 @@ impl UiState {
             }
             UiEvent::DeleteMutationCompleted(result) => {
                 self.apply_delete_mutation_result(result);
+                UiAction::None
+            }
+            UiEvent::ClearUnpinnedMutationCompleted(_result) => {
+                // CLR-02 只验证结果可达 UI；CLR-03 将建立 pending 身份并消费快照变化。
                 UiAction::None
             }
             UiEvent::HistoryViewportChanged {
@@ -957,6 +962,8 @@ thread_local! {
     static UI_PIN_MUTATIONS: RefCell<Option<PinMutationSender>> = const { RefCell::new(None) };
     /// UI 线程只持有删除请求发送端；DEL-03 会通过该单槽执行非阻塞提交。
     static UI_DELETE_MUTATIONS: RefCell<Option<DeleteMutationSender>> = const { RefCell::new(None) };
+    /// UI 线程只持有清空请求发送端；SQLite 和 worker 生命周期仍由主线程拥有。
+    static UI_CLEAR_UNPINNED_MUTATIONS: RefCell<Option<ClearUnpinnedMutationSender>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -1119,6 +1126,13 @@ pub fn bind_delete_mutation_sender(sender: DeleteMutationSender) {
     });
 }
 
+/// 在 UI 线程绑定清空未收藏文本的非阻塞单槽发送端。
+pub fn bind_clear_unpinned_mutation_sender(sender: ClearUnpinnedMutationSender) {
+    UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+        *slot.borrow_mut() = Some(sender);
+    });
+}
+
 /// 关闭查询双向桥；Quit 调用后 worker 不再接受排队请求，迟到结果也不再唤醒 UI。
 fn close_history_query_bridge() {
     UI_HISTORY_REQUESTS.with(|slot| {
@@ -1151,6 +1165,15 @@ fn close_delete_mutation_bridge() {
     });
 }
 
+/// 关闭清空请求入口；已经进入单槽的请求由 worker 排空后退出。
+fn close_clear_unpinned_mutation_bridge() {
+    UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            sender.close();
+        }
+    });
+}
+
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
 ///
 /// 该函数只接受拥有型 `UiEvent`，不会同步执行 reducer。返回 `Ok(())` 只代表事件
@@ -1168,14 +1191,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         };
         // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
-        let may_refresh_model = !matches!(
-            &event,
-            UiEvent::MoveSelection { .. }
-                | UiEvent::SelectItem { .. }
-                | UiEvent::CopyItem { .. }
-                | UiEvent::HistoryViewportChanged { .. }
-                | UiEvent::RetryHistoryPage
-        );
+        let may_refresh_model = event_may_refresh_model(&event);
         let (
             action,
             mut snapshot,
@@ -1266,6 +1282,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             close_history_query_bridge();
             close_pin_mutation_bridge();
             close_delete_mutation_bridge();
+            close_clear_unpinned_mutation_bridge();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");
@@ -1364,6 +1381,19 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             }
         });
     })
+}
+
+/// 判断事件是否可能改变卡片模型；纯完成通知在 CLR-03 消费前必须保持无视觉副作用。
+fn event_may_refresh_model(event: &UiEvent) -> bool {
+    !matches!(
+        event,
+        UiEvent::MoveSelection { .. }
+            | UiEvent::SelectItem { .. }
+            | UiEvent::CopyItem { .. }
+            | UiEvent::HistoryViewportChanged { .. }
+            | UiEvent::RetryHistoryPage
+            | UiEvent::ClearUnpinnedMutationCompleted(_)
+    )
 }
 
 #[cfg(windows)]
@@ -1675,12 +1705,15 @@ mod tests {
     #[cfg(windows)]
     use super::{activation_attempt, ActivationAttempt};
     use super::{
-        perform_show_action, selection_viewport_y, visible_snapshot_items, UiAction, UiState,
-        UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
+        bind_clear_unpinned_mutation_sender, close_clear_unpinned_mutation_bridge,
+        event_may_refresh_model, perform_show_action, selection_viewport_y, visible_snapshot_items,
+        UiAction, UiState, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
     use crate::history_mutation::{
-        DeleteMutationFailure, DeleteMutationResult, PinMutationFailure, PinMutationResult,
+        clear_unpinned_mutation_channel, ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult,
+        ClearUnpinnedMutationSubmitError, ClearUnpinnedMutationSuccess, DeleteMutationFailure,
+        DeleteMutationResult, PinMutationFailure, PinMutationResult,
     };
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
     use std::time::{Duration, Instant};
@@ -1725,6 +1758,45 @@ mod tests {
             requested_cursor: request.query.cursor,
             outcome,
         }
+    }
+
+    /// CLR-02 的清空完成通知在 CLR-03 消费前不得重建模型或改变 reducer 状态。
+    #[test]
+    fn 清空完成通知暂时保持界面无副作用() {
+        let event = UiEvent::ClearUnpinnedMutationCompleted(ClearUnpinnedMutationResult {
+            mutation_token: 1,
+            panel_generation: 2,
+            outcome: Ok(ClearUnpinnedMutationSuccess {
+                deleted_count: 3,
+                clear_revision: 4,
+            }),
+        });
+        assert!(!event_may_refresh_model(&event));
+
+        let mut state = UiState::default();
+        state.snapshot = UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        };
+        let before = state.snapshot.clone();
+        assert_eq!(state.apply(event), UiAction::None);
+        assert_eq!(state.snapshot, before);
+    }
+
+    /// Quit 使用的关闭辅助函数必须关闭已绑定 clear sender，并立即拒绝后续请求。
+    #[test]
+    fn 退出关闭已绑定的清空请求入口() {
+        let (sender, _receiver) = clear_unpinned_mutation_channel();
+        bind_clear_unpinned_mutation_sender(sender.clone());
+        close_clear_unpinned_mutation_bridge();
+
+        assert_eq!(
+            sender.try_submit(ClearUnpinnedMutationRequest {
+                mutation_token: 1,
+                panel_generation: 1,
+            }),
+            Err(ClearUnpinnedMutationSubmitError::Closed)
+        );
     }
 
     /// 首次打开立即请求 30 条 SQLite 首页，可见状态下重复激活不得重查。

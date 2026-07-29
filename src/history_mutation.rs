@@ -1,6 +1,6 @@
-//! 此模块提供收藏和单条删除的有界异步命令桥。
+//! 此模块提供收藏、单条删除和清空未收藏文本的有界异步命令桥。
 //!
-//! UI 线程只执行非阻塞提交；两个独立后台 worker 均通过唯一存储 worker 串行访问 SQLite。
+//! UI 线程只执行非阻塞提交；三个独立后台 worker 均通过唯一存储 worker 串行访问 SQLite。
 //! 关闭会拒绝新请求，但保留并排空已经接受的请求，确保退出不会丢失已承诺的事务。
 
 use std::{
@@ -408,9 +408,192 @@ fn map_delete_storage_failure(error: StorageError) -> DeleteMutationFailure {
     }
 }
 
+/// 清空请求的固定队列容量；UI 在 CLR-03 与收藏、删除共享全局 mutation 互斥。
+const CLEAR_UNPINNED_QUEUE_CAPACITY: usize = 1;
+
+/// 一次清空未收藏文本请求的稳定 UI 身份；请求不携带任何记录正文或哈希。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClearUnpinnedMutationRequest {
+    /// UI 分配的单调 mutation 令牌，用于隔离迟到结果。
+    pub mutation_token: u64,
+    /// 确认发生时的面板代次；结果与 pending 匹配但不要求面板仍可见。
+    pub panel_generation: u64,
+}
+
+/// 清空事务成功后的有限信息；修订号用于上层区分清空前后捕获。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClearUnpinnedMutationSuccess {
+    /// 本次事务实际删除的未收藏文本数量。
+    pub deleted_count: u64,
+    /// 唯一存储线程分配的清空线性化修订号。
+    pub clear_revision: u64,
+}
+
+/// 清空 worker 对外暴露的有限失败；底层 SQL 和系统错误不得进入 UI。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClearUnpinnedMutationFailure {
+    /// 存储正在关闭、不可用、修订号耗尽或返回其他有限外部失败。
+    StorageUnavailable,
+}
+
+/// 清空事务完成结果；完整回显请求身份并无损携带成功修订号。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearUnpinnedMutationResult {
+    /// UI 分配的单调 mutation 令牌。
+    pub mutation_token: u64,
+    /// 确认发生时的面板代次。
+    pub panel_generation: u64,
+    /// 事务成功的有限信息或固定失败类别。
+    pub outcome: Result<ClearUnpinnedMutationSuccess, ClearUnpinnedMutationFailure>,
+}
+
+/// UI 非阻塞提交清空请求时的有限拒绝原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClearUnpinnedMutationSubmitError {
+    /// 单槽已经包含一个等待处理的请求。
+    Full,
+    /// 请求入口已经关闭，不再接受新的清空。
+    Closed,
+}
+
+/// 清空队列的互斥状态；关闭不清除已经接受的唯一请求。
+struct ClearUnpinnedQueueState {
+    /// 唯一等待 worker 处理的请求。
+    pending: Option<ClearUnpinnedMutationRequest>,
+    /// 关闭线性化标志；置位后所有新请求稳定失败。
+    closed: bool,
+}
+
+/// 清空发送端和接收端共享的单槽核心。
+struct ClearUnpinnedQueueShared {
+    /// 同时保护请求与关闭标志，确保关闭和提交有明确先后。
+    state: Mutex<ClearUnpinnedQueueState>,
+    /// 请求提交或关闭时唤醒 worker。
+    ready: Condvar,
+}
+
+/// 可克隆的清空请求入口；克隆不拥有 worker 或 SQLite 生命周期。
+#[derive(Clone)]
+pub struct ClearUnpinnedMutationSender {
+    /// 共享单槽状态。
+    shared: Arc<ClearUnpinnedQueueShared>,
+}
+
+/// 清空 worker 独占的接收端；只有它可以取出已接受请求。
+pub struct ClearUnpinnedMutationReceiver {
+    /// 与发送端共享的单槽状态。
+    shared: Arc<ClearUnpinnedQueueShared>,
+}
+
+/// 创建容量固定为一的清空未收藏请求通道。
+pub fn clear_unpinned_mutation_channel(
+) -> (ClearUnpinnedMutationSender, ClearUnpinnedMutationReceiver) {
+    debug_assert_eq!(CLEAR_UNPINNED_QUEUE_CAPACITY, 1);
+    let shared = Arc::new(ClearUnpinnedQueueShared {
+        state: Mutex::new(ClearUnpinnedQueueState {
+            pending: None,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+    });
+    (
+        ClearUnpinnedMutationSender {
+            shared: Arc::clone(&shared),
+        },
+        ClearUnpinnedMutationReceiver { shared },
+    )
+}
+
+impl ClearUnpinnedMutationSender {
+    /// 非阻塞提交一个清空请求；满队列或关闭时立即返回有限错误。
+    pub fn try_submit(
+        &self,
+        request: ClearUnpinnedMutationRequest,
+    ) -> Result<(), ClearUnpinnedMutationSubmitError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| ClearUnpinnedMutationSubmitError::Closed)?;
+        if state.closed {
+            return Err(ClearUnpinnedMutationSubmitError::Closed);
+        }
+        if state.pending.is_some() {
+            return Err(ClearUnpinnedMutationSubmitError::Full);
+        }
+        state.pending = Some(request);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    /// 关闭请求入口并唤醒 worker；已经接受的单槽请求仍会被处理。
+    pub fn close(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.closed = true;
+            self.shared.ready.notify_all();
+        }
+    }
+}
+
+impl ClearUnpinnedMutationReceiver {
+    /// 阻塞等待下一请求；关闭且队列排空后返回 `None`。
+    fn receive(&self) -> Option<ClearUnpinnedMutationRequest> {
+        let mut state = self.shared.state.lock().ok()?;
+        loop {
+            if let Some(request) = state.pending.take() {
+                return Some(request);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.shared.ready.wait(state).ok()?;
+        }
+    }
+}
+
+/// 启动单一清空 worker；已接受事务不因 UI 结果接收端退出而撤销。
+pub fn start_clear_unpinned_mutation_worker<E>(
+    storage: StorageClient,
+    receiver: ClearUnpinnedMutationReceiver,
+    mut emit: E,
+) -> io::Result<JoinHandle<()>>
+where
+    E: FnMut(ClearUnpinnedMutationResult) -> bool + Send + 'static,
+{
+    thread::Builder::new()
+        .name("clipboard-board-clear-unpinned".to_owned())
+        .spawn(move || {
+            while let Some(request) = receiver.receive() {
+                let result = execute_clear_unpinned_mutation(&storage, request);
+                // UI 已退出时只丢弃有限结果；数据库事务已经完成，不能反向回滚。
+                let _ = emit(result);
+            }
+        })
+}
+
+/// 执行一次清空事务，并将任意存储错误压缩为固定失败类别。
+fn execute_clear_unpinned_mutation(
+    storage: &StorageClient,
+    request: ClearUnpinnedMutationRequest,
+) -> ClearUnpinnedMutationResult {
+    let outcome = storage
+        .clear_unpinned_text()
+        .map(|result| ClearUnpinnedMutationSuccess {
+            deleted_count: result.deleted_count,
+            clear_revision: result.mutation_revision,
+        })
+        .map_err(|_| ClearUnpinnedMutationFailure::StorageUnavailable);
+
+    ClearUnpinnedMutationResult {
+        mutation_token: request.mutation_token,
+        panel_generation: request.panel_generation,
+        outcome,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! 此测试模块验证收藏与删除桥的单槽边界、关闭排空和有限结果映射。
+    //! 此测试模块验证收藏、删除与清空桥的单槽边界、关闭排空和有限结果映射。
 
     use std::{
         fs,
@@ -424,8 +607,10 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        delete_mutation_channel, pin_mutation_channel, start_delete_mutation_worker,
-        start_pin_mutation_worker, DeleteMutationFailure, DeleteMutationRequest,
+        clear_unpinned_mutation_channel, delete_mutation_channel, pin_mutation_channel,
+        start_clear_unpinned_mutation_worker, start_delete_mutation_worker,
+        start_pin_mutation_worker, ClearUnpinnedMutationFailure, ClearUnpinnedMutationRequest,
+        ClearUnpinnedMutationSubmitError, DeleteMutationFailure, DeleteMutationRequest,
         DeleteMutationSubmitError, PinMutationFailure, PinMutationRequest, PinMutationSubmitError,
     };
     use crate::storage::{StorageExecutor, TextUpsertInput};
@@ -461,6 +646,14 @@ mod tests {
             panel_generation: 5,
             id,
             content_hash: hash,
+        }
+    }
+
+    /// 构造不含任何记录内容的清空请求。
+    fn clear_request(token: u64) -> ClearUnpinnedMutationRequest {
+        ClearUnpinnedMutationRequest {
+            mutation_token: token,
+            panel_generation: 7,
         }
     }
 
@@ -739,5 +932,130 @@ mod tests {
             .is_none());
         drop(reopened);
         fs::remove_dir_all(directory).expect("清理投递失败测试目录失败");
+    }
+
+    /// 清空单槽满时立即拒绝第二个请求，关闭后稳定拒绝新请求。
+    #[test]
+    fn clear_unpinned_channel_rejects_full_and_closed_without_blocking() {
+        let (sender, _receiver) = clear_unpinned_mutation_channel();
+        sender
+            .try_submit(clear_request(1))
+            .expect("首个清空请求应进入单槽");
+        assert_eq!(
+            sender.try_submit(clear_request(2)),
+            Err(ClearUnpinnedMutationSubmitError::Full)
+        );
+        sender.close();
+        assert_eq!(
+            sender.try_submit(clear_request(3)),
+            Err(ClearUnpinnedMutationSubmitError::Closed)
+        );
+    }
+
+    /// 关闭桥后已接受清空仍须提交，并无损返回删除数量和存储修订号。
+    #[test]
+    fn clear_unpinned_close_drains_request_and_preserves_revision() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动清空桥存储线程失败");
+        let inserted = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: [31; 32],
+                text_content: "清空桥正文".to_owned(),
+                preview_text: "清空桥预览".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 1,
+            })
+            .expect("写入清空桥测试记录失败");
+        let (sender, receiver) = clear_unpinned_mutation_channel();
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker =
+            start_clear_unpinned_mutation_worker(executor.client(), receiver, move |result| {
+                result_sender.send(result).is_ok()
+            })
+            .expect("启动清空 worker 失败");
+
+        sender
+            .try_submit(clear_request(11))
+            .expect("提交清空请求失败");
+        sender.close();
+        worker.join().expect("清空 worker 异常退出");
+
+        let result = result_receiver.recv().expect("未收到清空结果");
+        assert_eq!(result.mutation_token, 11);
+        assert_eq!(result.panel_generation, 7);
+        let success = result.outcome.expect("清空事务不应失败");
+        assert_eq!(success.deleted_count, 1);
+        assert_eq!(success.clear_revision, inserted.mutation_revision + 1);
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("读取清空结果失败")
+            .is_none());
+
+        drop(executor);
+        fs::remove_dir_all(directory).expect("清理清空桥测试目录失败");
+    }
+
+    /// 存储不可用时只返回固定失败类别，并完整回显请求身份。
+    #[test]
+    fn clear_unpinned_maps_storage_error_to_finite_failure() {
+        let directory = temporary_directory();
+        let mut executor = StorageExecutor::open_at(&directory).expect("启动失败映射存储线程失败");
+        let client = executor.client();
+        executor.begin_closing().expect("建立存储关闭态失败");
+        let (sender, receiver) = clear_unpinned_mutation_channel();
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker = start_clear_unpinned_mutation_worker(client, receiver, move |result| {
+            result_sender.send(result).is_ok()
+        })
+        .expect("启动失败映射清空 worker 失败");
+
+        let request = clear_request(21);
+        sender.try_submit(request).expect("提交失败映射请求失败");
+        sender.close();
+        worker.join().expect("失败映射清空 worker 异常退出");
+        let result = result_receiver.recv().expect("未收到失败映射结果");
+        assert_eq!(result.mutation_token, request.mutation_token);
+        assert_eq!(result.panel_generation, request.panel_generation);
+        assert_eq!(
+            result.outcome,
+            Err(ClearUnpinnedMutationFailure::StorageUnavailable)
+        );
+
+        executor.finish_shutdown().expect("完成存储关闭失败");
+        fs::remove_dir_all(directory).expect("清理失败映射目录失败");
+    }
+
+    /// UI 结果接收端消失不能阻塞清空事务或 worker 退出。
+    #[test]
+    fn clear_unpinned_emit_false_does_not_undo_transaction() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动投递失败存储线程失败");
+        let inserted = executor
+            .upsert_text(TextUpsertInput {
+                content_hash: [32; 32],
+                text_content: "清空投递失败正文".to_owned(),
+                preview_text: "清空投递失败预览".to_owned(),
+                source_exe: None,
+                source_app: None,
+                copied_at: 1,
+            })
+            .expect("写入清空投递失败记录失败");
+        let (sender, receiver) = clear_unpinned_mutation_channel();
+        let worker =
+            start_clear_unpinned_mutation_worker(executor.client(), receiver, |_result| false)
+                .expect("启动投递失败清空 worker 失败");
+        sender
+            .try_submit(clear_request(31))
+            .expect("提交投递失败清空请求失败");
+        sender.close();
+        worker.join().expect("投递失败清空 worker 异常退出");
+        assert!(executor
+            .get_history_payload(inserted.id)
+            .expect("读取投递失败后的记录失败")
+            .is_none());
+
+        drop(executor);
+        fs::remove_dir_all(directory).expect("清理投递失败清空目录失败");
     }
 }

@@ -84,7 +84,11 @@ impl From<StorageError> for StartupRestoreError {
 pub fn load_startup_snapshot(
     storage: &mut StorageExecutor,
 ) -> Result<UiSnapshot, StartupRestoreError> {
-    let page = storage.list_history_summaries(None, STARTUP_HISTORY_LIMIT)?;
+    let page = storage.query_history_summaries(crate::storage::HistoryQuery {
+        item_type: Some("text".to_owned()),
+        limit: STARTUP_HISTORY_LIMIT,
+        ..crate::storage::HistoryQuery::default()
+    })?;
     let now = unix_millis_now();
     let mut items = Vec::with_capacity(page.items.len());
 
@@ -263,11 +267,12 @@ mod tests {
         assert_eq!(snapshot.items[0].preview, "文本-119");
     }
 
-    /// 未支持的图片类型不能被伪造成文本卡片，恢复必须整体失败。
+    /// 混合数据库中的图片不能进入文本 UI，但也不能阻止文本启动恢复。
     #[test]
-    fn 不兼容类型阻止启动恢复() {
+    fn 启动恢复在查询边界忽略非文本记录() {
         let directory = test_directory("unsupported");
-        let storage = StorageExecutor::open_at(&directory).expect("启动恢复存储失败");
+        let mut storage = StorageExecutor::open_at(&directory).expect("启动恢复存储失败");
+        insert_text(&mut storage, "可恢复文本", 2);
         let connection = Connection::open(storage.database_path()).expect("打开注入连接失败");
         connection
             .execute(
@@ -277,12 +282,18 @@ mod tests {
             .expect("预置不兼容记录失败");
         drop(connection);
 
-        let mut storage = storage;
-        let result = load_startup_snapshot(&mut storage);
-        assert!(matches!(
-            result,
-            Err(StartupRestoreError::UnsupportedItemType { .. })
-        ));
+        let snapshot = load_startup_snapshot(&mut storage).expect("混合类型不应阻止文本恢复");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].preview, "可恢复文本");
+        let connection = Connection::open(storage.database_path()).expect("重新打开混合数据库失败");
+        let image_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clipboard_items WHERE item_type = 'image'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查询保留图片失败");
+        assert_eq!(image_count, 1);
     }
 
     /// 哈希长度不正确时必须拒绝 payload，不能截断或补零制造身份。

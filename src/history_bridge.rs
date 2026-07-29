@@ -256,7 +256,10 @@ where
     let result = upsert(input)?;
     let item = UiClipboardItem::from_persisted_result(&result)
         .ok_or(CaptureProcessError::InvalidPersistedRecord)?;
-    if emit(UiEvent::ClipboardCaptured(item)) {
+    if emit(UiEvent::ClipboardCaptured {
+        item,
+        mutation_revision: result.mutation_revision,
+    }) {
         Ok(CaptureProcessOutcome::Posted)
     } else {
         Ok(CaptureProcessOutcome::UiClosed)
@@ -377,9 +380,14 @@ mod tests {
 
         assert_eq!(outcome, CaptureProcessOutcome::Posted);
         assert_eq!(events.len(), 1);
-        let UiEvent::ClipboardCaptured(item) = &events[0] else {
+        let UiEvent::ClipboardCaptured {
+            item,
+            mutation_revision,
+        } = &events[0]
+        else {
             panic!("成功捕获必须投递 ClipboardCaptured");
         };
+        assert_eq!(*mutation_revision, 1);
         let payload = storage
             .get_history_payload(item.id as i64)
             .expect("成功 upsert 后应可读取记录")

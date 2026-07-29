@@ -121,6 +121,18 @@ impl MemoryHistory {
         true
     }
 
+    /// 按调用方提供的业务谓词保留摘要；用于事务成功后同步批量清理结果。
+    ///
+    /// 谓词只读取受限摘要，不能访问 SQLite 或完整正文；返回实际移除数量便于测试。
+    pub fn retain<F>(&mut self, mut keep: F) -> usize
+    where
+        F: FnMut(&UiClipboardItem) -> bool,
+    {
+        let before = self.items.len();
+        self.items.retain(|item| keep(item));
+        before.saturating_sub(self.items.len())
+    }
+
     /// 以只读切片形式暴露当前顺序，调用方不能绕过协调器修改去重状态。
     pub fn items(&self) -> &[UiClipboardItem] {
         &self.items
@@ -243,6 +255,28 @@ mod tests {
         history.record(item(8, "新摘要", "刚刚", false));
 
         assert_eq!(history.items()[0].copy_count, u64::MAX);
+    }
+
+    /// 批量保留谓词必须精确返回移除数量，并保持剩余摘要原有顺序。
+    #[test]
+    fn 批量保留按谓词移除摘要() {
+        let mut history = MemoryHistory::new(4);
+        history.replace(vec![
+            item(1, "一", "一", false),
+            item(2, "二", "二", true),
+            item(3, "三", "三", false),
+        ]);
+
+        let removed = history.retain(|entry| entry.is_pinned || entry.content_hash == [3; 32]);
+        assert_eq!(removed, 1);
+        assert_eq!(
+            history
+                .items()
+                .iter()
+                .map(|entry| entry.content_hash[0])
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     /// 持久化捕获重复项必须完整采用数据库最终快照，不能把旧卡片本地加一或保留旧身份。

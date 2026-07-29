@@ -181,8 +181,13 @@ pub enum UiEvent {
     HidePanel { generation: u64 },
     /// 用一个完整且拥有所有权的快照替换 UI 历史状态。
     ReplaceSnapshot(UiSnapshot),
-    /// 将一条已由持久化结果转换的剪贴板记录交给 UI 线程置顶显示。
-    ClipboardCaptured(UiClipboardItem),
+    /// 将持久化捕获及其存储修订号交给 UI；修订号只用于清空前后顺序隔离。
+    ClipboardCaptured {
+        /// 已由 SQLite 最终快照转换且不含正文的 UI 摘要。
+        item: UiClipboardItem,
+        /// 唯一存储线程为本次成功 upsert 分配的单调修订号。
+        mutation_revision: u64,
+    },
     /// 搜索框文本变化；完整正文只作为用户主动输入的查询词进入 UI 状态。
     SearchTextChanged(String),
     /// 搜索筛选标签变化；未知索引在 UI 回调边界转换为“全部”。
@@ -247,6 +252,15 @@ pub enum UiEvent {
         id: u64,
         /// 与 ID 共同校验的固定内容哈希。
         content_hash: [u8; 32],
+    },
+    /// 用户点击清理入口；该事件只打开确认区，不提交存储请求。
+    ClearUnpinnedRequested,
+    /// 用户取消清理确认；未提交请求时只关闭确认区。
+    ClearUnpinnedCancelled,
+    /// 用户确认清空未收藏文本；面板代次用于拒绝旧会话确认。
+    ClearUnpinnedConfirmed {
+        /// 确认发生时的面板打开代次。
+        panel_generation: u64,
     },
 }
 

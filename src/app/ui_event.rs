@@ -9,9 +9,9 @@ use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
 use crate::history_mutation::{
-    ClearUnpinnedMutationSender, DeleteMutationFailure, DeleteMutationRequest,
-    DeleteMutationResult, DeleteMutationSender, PinMutationRequest, PinMutationResult,
-    PinMutationSender,
+    ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult, ClearUnpinnedMutationSender,
+    DeleteMutationFailure, DeleteMutationRequest, DeleteMutationResult, DeleteMutationSender,
+    PinMutationRequest, PinMutationResult, PinMutationSender,
 };
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
@@ -22,6 +22,7 @@ use crate::storage::HistoryQuery;
 use crate::AppWindow;
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
 use std::time::Duration;
@@ -61,6 +62,8 @@ enum UiAction {
     QueuePin(PinMutationRequest),
     /// 请求把完整稳定身份投递到删除单槽；事务成功前卡片保持可见。
     QueueDelete(DeleteMutationRequest),
+    /// 请求把无正文清空身份投递到清空单槽；事务成功前卡片保持可见。
+    QueueClearUnpinned(ClearUnpinnedMutationRequest),
     /// 防抖协调器已经接收新查询；由 UI 线程安排一个代次绑定的计时器。
     ScheduleSearch { generation: u64 },
     /// 隐藏面板；实际调用必须仍在 UI 线程执行。
@@ -156,6 +159,18 @@ struct UiState {
     next_delete_mutation_token: u64,
     /// 固定删除失败提示的可见状态，不保存底层错误详情。
     delete_error_visible: bool,
+    /// 清空确认区是否可见；首次点击只打开该区域，不访问存储。
+    clear_unpinned_confirmation_visible: bool,
+    /// 当前唯一在途清空请求；隐藏面板不能取消已经接受的事务。
+    pending_clear_unpinned_mutation: Option<ClearUnpinnedMutationRequest>,
+    /// 下一次清空请求使用的单调令牌；耗尽时拒绝而不回绕。
+    next_clear_unpinned_mutation_token: u64,
+    /// 固定清空失败提示的可见状态，不保存底层错误详情。
+    clear_unpinned_error_visible: bool,
+    /// 已成功消费的最大清空修订号；进程生命周期内只增不减。
+    active_clear_revision: u64,
+    /// 捕获稳定身份到存储修订号的有界旁路索引；查询结果不得覆盖该顺序证据。
+    capture_revisions: HashMap<(u64, [u8; 32]), u64>,
     panel_visible: bool,
     /// 只有从隐藏进入可见的新会话才递增，用来隔离旧的 Esc 事件。
     panel_generation: u64,
@@ -187,6 +202,12 @@ impl Default for UiState {
             pending_delete_mutation: None,
             next_delete_mutation_token: 1,
             delete_error_visible: false,
+            clear_unpinned_confirmation_visible: false,
+            pending_clear_unpinned_mutation: None,
+            next_clear_unpinned_mutation_token: 1,
+            clear_unpinned_error_visible: false,
+            active_clear_revision: 0,
+            capture_revisions: HashMap::new(),
             panel_visible: false,
             panel_generation: 0,
             quitting: false,
@@ -252,6 +273,7 @@ impl UiState {
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
                     self.panel_visible = false;
+                    self.clear_unpinned_confirmation_visible = false;
                     self.search.cancel();
                     self.history_pages.invalidate();
                     self.pending_history_request = None;
@@ -275,14 +297,25 @@ impl UiState {
                 self.rebuild_visible_snapshot(selected_hash);
                 UiAction::None
             }
-            UiEvent::ClipboardCaptured(item) => {
+            UiEvent::ClipboardCaptured {
+                item,
+                mutation_revision,
+            } => {
+                if mutation_revision < self.active_clear_revision {
+                    // 捕获携带的是 upsert 提交时的收藏快照；其后可能已取消收藏并被清空。
+                    // 因此所有早于清空事务的迟到捕获都必须拒绝，不能依赖旧 is_pinned 判断。
+                    return UiAction::None;
+                }
                 let selected_hash = self
                     .snapshot
                     .selected_index
                     .and_then(|index| self.snapshot.items.get(index))
                     .map(|item| item.content_hash);
                 // 捕获事件已经由 SQLite 返回最终快照，不能再走本地“旧值加一”的兼容路径。
+                let identity = (item.id, item.content_hash);
+                self.capture_revisions.insert(identity, mutation_revision);
                 self.history.record_persisted(item);
+                self.prune_capture_revisions();
                 // 捕获先推进数据集，立即屏蔽已经完成 SQLite 但尚未到 UI 的旧首页。
                 // 当前筛选会被立即查询，因此取消尚未到期的同筛选防抖，避免重复首页。
                 self.search.cancel();
@@ -308,8 +341,8 @@ impl UiState {
                 self.apply_delete_mutation_result(result);
                 UiAction::None
             }
-            UiEvent::ClearUnpinnedMutationCompleted(_result) => {
-                // CLR-02 只验证结果可达 UI；CLR-03 将建立 pending 身份并消费快照变化。
+            UiEvent::ClearUnpinnedMutationCompleted(result) => {
+                self.apply_clear_unpinned_result(result);
                 UiAction::None
             }
             UiEvent::HistoryViewportChanged {
@@ -389,6 +422,16 @@ impl UiState {
                 id,
                 content_hash,
             } => self.begin_delete_mutation(panel_generation, id, content_hash),
+            UiEvent::ClearUnpinnedRequested => self.show_clear_unpinned_confirmation(),
+            UiEvent::ClearUnpinnedCancelled => {
+                if self.pending_clear_unpinned_mutation.is_none() {
+                    self.clear_unpinned_confirmation_visible = false;
+                }
+                UiAction::None
+            }
+            UiEvent::ClearUnpinnedConfirmed { panel_generation } => {
+                self.begin_clear_unpinned_mutation(panel_generation)
+            }
         }
     }
 
@@ -404,6 +447,7 @@ impl UiState {
             || panel_generation != self.panel_generation
             || self.pending_pin_mutation.is_some()
             || self.pending_delete_mutation.is_some()
+            || self.pending_clear_unpinned_mutation.is_some()
         {
             return UiAction::None;
         }
@@ -514,6 +558,7 @@ impl UiState {
             || panel_generation != self.panel_generation
             || self.pending_pin_mutation.is_some()
             || self.pending_delete_mutation.is_some()
+            || self.pending_clear_unpinned_mutation.is_some()
             || self.next_delete_mutation_token == u64::MAX
         {
             return UiAction::None;
@@ -564,6 +609,8 @@ impl UiState {
                     item.id != result.id || item.content_hash != result.content_hash
                 });
                 self.history.remove(result.id, result.content_hash);
+                self.capture_revisions
+                    .remove(&(result.id, result.content_hash));
                 self.snapshot.selected_index =
                     selected_identity.and_then(|(selected_id, selected_hash)| {
                         self.snapshot.items.iter().position(|item| {
@@ -604,6 +651,119 @@ impl UiState {
         }
     }
 
+    /// 首次点击只打开确认区；任一 mutation 在途时不得进入确认流程。
+    fn show_clear_unpinned_confirmation(&mut self) -> UiAction {
+        if !self.panel_visible
+            || self.pending_pin_mutation.is_some()
+            || self.pending_delete_mutation.is_some()
+            || self.pending_clear_unpinned_mutation.is_some()
+        {
+            return UiAction::None;
+        }
+        self.clear_unpinned_confirmation_visible = true;
+        self.clear_unpinned_error_visible = false;
+        UiAction::None
+    }
+
+    /// 用户二次确认后建立唯一清空请求；事务成功前不修改任何卡片。
+    fn begin_clear_unpinned_mutation(&mut self, panel_generation: u64) -> UiAction {
+        if !self.panel_visible
+            || panel_generation != self.panel_generation
+            || !self.clear_unpinned_confirmation_visible
+            || self.pending_pin_mutation.is_some()
+            || self.pending_delete_mutation.is_some()
+            || self.pending_clear_unpinned_mutation.is_some()
+        {
+            return UiAction::None;
+        }
+        if self.next_clear_unpinned_mutation_token == u64::MAX {
+            self.clear_unpinned_confirmation_visible = false;
+            self.clear_unpinned_error_visible = true;
+            return UiAction::None;
+        }
+
+        let request = ClearUnpinnedMutationRequest {
+            mutation_token: self.next_clear_unpinned_mutation_token,
+            panel_generation,
+        };
+        self.next_clear_unpinned_mutation_token += 1;
+        self.pending_clear_unpinned_mutation = Some(request);
+        self.clear_unpinned_confirmation_visible = false;
+        self.clear_unpinned_error_visible = false;
+        UiAction::QueueClearUnpinned(request)
+    }
+
+    /// 只消费与活动清空二元身份匹配的结果；成功后按存储修订号精确清理旧摘要。
+    fn apply_clear_unpinned_result(&mut self, result: ClearUnpinnedMutationResult) {
+        let Some(pending) = self.pending_clear_unpinned_mutation else {
+            return;
+        };
+        if result.mutation_token != pending.mutation_token
+            || result.panel_generation != pending.panel_generation
+        {
+            return;
+        }
+
+        self.pending_clear_unpinned_mutation = None;
+        match result.outcome {
+            Ok(success) => {
+                self.clear_unpinned_error_visible = false;
+                self.active_clear_revision = self.active_clear_revision.max(success.clear_revision);
+                let selected_identity = self
+                    .snapshot
+                    .selected_index
+                    .and_then(|index| self.snapshot.items.get(index))
+                    .map(|item| (item.id, item.content_hash));
+                let revisions = &self.capture_revisions;
+                let keep = |item: &UiClipboardItem| {
+                    if item.is_pinned {
+                        return true;
+                    }
+                    revisions
+                        .get(&(item.id, item.content_hash))
+                        .is_some_and(|revision| *revision >= success.clear_revision)
+                };
+                self.snapshot.items.retain(keep);
+                self.history.retain(keep);
+                self.snapshot.selected_index =
+                    selected_identity.and_then(|(selected_id, selected_hash)| {
+                        self.snapshot.items.iter().position(|item| {
+                            item.id == selected_id && item.content_hash == selected_hash
+                        })
+                    });
+                self.select_first_if_needed();
+                self.prune_capture_revisions();
+                self.search.cancel();
+                // 新数据集同时拒绝清空前已经在途的首页、续页和搜索结果。
+                self.begin_history_dataset(self.panel_visible);
+            }
+            Err(_) => {
+                self.clear_unpinned_error_visible = true;
+            }
+        }
+    }
+
+    /// 清空请求未进入后台单槽时清除 pending，保留全部卡片并显示固定提示。
+    fn mark_clear_unpinned_submission_failed(&mut self, request: &ClearUnpinnedMutationRequest) {
+        if self.pending_clear_unpinned_mutation.as_ref() == Some(request) {
+            self.pending_clear_unpinned_mutation = None;
+            self.clear_unpinned_error_visible = true;
+        }
+    }
+
+    /// 将捕获修订索引限制在当前缓存或可见快照身份内，避免常驻运行后无界增长。
+    fn prune_capture_revisions(&mut self) {
+        let identities = self
+            .history
+            .items()
+            .iter()
+            .chain(self.snapshot.items.iter())
+            .map(|item| (item.id, item.content_hash))
+            .collect::<HashSet<_>>();
+        self.capture_revisions
+            .retain(|identity, _| identities.contains(identity));
+    }
+
     /// 清空当前搜索接缝并恢复完整内存历史；每次新一轮面板打开都从此状态开始。
     fn reset_search_state(&mut self) {
         self.search.cancel();
@@ -618,6 +778,8 @@ impl UiState {
         self.snapshot.selected_index = None;
         self.pin_error_visible = false;
         self.delete_error_visible = false;
+        self.clear_unpinned_confirmation_visible = false;
+        self.clear_unpinned_error_visible = false;
         self.rebuild_visible_snapshot(None);
     }
 
@@ -769,10 +931,8 @@ impl UiState {
         let keyword = self.search_text.trim();
         HistoryQuery {
             keyword: (!keyword.is_empty()).then(|| keyword.to_owned()),
-            item_type: match self.search_filter {
-                SearchFilter::Text => Some("text".to_owned()),
-                SearchFilter::All | SearchFilter::Pinned => None,
-            },
+            // 当前窗口只渲染文本卡片；全部和收藏也必须在 SQL 边界排除非文本行。
+            item_type: Some("text".to_owned()),
             is_pinned: match self.search_filter {
                 SearchFilter::Pinned => Some(true),
                 SearchFilter::All | SearchFilter::Text => None,
@@ -823,6 +983,7 @@ impl UiState {
                     );
                     self.history.replace(self.snapshot.items.clone());
                 }
+                self.prune_capture_revisions();
                 self.search_status = if self.snapshot.items.is_empty() {
                     SearchStatus::Empty
                 } else {
@@ -940,6 +1101,10 @@ impl UiState {
             pin_error_visible: self.pin_error_visible,
             pending_delete_mutation: self.pending_delete_mutation,
             delete_error_visible: self.delete_error_visible,
+            clear_unpinned_confirmation_visible: self.clear_unpinned_confirmation_visible,
+            pending_clear_unpinned_mutation: self.pending_clear_unpinned_mutation,
+            clear_unpinned_error_visible: self.clear_unpinned_error_visible,
+            active_clear_revision: self.active_clear_revision,
             applied_event_count: self.applied_event_count,
             applied_on_thread: self.applied_on_thread,
         }
@@ -993,6 +1158,14 @@ pub struct UiStateSnapshot {
     pub pending_delete_mutation: Option<DeleteMutationRequest>,
     /// 固定删除失败提示当前是否可见。
     pub delete_error_visible: bool,
+    /// 清空未收藏确认区当前是否可见。
+    pub clear_unpinned_confirmation_visible: bool,
+    /// 当前唯一在途清空请求；只含 token 和面板代次。
+    pub pending_clear_unpinned_mutation: Option<ClearUnpinnedMutationRequest>,
+    /// 固定清空失败提示当前是否可见。
+    pub clear_unpinned_error_visible: bool,
+    /// 已消费的最大清空修订号；用于测试水位只增不减。
+    pub active_clear_revision: u64,
     /// 已由 UI reducer 应用的事件数量。
     pub applied_event_count: u64,
     /// 最后一次 reducer 执行所在的线程，用于测试线程所有权。
@@ -1060,6 +1233,25 @@ pub fn bind_app_window(window: &AppWindow) {
         };
         if let Err(error) = post_ui_event(event) {
             eprintln!("删除事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_clear_unpinned_requested(|| {
+        if let Err(error) = post_ui_event(UiEvent::ClearUnpinnedRequested) {
+            eprintln!("打开清空确认事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_clear_unpinned_cancelled(|| {
+        if let Err(error) = post_ui_event(UiEvent::ClearUnpinnedCancelled) {
+            eprintln!("取消清空事件无法进入 UI 事件队列：{error}");
+        }
+    });
+
+    window.on_clear_unpinned_confirmed(|| {
+        let panel_generation = current_panel_generation();
+        if let Err(error) = post_ui_event(UiEvent::ClearUnpinnedConfirmed { panel_generation }) {
+            eprintln!("确认清空事件无法进入 UI 事件队列：{error}");
         }
     });
 
@@ -1203,6 +1395,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             mut pin_error_visible,
             mut pending_delete_mutation,
             mut delete_error_visible,
+            clear_unpinned_confirmation_visible,
+            mut pending_clear_unpinned_mutation,
+            mut clear_unpinned_error_visible,
             request,
         ) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -1221,6 +1416,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.pin_error_visible,
                 state.pending_delete_mutation,
                 state.delete_error_visible,
+                state.clear_unpinned_confirmation_visible,
+                state.pending_clear_unpinned_mutation,
+                state.clear_unpinned_error_visible,
                 state.take_pending_history_request(),
             )
         });
@@ -1273,6 +1471,21 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 });
             }
         }
+        if let UiAction::QueueClearUnpinned(clear_request) = action {
+            let submitted = UI_CLEAR_UNPINNED_MUTATIONS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|sender| sender.try_submit(clear_request).is_ok())
+            });
+            if !submitted {
+                UI_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.mark_clear_unpinned_submission_failed(&clear_request);
+                    pending_clear_unpinned_mutation = state.pending_clear_unpinned_mutation;
+                    clear_unpinned_error_visible = state.clear_unpinned_error_visible;
+                });
+            }
+        }
         // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
         let refresh_model = may_refresh_model && action != UiAction::Reassert;
 
@@ -1304,6 +1517,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             window.set_history_retry_required(history_retry_required);
             window.set_pin_error_visible(pin_error_visible);
             window.set_delete_error_visible(delete_error_visible);
+            window.set_clear_unpinned_confirmation_visible(clear_unpinned_confirmation_visible);
+            window.set_clear_unpinned_pending(pending_clear_unpinned_mutation.is_some());
+            window.set_clear_unpinned_error_visible(clear_unpinned_error_visible);
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
@@ -1374,6 +1590,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 UiAction::QueueCopy { .. } => {}
                 UiAction::QueuePin(_) => {}
                 UiAction::QueueDelete(_) => {}
+                UiAction::QueueClearUnpinned(_) => {}
                 UiAction::ScheduleSearch { .. } => {}
                 UiAction::None => {}
                 // Quit 已在上方提前返回；此分支仅用于让枚举匹配保持显式完整。
@@ -1383,7 +1600,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     })
 }
 
-/// 判断事件是否可能改变卡片模型；纯完成通知在 CLR-03 消费前必须保持无视觉副作用。
+/// 判断事件是否可能改变卡片模型；纯确认状态变化复用现有列表模型。
 fn event_may_refresh_model(event: &UiEvent) -> bool {
     !matches!(
         event,
@@ -1392,7 +1609,9 @@ fn event_may_refresh_model(event: &UiEvent) -> bool {
             | UiEvent::CopyItem { .. }
             | UiEvent::HistoryViewportChanged { .. }
             | UiEvent::RetryHistoryPage
-            | UiEvent::ClearUnpinnedMutationCompleted(_)
+            | UiEvent::ClearUnpinnedRequested
+            | UiEvent::ClearUnpinnedCancelled
+            | UiEvent::ClearUnpinnedConfirmed { .. }
     )
 }
 
@@ -1487,6 +1706,7 @@ fn resolve_pin_item(index: i32) -> Option<UiEvent> {
         if !state.panel_visible
             || state.pending_pin_mutation.is_some()
             || state.pending_delete_mutation.is_some()
+            || state.pending_clear_unpinned_mutation.is_some()
             || index >= selection_limit(&state.snapshot)
         {
             return None;
@@ -1509,6 +1729,7 @@ fn resolve_delete_item(index: i32) -> Option<UiEvent> {
         if !state.panel_visible
             || state.pending_pin_mutation.is_some()
             || state.pending_delete_mutation.is_some()
+            || state.pending_clear_unpinned_mutation.is_some()
             || index >= selection_limit(&state.snapshot)
         {
             return None;
@@ -1711,7 +1932,8 @@ mod tests {
     };
     use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
     use crate::history_mutation::{
-        clear_unpinned_mutation_channel, ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult,
+        clear_unpinned_mutation_channel, ClearUnpinnedMutationFailure,
+        ClearUnpinnedMutationRequest, ClearUnpinnedMutationResult,
         ClearUnpinnedMutationSubmitError, ClearUnpinnedMutationSuccess, DeleteMutationFailure,
         DeleteMutationResult, PinMutationFailure, PinMutationResult,
     };
@@ -1728,6 +1950,14 @@ mod tests {
             content_hash: [index as u8; 32],
             copy_count: 1,
             is_pinned: false,
+        }
+    }
+
+    /// 将测试摘要包装成带存储修订号的持久化捕获事件。
+    fn captured(item: UiClipboardItem, mutation_revision: u64) -> UiEvent {
+        UiEvent::ClipboardCaptured {
+            item,
+            mutation_revision,
         }
     }
 
@@ -1760,27 +1990,272 @@ mod tests {
         }
     }
 
-    /// CLR-02 的清空完成通知在 CLR-03 消费前不得重建模型或改变 reducer 状态。
-    #[test]
-    fn 清空完成通知暂时保持界面无副作用() {
-        let event = UiEvent::ClearUnpinnedMutationCompleted(ClearUnpinnedMutationResult {
-            mutation_token: 1,
-            panel_generation: 2,
-            outcome: Ok(ClearUnpinnedMutationSuccess {
-                deleted_count: 3,
-                clear_revision: 4,
-            }),
+    /// 在已打开面板中完成“打开确认→确认”，返回 reducer 生成的后台请求。
+    fn begin_clear(state: &mut UiState) -> ClearUnpinnedMutationRequest {
+        assert_eq!(state.apply(UiEvent::ClearUnpinnedRequested), UiAction::None);
+        assert!(state.clear_unpinned_confirmation_visible);
+        let action = state.apply(UiEvent::ClearUnpinnedConfirmed {
+            panel_generation: state.panel_generation,
         });
-        assert!(!event_may_refresh_model(&event));
+        let UiAction::QueueClearUnpinned(request) = action else {
+            panic!("二次确认必须生成清空请求");
+        };
+        request
+    }
 
+    /// 生成与指定请求严格匹配的清空成功事件。
+    fn clear_succeeded(request: ClearUnpinnedMutationRequest, clear_revision: u64) -> UiEvent {
+        UiEvent::ClearUnpinnedMutationCompleted(ClearUnpinnedMutationResult {
+            mutation_token: request.mutation_token,
+            panel_generation: request.panel_generation,
+            outcome: Ok(ClearUnpinnedMutationSuccess {
+                deleted_count: 1,
+                clear_revision,
+            }),
+        })
+    }
+
+    /// 打开确认后取消不得创建请求或改变卡片。
+    #[test]
+    fn 取消清空确认不改变历史() {
         let mut state = UiState::default();
-        state.snapshot = UiSnapshot {
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0), test_item(1)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let before = state.snapshot.clone();
+        state.apply(UiEvent::ClearUnpinnedRequested);
+        assert!(state.clear_unpinned_confirmation_visible);
+        assert_eq!(state.apply(UiEvent::ClearUnpinnedCancelled), UiAction::None);
+        assert!(!state.clear_unpinned_confirmation_visible);
+        assert!(state.pending_clear_unpinned_mutation.is_none());
+        assert_eq!(state.snapshot, before);
+    }
+
+    /// 成功前不乐观移除；成功后只移除清空前未收藏项并保留收藏与清空后捕获。
+    #[test]
+    fn 清空成功按存储修订号保留收藏和新捕获() {
+        let mut state = UiState::default();
+        let mut pinned = test_item(1);
+        pinned.is_pinned = true;
+        let old = test_item(0);
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![old.clone(), pinned.clone()],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let first = state
+            .take_pending_history_request()
+            .expect("打开后缺少首页请求");
+        state.apply_history_page_result(page_result(
+            &first,
+            Ok(UiHistoryPage {
+                items: vec![old.clone(), pinned.clone()],
+                next_cursor: None,
+            }),
+        ));
+        let request = begin_clear(&mut state);
+        assert_eq!(state.snapshot.items, vec![old, pinned.clone()]);
+
+        let post_clear = test_item(2);
+        state.apply(captured(post_clear.clone(), 3));
+        let capture_page = state
+            .take_pending_history_request()
+            .expect("捕获后缺少首页请求");
+        state.apply_history_page_result(page_result(
+            &capture_page,
+            Ok(UiHistoryPage {
+                items: vec![post_clear.clone(), pinned.clone()],
+                next_cursor: None,
+            }),
+        ));
+        state.apply(clear_succeeded(request, 2));
+
+        assert_eq!(
+            state
+                .snapshot
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![post_clear.id, pinned.id]
+        );
+        assert_eq!(state.active_clear_revision, 2);
+        assert!(event_may_refresh_model(&clear_succeeded(request, 2)));
+        let refresh = state
+            .take_pending_history_request()
+            .expect("清空成功后缺少刷新请求");
+        state.mark_history_submission_failed(&refresh);
+        assert_eq!(state.snapshot.items.len(), 2);
+    }
+
+    /// 失败结果和提交失败都必须保留卡片，并显示同一固定失败状态。
+    #[test]
+    fn 清空失败保留历史并显示固定错误() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
             items: vec![test_item(0)],
             selected_index: Some(0),
-        };
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let request = begin_clear(&mut state);
         let before = state.snapshot.clone();
-        assert_eq!(state.apply(event), UiAction::None);
+        state.apply(UiEvent::ClearUnpinnedMutationCompleted(
+            ClearUnpinnedMutationResult {
+                mutation_token: request.mutation_token,
+                panel_generation: request.panel_generation,
+                outcome: Err(ClearUnpinnedMutationFailure::StorageUnavailable),
+            },
+        ));
         assert_eq!(state.snapshot, before);
+        assert!(state.clear_unpinned_error_visible);
+
+        state.apply(UiEvent::ClearUnpinnedRequested);
+        let second = begin_clear(&mut state);
+        state.mark_clear_unpinned_submission_failed(&second);
+        assert_eq!(state.snapshot, before);
+        assert!(state.clear_unpinned_error_visible);
+    }
+
+    /// 成功水位只增不减，幂等第二次清空后第一次清空前的迟到捕获仍被拒绝。
+    #[test]
+    fn 清空水位单调并拒绝迟到捕获() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let first = begin_clear(&mut state);
+        state.apply(clear_succeeded(first, 5));
+        let second = begin_clear(&mut state);
+        state.apply(clear_succeeded(second, 3));
+        assert_eq!(state.active_clear_revision, 5);
+
+        state.apply(captured(test_item(8), 4));
+        assert!(state
+            .history
+            .items()
+            .iter()
+            .all(|item| item.id != test_item(8).id));
+        let reused_old_id = test_item(0);
+        state.apply(captured(reused_old_id.clone(), 6));
+        assert!(state
+            .history
+            .items()
+            .iter()
+            .any(|item| item.id == reused_old_id.id));
+    }
+
+    /// 清空前返回的旧收藏快照不能在随后取消收藏并清空后迟到复活。
+    #[test]
+    fn 清空拒绝收藏状态已经过期的迟到捕获() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let request = begin_clear(&mut state);
+        state.apply(clear_succeeded(request, 2));
+
+        let mut stale_pinned_capture = test_item(4);
+        stale_pinned_capture.is_pinned = true;
+        state.apply(captured(stale_pinned_capture.clone(), 1));
+
+        assert!(state
+            .history
+            .items()
+            .iter()
+            .all(|item| item.id != stale_pinned_capture.id));
+        assert!(state
+            .snapshot
+            .items
+            .iter()
+            .all(|item| item.id != stale_pinned_capture.id));
+    }
+
+    /// 清空与收藏、单条删除必须双向共享一个 UI mutation 互斥边界。
+    #[test]
+    fn 清空与收藏删除双向互斥() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let clear_request = begin_clear(&mut state);
+        let item = state.snapshot.items[0].clone();
+        assert_eq!(
+            state.begin_pin_mutation(state.panel_generation, item.id, item.content_hash, true),
+            UiAction::None
+        );
+        assert_eq!(
+            state.begin_delete_mutation(state.panel_generation, item.id, item.content_hash),
+            UiAction::None
+        );
+        state.mark_clear_unpinned_submission_failed(&clear_request);
+
+        let UiAction::QueuePin(_) =
+            state.begin_pin_mutation(state.panel_generation, item.id, item.content_hash, true)
+        else {
+            panic!("清空结束后收藏请求应可建立");
+        };
+        assert_eq!(state.apply(UiEvent::ClearUnpinnedRequested), UiAction::None);
+        assert!(!state.clear_unpinned_confirmation_visible);
+    }
+
+    /// 深分页快照成功清空后只保留收藏，清空前旧首页不得把已删记录带回。
+    #[test]
+    fn 清空深分页快照并拒绝旧首页复活() {
+        let mut items = (0..120).map(test_item).collect::<Vec<_>>();
+        items[110].is_pinned = true;
+        let pinned_identity = (items[110].id, items[110].content_hash);
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: items.clone(),
+            selected_index: Some(110),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let stale_page = state
+            .take_pending_history_request()
+            .expect("打开后缺少旧首页请求");
+        let request = begin_clear(&mut state);
+        state.apply(clear_succeeded(request, 10));
+
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(
+            (
+                state.snapshot.items[0].id,
+                state.snapshot.items[0].content_hash
+            ),
+            pinned_identity
+        );
+        assert_eq!(state.snapshot.selected_index, Some(0));
+        state.apply_history_page_result(page_result(
+            &stale_page,
+            Ok(UiHistoryPage {
+                items,
+                next_cursor: None,
+            }),
+        ));
+        assert_eq!(state.snapshot.items.len(), 1);
+        assert_eq!(state.snapshot.items[0].id, pinned_identity.0);
+    }
+
+    /// 已接受清空在面板隐藏后仍须应用，重新打开不能吞掉成功结果或降低水位。
+    #[test]
+    fn 清空在隐藏期间完成并在重开后保持() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation;
+        let request = begin_clear(&mut state);
+        state.apply(UiEvent::HidePanel { generation });
+        state.apply(clear_succeeded(request, 2));
+
+        assert!(state.snapshot.items.is_empty());
+        assert_eq!(state.active_clear_revision, 2);
+        assert!(state.pending_clear_unpinned_mutation.is_none());
+        state.apply(UiEvent::ShowPanel);
+        assert!(state.snapshot.items.is_empty());
+        assert_eq!(state.active_clear_revision, 2);
     }
 
     /// Quit 使用的关闭辅助函数必须关闭已绑定 clear sender，并立即拒绝后续请求。
@@ -2038,7 +2513,7 @@ mod tests {
         }));
         state.apply(UiEvent::OpenPanel);
         let old_request = state.take_pending_history_request().unwrap();
-        state.apply(UiEvent::ClipboardCaptured(test_item(1)));
+        state.apply(captured(test_item(1), 1));
         let current_request = state.take_pending_history_request().unwrap();
 
         state.apply_history_page_result(page_result(
@@ -2263,15 +2738,18 @@ mod tests {
         }));
 
         assert_eq!(
-            state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
-                id: 2,
-                preview: "新摘要".to_owned(),
-                source: "新来源".to_owned(),
-                relative_time: "刚刚".to_owned(),
-                content_hash: [2; 32],
-                copy_count: 1,
-                is_pinned: false,
-            })),
+            state.apply(captured(
+                UiClipboardItem {
+                    id: 2,
+                    preview: "新摘要".to_owned(),
+                    source: "新来源".to_owned(),
+                    relative_time: "刚刚".to_owned(),
+                    content_hash: [2; 32],
+                    copy_count: 1,
+                    is_pinned: false,
+                },
+                1,
+            )),
             UiAction::None
         );
         assert_eq!(state.snapshot.items[0].preview, "新摘要");
@@ -2284,24 +2762,30 @@ mod tests {
     #[test]
     fn 捕获重复文本合并并保留收藏() {
         let mut state = UiState::default();
-        state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
-            id: 1,
-            preview: "收藏正文".to_owned(),
-            source: "旧来源".to_owned(),
-            relative_time: "之前".to_owned(),
-            content_hash: [9; 32],
-            copy_count: 1,
-            is_pinned: true,
-        }));
-        state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
-            id: 1,
-            preview: "收藏正文".to_owned(),
-            source: "旧来源".to_owned(),
-            relative_time: "刚刚".to_owned(),
-            content_hash: [9; 32],
-            copy_count: u64::MAX,
-            is_pinned: true,
-        }));
+        state.apply(captured(
+            UiClipboardItem {
+                id: 1,
+                preview: "收藏正文".to_owned(),
+                source: "旧来源".to_owned(),
+                relative_time: "之前".to_owned(),
+                content_hash: [9; 32],
+                copy_count: 1,
+                is_pinned: true,
+            },
+            1,
+        ));
+        state.apply(captured(
+            UiClipboardItem {
+                id: 1,
+                preview: "收藏正文".to_owned(),
+                source: "旧来源".to_owned(),
+                relative_time: "刚刚".to_owned(),
+                content_hash: [9; 32],
+                copy_count: u64::MAX,
+                is_pinned: true,
+            },
+            2,
+        ));
 
         assert_eq!(state.snapshot.items.len(), 1);
         assert_eq!(state.snapshot.items[0].id, 1);
@@ -2361,15 +2845,18 @@ mod tests {
         for index in 0..(UI_HISTORY_MEMORY_CAPACITY + 20) {
             let mut content_hash = [0_u8; 32];
             content_hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
-            state.apply(UiEvent::ClipboardCaptured(UiClipboardItem {
-                id: index as u64 + 1,
-                preview: format!("条目-{index}"),
-                source: "测试来源".to_owned(),
-                relative_time: "刚刚".to_owned(),
-                content_hash,
-                copy_count: 1,
-                is_pinned: false,
-            }));
+            state.apply(captured(
+                UiClipboardItem {
+                    id: index as u64 + 1,
+                    preview: format!("条目-{index}"),
+                    source: "测试来源".to_owned(),
+                    relative_time: "刚刚".to_owned(),
+                    content_hash,
+                    copy_count: 1,
+                    is_pinned: false,
+                },
+                index as u64 + 1,
+            ));
         }
 
         assert_eq!(state.snapshot.items.len(), UI_HISTORY_MEMORY_CAPACITY);
@@ -2656,6 +3143,21 @@ mod tests {
         assert!(state.snapshot.items[0].is_pinned);
         assert_eq!(state.snapshot.selected_index, Some(0));
         assert_eq!(state.history.items().len(), 1);
+    }
+
+    /// 全部、文本和收藏标签都必须在 SQLite 输入边界显式限制为 text。
+    #[test]
+    fn 所有当前筛选都只查询文本记录() {
+        let mut state = UiState::default();
+        for filter in [SearchFilter::All, SearchFilter::Text, SearchFilter::Pinned] {
+            state.search_filter = filter;
+            let query = state.build_search_query();
+            assert_eq!(query.item_type.as_deref(), Some("text"));
+            assert_eq!(
+                query.is_pinned,
+                (filter == SearchFilter::Pinned).then_some(true)
+            );
+        }
     }
 
     /// 面板关闭后到达的旧搜索事件不能重新显示结果或改变已取消的查询状态。

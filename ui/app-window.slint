@@ -43,6 +43,12 @@ export component AppWindow inherits Window {
     callback pin-item-requested(index: int);
     // 删除按钮只提交当前索引，Rust 必须等待 SQLite 成功后才移除卡片。
     callback delete-item-requested(index: int);
+    // 清理入口只打开确认区，不得直接访问存储。
+    callback clear-unpinned-requested();
+    // 取消确认只关闭确认区，不产生后台请求。
+    callback clear-unpinned-cancelled();
+    // 二次确认后才允许 Rust 提交清空未收藏事务。
+    callback clear-unpinned-confirmed();
     // 搜索框文本变化只发送用户主动输入，不把历史正文回传给 Rust。
     callback search-text-changed(text: string);
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
@@ -70,6 +76,10 @@ export component AppWindow inherits Window {
     in property <bool> pin-error-visible: false;
     // 删除失败只展示固定文案，不接收 SQLite、哈希或正文错误详情。
     in property <bool> delete-error-visible: false;
+    // 清空确认、处理中和固定失败状态由 Rust reducer 单向同步。
+    in property <bool> clear-unpinned-confirmation-visible: false;
+    in property <bool> clear-unpinned-pending: false;
+    in property <bool> clear-unpinned-error-visible: false;
     // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
     in-out property <length> history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
@@ -131,57 +141,155 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalLayout {
-                    height: 30px;
-                    spacing: 8px;
+                // 清理确认和失败提示归入筛选区的可变高度容器；默认状态仍只占 30px，
+                // 避免不可见的零高度控件因外层 spacing 令历史卡片整体下移。
+                VerticalLayout {
+                    height: 30px
+                        + (clear-unpinned-confirmation-visible ? 56px : 0px)
+                        + (clear-unpinned-error-visible ? 30px : 0px);
+                    spacing: 12px;
 
-                    Rectangle {
-                        width: 64px;
-                        border-radius: 6px;
-                        background: search-filter == 0 ? #f5f5f5 : #141414;
-                        TouchArea {
-                            clicked => { search-filter-requested(0); }
+                    HorizontalLayout {
+                        height: 30px;
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 64px;
+                            border-radius: 6px;
+                            background: search-filter == 0 ? #f5f5f5 : #141414;
+                            TouchArea {
+                                clicked => { search-filter-requested(0); }
+                            }
+                            Text {
+                                text: "全部";
+                                color: search-filter == 0 ? #080808 : #8c8c8c;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
-                        Text {
-                            text: "全部";
-                            color: search-filter == 0 ? #080808 : #8c8c8c;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+
+                        Rectangle {
+                            width: 64px;
+                            border-radius: 6px;
+                            background: search-filter == 1 ? #f5f5f5 : #141414;
+                            TouchArea {
+                                clicked => { search-filter-requested(1); }
+                            }
+                            Text {
+                                text: "文本";
+                                color: search-filter == 1 ? #080808 : #8c8c8c;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            width: 64px;
+                            border-radius: 6px;
+                            background: search-filter == 2 ? #f5f5f5 : #141414;
+                            TouchArea {
+                                clicked => { search-filter-requested(2); }
+                            }
+                            Text {
+                                text: "收藏";
+                                color: search-filter == 2 ? #080808 : #8c8c8c;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
+                        Rectangle {
+                            width: 108px;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #3a3a3a;
+                            background: #141414;
+                            clear-touch := TouchArea {
+                                enabled: !clear-unpinned-pending;
+                                clicked => {
+                                    if (!clear-unpinned-pending) {
+                                        clear-unpinned-requested();
+                                    }
+                                }
+                            }
+                            Text {
+                                text: clear-unpinned-pending ? "清理中…" : "清理未收藏";
+                                color: clear-unpinned-pending ? #666666 : #cfcfcf;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
 
+                    // 二次确认使用面板内联区域，避免系统弹窗打断置顶和键盘上下文。
                     Rectangle {
-                        width: 64px;
+                        visible: clear-unpinned-confirmation-visible;
+                        height: clear-unpinned-confirmation-visible ? 44px : 0px;
                         border-radius: 6px;
-                        background: search-filter == 1 ? #f5f5f5 : #141414;
-                        TouchArea {
-                            clicked => { search-filter-requested(1); }
-                        }
-                        Text {
-                            text: "文本";
-                            color: search-filter == 1 ? #080808 : #8c8c8c;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        border-width: 1px;
+                        border-color: #3a3a3a;
+                        background: #141414;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 8px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "将删除所有未收藏记录";
+                                color: #d8d8d8;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            Rectangle {
+                                width: 58px;
+                                height: 28px;
+                                border-radius: 5px;
+                                background: #222222;
+                                TouchArea {
+                                    clicked => { clear-unpinned-cancelled(); }
+                                }
+                                Text {
+                                    text: "取消";
+                                    color: #b8b8b8;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Rectangle {
+                                width: 72px;
+                                height: 28px;
+                                border-radius: 5px;
+                                background: #f2f2f2;
+                                TouchArea {
+                                    clicked => { clear-unpinned-confirmed(); }
+                                }
+                                Text {
+                                    text: "确认清空";
+                                    color: #111111;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
                         }
                     }
 
-                    Rectangle {
-                        width: 64px;
-                        border-radius: 6px;
-                        background: search-filter == 2 ? #f5f5f5 : #141414;
-                        TouchArea {
-                            clicked => { search-filter-requested(2); }
-                        }
-                        Text {
-                            text: "收藏";
-                            color: search-filter == 2 ? #080808 : #8c8c8c;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    Rectangle {
-                        horizontal-stretch: 1;
+                    Text {
+                        visible: clear-unpinned-error-visible;
+                        height: clear-unpinned-error-visible ? 18px : 0px;
+                        text: "清空失败，请重试";
+                        color: #ff8e8e;
+                        font-size: 12px;
                     }
                 }
 

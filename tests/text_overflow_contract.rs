@@ -1,21 +1,26 @@
 //! 此集成测试用真实软件渲染快照锁定长文本不能越过固定卡片边界。
 //!
-//! 回归输入包含换行和超长英文标识符，复现用户截图中的预览文字穿过卡片底部并与
-//! 下一张卡片重叠；测试只扫描两张卡片之间的透明间隔，不依赖具体字体字形。
+//! 回归输入使用用户实际复制的多行 SQL：既锁定短首行后仍应显示后续行，也扫描两张
+//! 卡片之间的透明间隔，避免修复截断时重新引入文字越界。
 
 use clipboard_board::{create_app_window, ClipboardCard};
 use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-/// 构造能够稳定产生多行换行的长文本卡片。
+/// 构造用户实际遇到“只显示 /*...”问题的多行 SQL 卡片。
 fn long_card() -> ClipboardCard {
     ClipboardCard {
         preview: SharedString::from(
-            "EXCHANGE TABLES\n\
-             nlp_semantic_layer_replenishment_group_effect_semantic_10m_20260727_r03\n\
-             AND\n\
-             nlp_semantic_layer__shadow_replenishment_group_effect_semantic_10m_20260727_r03\n\
-             ON CLUSTER default_cluster",
+            r#"
+/*
+#4 正向交换；只执行一次。
+执行后无论客户端返回成功、失败还是超时，都先执行 #5、#6，禁止重跑本语句。
+*/
+/* cutover_probe_id=replenishment_group_effect_20260728_probe_forward */
+EXCHANGE TABLES
+    nlp_semantic_layer.__exchange_cutover_probe_codex_20260728_a
+AND nlp_semantic_layer.__exchange_cutover_probe_codex_20260728_b
+ON CLUSTER default_cluster;"#,
         ),
         source: SharedString::from("测试来源"),
         relative_time: SharedString::from("刚刚"),
@@ -37,9 +42,9 @@ fn short_card() -> ClipboardCard {
     }
 }
 
-/// 两张固定高度卡片之间的 10px 间隔内不能出现长文本的浅色像素。
+/// 短首行之后必须显示后续正文，同时两张卡片间隔内不能出现越界文字。
 #[test]
-fn 长文本预览不会绘制到卡片间隔() {
+fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
     slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
         mock_time: true,
         threading: true,
@@ -58,6 +63,20 @@ fn 长文本预览不会绘制到卡片间隔() {
     assert_eq!(snapshot.height(), 640);
     let pixels = snapshot.as_bytes();
     let stride = snapshot.width() as usize * 4;
+    // 开头空行之后的 `/*` 和首行正文应在 253～286px 留下足够浅色字形。
+    // 旧实现用 elide 只留下 `/*...`，该区域像素过少，因此能精确捕获用户截图。
+    let continuation_pixels = (253_usize..287)
+        .flat_map(|y| (38_usize..380).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            let offset = y * stride + x * 4;
+            pixels[offset] > 120 && pixels[offset + 1] > 120 && pixels[offset + 2] > 120
+        })
+        .count();
+    assert!(
+        continuation_pixels > 40,
+        "短首行后的正文没有显示，后续区域只有 {continuation_pixels} 个浅色像素"
+    );
+
     // 当前固定布局中首张卡片底边约为 320px，随后是 10px 透明间隔。
     let light_pixels = (321_usize..329)
         .flat_map(|y| (38_usize..420).map(move |x| (x, y)))

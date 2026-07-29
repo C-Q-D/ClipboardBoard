@@ -8,6 +8,7 @@
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
 use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
 use crate::history::MemoryHistory;
+use crate::history_mutation::PinMutationSender;
 use crate::history_query::{
     HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
     HistoryRequestSender, HistoryResultReceiver, MAX_LOADED_ITEMS,
@@ -273,6 +274,8 @@ impl UiState {
                 self.apply_search_if_current(generation, now)
             }
             UiEvent::HistoryQueryWake => UiAction::None,
+            // FAV-02 只建立后台桥和退出协议；FAV-03 再消费结果并更新卡片状态。
+            UiEvent::PinMutationCompleted(_) => UiAction::None,
             UiEvent::HistoryViewportChanged {
                 viewport_y,
                 visible_height,
@@ -690,6 +693,8 @@ thread_local! {
     static UI_HISTORY_REQUESTS: RefCell<Option<HistoryRequestSender>> = const { RefCell::new(None) };
     /// UI wake 到达后从该槽提取最新轻量结果，并在同一锁内清除 wake_pending。
     static UI_HISTORY_RESULTS: RefCell<Option<HistoryResultReceiver>> = const { RefCell::new(None) };
+    /// UI 线程只持有收藏请求发送端；SQLite 和 worker 生命周期仍由主线程拥有。
+    static UI_PIN_MUTATIONS: RefCell<Option<PinMutationSender>> = const { RefCell::new(None) };
 }
 
 /// 可安全跨线程读取的 UI 状态快照，不包含任何 UI 引用或 Slint 对象。
@@ -810,6 +815,13 @@ pub fn bind_history_query_bridge(requests: HistoryRequestSender, results: Histor
     });
 }
 
+/// 在 UI 线程绑定收藏变更的非阻塞单槽发送端。
+pub fn bind_pin_mutation_sender(sender: PinMutationSender) {
+    UI_PIN_MUTATIONS.with(|slot| {
+        *slot.borrow_mut() = Some(sender);
+    });
+}
+
 /// 关闭查询双向桥；Quit 调用后 worker 不再接受排队请求，迟到结果也不再唤醒 UI。
 fn close_history_query_bridge() {
     UI_HISTORY_REQUESTS.with(|slot| {
@@ -820,6 +832,15 @@ fn close_history_query_bridge() {
     UI_HISTORY_RESULTS.with(|slot| {
         if let Some(receiver) = slot.borrow().as_ref() {
             receiver.close();
+        }
+    });
+}
+
+/// 关闭收藏请求入口；已经进入单槽的请求由 worker 排空后退出。
+fn close_pin_mutation_bridge() {
+    UI_PIN_MUTATIONS.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            sender.close();
         }
     });
 }
@@ -897,6 +918,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             #[cfg(windows)]
             close_copy_request_gate();
             close_history_query_bridge();
+            close_pin_mutation_bridge();
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");

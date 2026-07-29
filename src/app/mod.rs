@@ -6,5 +6,6 @@ mod ui_event;
 #[cfg(windows)]
 pub use ui_event::bind_copy_request_inbox;
 pub use ui_event::{
-    bind_app_window, bind_history_query_bridge, post_ui_event, ui_state_snapshot, UiStateSnapshot,
+    bind_app_window, bind_history_query_bridge, bind_pin_mutation_sender, post_ui_event,
+    ui_state_snapshot, UiStateSnapshot,
 };

@@ -5,6 +5,7 @@
 
 #[cfg(windows)]
 use crate::clipboard::ClipboardCaptureResult;
+use crate::history_mutation::PinMutationResult;
 #[cfg(windows)]
 use crate::storage::TextUpsertResult;
 
@@ -188,6 +189,8 @@ pub enum UiEvent {
     SearchDebounceElapsed { generation: u64 },
     /// SQLite 查询 worker 的无正文唤醒；UI 从绑定的 latest 结果槽提取真实结果。
     HistoryQueryWake,
+    /// 收藏 worker 已完成一次事务；结果不携带正文且必须与活动 mutation 完整匹配。
+    PinMutationCompleted(PinMutationResult),
     /// 历史列表真实视口几何变化；reducer 只在进入底部阈值的边沿请求续页。
     HistoryViewportChanged {
         /// Flickable 的负向纵向视口坐标。

@@ -7,7 +7,9 @@
 #[cfg(windows)]
 use clipboard_board::app::post_ui_event;
 #[cfg(windows)]
-use clipboard_board::app::{bind_app_window, bind_copy_request_inbox, bind_history_query_bridge};
+use clipboard_board::app::{
+    bind_app_window, bind_copy_request_inbox, bind_history_query_bridge, bind_pin_mutation_sender,
+};
 #[cfg(windows)]
 use clipboard_board::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
 #[cfg(windows)]
@@ -16,6 +18,8 @@ use clipboard_board::command::UiEvent;
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
 use clipboard_board::history_bridge::run_clipboard_pump;
+#[cfg(windows)]
+use clipboard_board::history_mutation::{pin_mutation_channel, start_pin_mutation_worker};
 #[cfg(windows)]
 use clipboard_board::history_query::{
     history_request_channel, history_result_channel, start_history_query_worker,
@@ -82,9 +86,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    let (pin_mutations, pin_mutation_receiver) = pin_mutation_channel();
+    bind_pin_mutation_sender(pin_mutations.clone());
+    let pin_mutation_worker =
+        match start_pin_mutation_worker(storage.client(), pin_mutation_receiver, |result| {
+            post_ui_event(UiEvent::PinMutationCompleted(result)).is_ok()
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                pin_mutations.close();
+                history_requests.close();
+                history_results.close();
+                let _ = hotkey_manager.stop();
+                let _ = capture_pump.join();
+                let _ = history_query_worker.join();
+                return Err(error.into());
+            }
+        };
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
+    pin_mutations.close();
     history_requests.close();
     history_results.close();
     let hotkey_result = hotkey_manager.stop();
@@ -98,6 +120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "历史查询线程异常退出")
         .map(|_| ());
+    let pin_mutation_result = pin_mutation_worker
+        .join()
+        .map_err(|_| "收藏变更线程异常退出")
+        .map(|_| ());
     // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
     let storage_result = storage
         .begin_closing()
@@ -108,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hotkey_result?;
     capture_pump_result?;
     history_query_result?;
+    pin_mutation_result?;
     storage_result?;
     Ok(())
 }

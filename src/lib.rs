@@ -12,6 +12,8 @@ pub mod command;
 pub mod diagnostics;
 pub mod domain;
 pub mod history;
+// 收藏 mutation 使用独立有界桥，避免 UI 线程阻塞或把 SQLite 连接泄漏到界面层。
+pub mod history_mutation;
 pub mod history_query;
 // 搜索模块只负责 120ms 防抖；SQLite 查询与结果身份由 history_query 独立管理。
 pub mod search;

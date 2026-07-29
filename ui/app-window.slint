@@ -211,6 +211,8 @@ export component AppWindow inherits Window {
                         card-background := Rectangle {
                             height: 96px;
                             width: parent.width;
+                            // 固定高度虚拟卡片必须裁剪子元素，禁止长预览绘制到卡片间隔。
+                            clip: true;
                             // 选中态优先于悬停态，确保鼠标离开后仍能辨认当前复制目标。
                             background: index == selected-index
                                 ? #242424
@@ -221,16 +223,19 @@ export component AppWindow inherits Window {
 
                             VerticalLayout {
                                 width: parent.width - 100px;
+                                height: parent.height;
                                 padding: 14px;
                                 spacing: 8px;
 
                                 Text {
                                     text: card.preview;
+                                    // 46px 约容纳三行正文；来源信息始终保留在卡片底部。
+                                    height: 46px;
+                                    vertical-stretch: 0;
                                     color: #f5f5f5;
                                     font-size: 14px;
                                     wrap: word-wrap;
                                     overflow: elide;
-                                    vertical-stretch: 1;
                                 }
 
                                 HorizontalLayout {

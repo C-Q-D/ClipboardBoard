@@ -17,7 +17,7 @@ slint-build = "1.16.0"
 
 # 仅用于隔离集成测试，验证 Slint 事件循环的线程投递边界；生产程序不依赖测试后端。
 [dev-dependencies]
-i-slint-backend-testing = "=1.17.1"
+i-slint-backend-testing = { version = "=1.17.1", features = ["renderer-software"] }
 
 # 仅在 Windows 目标启用原生消息窗口和全局热键 API，避免其他平台拉入无用依赖。
 [target.'cfg(windows)'.dependencies]

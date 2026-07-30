@@ -26,6 +26,8 @@ $requiredFiles = @(
     'src/image_decode/mod.rs',
     'src/image_decode/dib.rs',
     'src/image_decode/png.rs',
+    'src/image_pipeline/mod.rs',
+    'src/image_pipeline/encoding.rs',
     'src/image_storage/mod.rs',
     'src/storage/mod.rs',
     'src/storage/migration.rs',

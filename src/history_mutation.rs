@@ -9,7 +9,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crate::storage::{DeleteHistoryInput, SetPinnedInput, StorageClient, StorageError};
+use crate::{
+    image_pipeline::ImageWorkerSender,
+    storage::{DeleteHistoryInput, SetPinnedInput, StorageClient, StorageError},
+};
 
 /// 收藏请求的固定队列容量；UI 同时只允许一个活动 mutation。
 const PIN_MUTATION_QUEUE_CAPACITY: usize = 1;
@@ -356,6 +359,7 @@ impl DeleteMutationReceiver {
 /// 启动单一删除 worker；已提交事务无论 UI 是否仍可接收结果都必须完成。
 pub fn start_delete_mutation_worker<E>(
     storage: StorageClient,
+    image_worker: Option<ImageWorkerSender>,
     receiver: DeleteMutationReceiver,
     mut emit: E,
 ) -> io::Result<JoinHandle<()>>
@@ -366,7 +370,7 @@ where
         .name("clipboard-board-delete-mutation".to_owned())
         .spawn(move || {
             while let Some(request) = receiver.receive() {
-                let result = execute_delete_mutation(&storage, request);
+                let result = execute_delete_mutation(&storage, image_worker.as_ref(), request);
                 // 结果投递失败只表示 UI 已退出；SQLite 事务已经完成，不能反向回滚。
                 let _ = emit(result);
             }
@@ -376,18 +380,20 @@ where
 /// 执行一次删除事务并把所有底层错误压缩为有限类别。
 fn execute_delete_mutation(
     storage: &StorageClient,
+    image_worker: Option<&ImageWorkerSender>,
     request: DeleteMutationRequest,
 ) -> DeleteMutationResult {
     let outcome = i64::try_from(request.id)
         .map_err(|_| DeleteMutationFailure::IdentityChanged)
         .and_then(|id| {
-            storage
+            let result = storage
                 .delete_history(DeleteHistoryInput {
                     id,
                     content_hash: request.content_hash,
                 })
-                .map(|_| ())
-                .map_err(map_delete_storage_failure)
+                .map_err(map_delete_storage_failure)?;
+            recycle_images(storage, image_worker, result.recycled_image);
+            Ok(())
         });
 
     DeleteMutationResult {
@@ -567,6 +573,7 @@ impl ClearHistoryMutationReceiver {
 /// 启动单一清空 worker；已接受事务不因 UI 结果接收端退出而撤销。
 pub fn start_clear_history_mutation_worker<E>(
     storage: StorageClient,
+    image_worker: Option<ImageWorkerSender>,
     receiver: ClearHistoryMutationReceiver,
     mut emit: E,
 ) -> io::Result<JoinHandle<()>>
@@ -577,7 +584,8 @@ where
         .name("clipboard-board-clear-history".to_owned())
         .spawn(move || {
             while let Some(request) = receiver.receive() {
-                let result = execute_clear_history_mutation(&storage, request);
+                let result =
+                    execute_clear_history_mutation(&storage, image_worker.as_ref(), request);
                 // UI 已退出时只丢弃有限结果；数据库事务已经完成，不能反向回滚。
                 let _ = emit(result);
             }
@@ -587,15 +595,17 @@ where
 /// 按请求的显式范围执行一次清空事务，并将任意存储错误压缩为固定失败类别。
 fn execute_clear_history_mutation(
     storage: &StorageClient,
+    image_worker: Option<&ImageWorkerSender>,
     request: ClearHistoryMutationRequest,
 ) -> ClearHistoryMutationResult {
     let storage_result = match request.scope {
         ClearHistoryScope::UnpinnedText => storage
             .clear_unpinned_text()
             .map(|result| (result.deleted_count, result.mutation_revision)),
-        ClearHistoryScope::All => storage
-            .clear_all_history()
-            .map(|result| (result.deleted_count, result.mutation_revision)),
+        ClearHistoryScope::All => storage.clear_all_history().map(|result| {
+            recycle_images(storage, image_worker, result.recycled_images);
+            (result.deleted_count, result.mutation_revision)
+        }),
     };
     let outcome = storage_result
         .map(|result| ClearHistoryMutationSuccess {
@@ -609,6 +619,25 @@ fn execute_clear_history_mutation(
         panel_generation: request.panel_generation,
         scope: request.scope,
         outcome,
+    }
+}
+
+/// 将数据库已提交删除返回的图片资产逐项交给独占 ImageWorker 回收。
+///
+/// 回收失败不能恢复已经提交的数据库行；当前有限重试失败由后续启动期对账原子处理。
+fn recycle_images(
+    storage: &StorageClient,
+    image_worker: Option<&ImageWorkerSender>,
+    images: impl IntoIterator<Item = crate::domain::ImageMetadata>,
+) {
+    let Some(image_worker) = image_worker else {
+        return;
+    };
+    for image in images {
+        let Ok(receiver) = image_worker.recycle(storage.clone(), image) else {
+            continue;
+        };
+        let _ = receiver.recv();
     }
 }
 
@@ -817,7 +846,7 @@ mod tests {
             .expect("写入删除桥测试记录失败");
         let (sender, receiver) = delete_mutation_channel();
         let (result_sender, result_receiver) = sync_channel(1);
-        let worker = start_delete_mutation_worker(executor.client(), receiver, move |result| {
+        let worker = start_delete_mutation_worker(executor.client(), None, receiver, move |result| {
             result_sender.send(result).is_ok()
         })
         .expect("启动删除 worker 失败");
@@ -886,7 +915,7 @@ mod tests {
             .expect("写入身份测试文本失败");
         let (sender, receiver) = delete_mutation_channel();
         let (result_sender, result_receiver) = sync_channel(2);
-        let worker = start_delete_mutation_worker(executor.client(), receiver, move |result| {
+        let worker = start_delete_mutation_worker(executor.client(), None, receiver, move |result| {
             result_sender.send(result).is_ok()
         })
         .expect("启动失败映射删除 worker 失败");
@@ -942,7 +971,7 @@ mod tests {
             })
             .expect("写入投递失败测试记录失败");
         let (sender, receiver) = delete_mutation_channel();
-        let worker = start_delete_mutation_worker(executor.client(), receiver, |_result| false)
+        let worker = start_delete_mutation_worker(executor.client(), None, receiver, |_result| false)
             .expect("启动投递失败删除 worker 失败");
         sender
             .try_submit(delete_request(
@@ -1030,7 +1059,7 @@ mod tests {
         let (sender, receiver) = clear_history_mutation_channel();
         let (result_sender, result_receiver) = sync_channel(1);
         let worker =
-            start_clear_history_mutation_worker(executor.client(), receiver, move |result| {
+            start_clear_history_mutation_worker(executor.client(), None, receiver, move |result| {
                 result_sender.send(result).is_ok()
             })
             .expect("启动清空 worker 失败");
@@ -1077,7 +1106,7 @@ mod tests {
         executor.begin_closing().expect("建立存储关闭态失败");
         let (sender, receiver) = clear_history_mutation_channel();
         let (result_sender, result_receiver) = sync_channel(1);
-        let worker = start_clear_history_mutation_worker(client, receiver, move |result| {
+        let worker = start_clear_history_mutation_worker(client, None, receiver, move |result| {
             result_sender.send(result).is_ok()
         })
         .expect("启动失败映射清空 worker 失败");
@@ -1116,7 +1145,7 @@ mod tests {
             .expect("写入清空投递失败记录失败");
         let (sender, receiver) = clear_history_mutation_channel();
         let worker =
-            start_clear_history_mutation_worker(executor.client(), receiver, |_result| false)
+            start_clear_history_mutation_worker(executor.client(), None, receiver, |_result| false)
                 .expect("启动投递失败清空 worker 失败");
         sender
             .try_submit(clear_request(31))
@@ -1169,7 +1198,7 @@ mod tests {
         let (sender, receiver) = clear_history_mutation_channel();
         let (result_sender, result_receiver) = sync_channel(1);
         let worker =
-            start_clear_history_mutation_worker(executor.client(), receiver, move |result| {
+            start_clear_history_mutation_worker(executor.client(), None, receiver, move |result| {
                 result_sender.send(result).is_ok()
             })
             .expect("启动双范围清空 worker 失败");

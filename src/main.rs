@@ -124,28 +124,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     let (delete_mutations, delete_mutation_receiver) = delete_mutation_channel();
     bind_delete_mutation_sender(delete_mutations.clone());
-    let delete_mutation_worker =
-        match start_delete_mutation_worker(storage.client(), delete_mutation_receiver, |result| {
-            post_ui_event(UiEvent::DeleteMutationCompleted(result)).is_ok()
-        }) {
-            Ok(handle) => handle,
-            Err(error) => {
-                delete_mutations.close();
-                pin_mutations.close();
-                history_requests.close();
-                history_results.close();
-                let _ = hotkey_manager.stop();
-                let _ = capture_pump.join();
-                let _ = image_worker.stop();
-                let _ = history_query_worker.join();
-                let _ = pin_mutation_worker.join();
-                return Err(error.into());
-            }
-        };
+    let delete_mutation_worker = match start_delete_mutation_worker(
+        storage.client(),
+        Some(image_worker.sender()),
+        delete_mutation_receiver,
+        |result| post_ui_event(UiEvent::DeleteMutationCompleted(result)).is_ok(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            delete_mutations.close();
+            pin_mutations.close();
+            history_requests.close();
+            history_results.close();
+            let _ = hotkey_manager.stop();
+            let _ = capture_pump.join();
+            let _ = image_worker.stop();
+            let _ = history_query_worker.join();
+            let _ = pin_mutation_worker.join();
+            return Err(error.into());
+        }
+    };
     let (clear_history_mutations, clear_history_receiver) = clear_history_mutation_channel();
     bind_clear_history_mutation_sender(clear_history_mutations.clone());
     let clear_history_worker = match start_clear_history_mutation_worker(
         storage.client(),
+        Some(image_worker.sender()),
         clear_history_receiver,
         |result| post_ui_event(UiEvent::ClearHistoryMutationCompleted(result)).is_ok(),
     ) {
@@ -180,8 +183,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "剪贴板结果泵线程异常退出")
         .map(|_| ());
-    // 捕获泵已排空所有图片事务和 finalize，随后才能停止独占资产根的 ImageWorker。
-    let image_worker_result = image_worker.stop();
     let history_query_result = history_query_worker
         .join()
         .map_err(|_| "历史查询线程异常退出")
@@ -198,6 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "清空历史线程异常退出")
         .map(|_| ());
+    // 捕获泵和图片 mutation 均已完成 finalize/回收，随后才能停止独占资产根的 ImageWorker。
+    let image_worker_result = image_worker.stop();
     // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
     let storage_result = storage
         .begin_closing()

@@ -245,6 +245,8 @@ pub struct DeleteHistoryResult {
     pub content_hash: [u8; 32],
     /// 本次事务是否实际删除了一行；`false` 表示目标此前已经不存在。
     pub was_deleted: bool,
+    /// 图片行删除提交后需要回收的资产；文本或幂等删除为空。
+    pub recycled_image: Option<ImageMetadata>,
 }
 
 /// 清空未收藏文本事务提交后的有限结果；不携带任何剪贴板正文或稳定身份。
@@ -263,6 +265,8 @@ pub struct ClearAllHistoryResult {
     pub deleted_count: u64,
     /// 唯一存储线程为本次成功事务分配的进程内单调修订号。
     pub mutation_revision: u64,
+    /// 清空事务提交后需要回收的全部图片资产；不包含正文。
+    pub recycled_images: Vec<ImageMetadata>,
 }
 
 /// 稳定分页游标；同一毫秒内用自增 ID 作为第二排序键。
@@ -390,6 +394,13 @@ enum StorageCommand {
         input: DeleteHistoryInput,
         /// 返回事务提交后的有限删除结果。
         reply: SyncSender<Result<DeleteHistoryResult, StorageError>>,
+    },
+    /// 在唯一连接上复核完整图片资产身份当前是否仍被引用。
+    IsImageAssetReferenced {
+        /// 已验证的图片资产身份。
+        metadata: ImageMetadata,
+        /// 返回精确引用状态。
+        reply: SyncSender<Result<bool, StorageError>>,
     },
     /// 在 worker 的唯一连接上用单个事务清空所有未收藏文本。
     ClearUnpinnedText {
@@ -584,6 +595,14 @@ impl StorageExecutor {
         input: DeleteHistoryInput,
     ) -> Result<DeleteHistoryResult, StorageError> {
         self.client().delete_history(input)
+    }
+
+    /// 查询完整图片资产身份当前是否仍被任一图片历史引用。
+    pub fn is_image_asset_referenced(
+        &self,
+        metadata: ImageMetadata,
+    ) -> Result<bool, StorageError> {
+        self.client().is_image_asset_referenced(metadata)
     }
 
     /// 使用单个事务删除全部未收藏文本；收藏和非文本记录保持不变。
@@ -825,6 +844,21 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 在共享 worker 上复核完整图片资产身份是否仍被引用。
+    pub fn is_image_asset_referenced(
+        &self,
+        metadata: ImageMetadata,
+    ) -> Result<bool, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::IsImageAssetReferenced {
+            metadata,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 使用复合游标读取一页历史摘要。
     pub fn list_history_summaries(
         &self,
@@ -999,6 +1033,9 @@ fn storage_thread(
             }
             StorageCommand::DeleteHistory { input, reply } => {
                 let _ = reply.send(delete_history(&mut state.connection, input));
+            }
+            StorageCommand::IsImageAssetReferenced { metadata, reply } => {
+                let _ = reply.send(is_image_asset_referenced(&state.connection, &metadata));
             }
             StorageCommand::ClearUnpinnedText { reply } => {
                 let result = reserve_mutation_revision(&state).and_then(|revision| {
@@ -1335,6 +1372,20 @@ fn clear_all_history(
     mutation_revision: u64,
 ) -> Result<ClearAllHistoryResult, StorageError> {
     let transaction = connection.transaction()?;
+    let recycled_images = {
+        let mut statement = transaction.prepare(
+            r#"
+SELECT content_hash, image_root_id, image_path, thumbnail_path,
+       image_width, image_height, content_size
+FROM clipboard_items
+WHERE item_type = 'image'
+"#,
+        )?;
+        let images = statement
+            .query_map([], image_metadata_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        images
+    };
     let deleted_count = transaction.execute("DELETE FROM clipboard_items", [])?;
     transaction.commit()?;
 
@@ -1342,6 +1393,7 @@ fn clear_all_history(
         // rusqlite 的影响行数是 usize；Rust 支持目标的 usize 不宽于 u64。
         deleted_count: deleted_count as u64,
         mutation_revision,
+        recycled_images,
     })
 }
 
@@ -1382,7 +1434,7 @@ fn set_history_pinned(
     })
 }
 
-/// 在同一事务内校验类型与稳定身份，并精确删除一条文本历史。
+/// 在同一事务内校验稳定身份并精确删除一条文本或图片历史。
 fn delete_history(
     connection: &mut Connection,
     input: DeleteHistoryInput,
@@ -1405,11 +1457,11 @@ fn delete_history(
             id,
             content_hash,
             was_deleted: false,
+            recycled_image: None,
         });
     };
 
-    // 图片文件尚无删除生命周期契约，因此存储边界只放行文本记录。
-    if item_type != "text" {
+    if item_type != "text" && item_type != "image" {
         return Err(StorageError::HistoryItemNotDeletable { id });
     }
     if stored_hash.len() != 32 {
@@ -1422,10 +1474,26 @@ fn delete_history(
         return Err(StorageError::HistoryIdentityMismatch { id });
     }
 
+    // 图片元数据必须在删除前、同一事务内读取；只有事务提交后上层才允许回收文件。
+    let recycled_image = if item_type == "image" {
+        Some(transaction.query_row(
+            r#"
+SELECT content_hash, image_root_id, image_path, thumbnail_path,
+       image_width, image_height, content_size
+FROM clipboard_items
+WHERE id = ?1 AND content_hash = ?2 AND item_type = 'image'
+"#,
+            params![id, content_hash_blob.as_slice()],
+            image_metadata_from_row,
+        )?)
+    } else {
+        None
+    };
+
     // WHERE 再次绑定全部身份与类型；触发器或并发异常导致零行时必须回滚。
     let affected = transaction.execute(
-        "DELETE FROM clipboard_items WHERE id = ?1 AND content_hash = ?2 AND item_type = 'text'",
-        params![id, content_hash_blob.as_slice()],
+        "DELETE FROM clipboard_items WHERE id = ?1 AND content_hash = ?2 AND item_type = ?3",
+        params![id, content_hash_blob.as_slice(), item_type],
     )?;
     if affected != 1 {
         return Err(StorageError::HistoryDeleteAffectedRows { id, affected });
@@ -1436,7 +1504,87 @@ fn delete_history(
         id,
         content_hash,
         was_deleted: true,
+        recycled_image,
     })
+}
+
+/// 从固定列顺序恢复已验证图片元数据；损坏行会阻止删除事务提交，避免丢失资产身份。
+fn image_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageMetadata> {
+    let content_hash_blob: Vec<u8> = row.get(0)?;
+    let content_hash: [u8; 32] = content_hash_blob.as_slice().try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::new(StorageError::InvalidImageAssetMetadata),
+        )
+    })?;
+    let root_id_blob: Vec<u8> = row.get(1)?;
+    let root_id: [u8; 32] = root_id_blob.as_slice().try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Blob,
+            Box::new(StorageError::InvalidImageAssetMetadata),
+        )
+    })?;
+    let content_size: i64 = row.get(6)?;
+    let content_size = u64::try_from(content_size)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, content_size))?;
+    ImageMetadata::new(
+        content_hash,
+        ImageAssetRootId::new(root_id),
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        content_size,
+    )
+    .map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// 精确复核当前数据库是否仍引用同一哈希、根和两条受限相对路径。
+fn is_image_asset_referenced(
+    connection: &Connection,
+    metadata: &ImageMetadata,
+) -> Result<bool, StorageError> {
+    let image_path = metadata
+        .image_path()
+        .as_path()
+        .to_str()
+        .ok_or(StorageError::InvalidImageAssetMetadata)?;
+    let thumbnail_path = metadata
+        .thumbnail_path()
+        .as_path()
+        .to_str()
+        .ok_or(StorageError::InvalidImageAssetMetadata)?;
+    connection
+        .query_row(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM clipboard_items
+    WHERE item_type = 'image'
+      AND content_hash = ?1
+      AND image_root_id = ?2
+      AND image_path = ?3
+      AND thumbnail_path = ?4
+)
+"#,
+            params![
+                metadata.content_hash().as_slice(),
+                metadata.root_id().as_bytes().as_slice(),
+                image_path,
+                thumbnail_path,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(StorageError::from)
 }
 
 /// 从 worker 的唯一连接执行筛选摘要查询，并用多取一行决定 next_cursor。
@@ -2359,6 +2507,37 @@ mod tests {
         remove_directory(&directory);
     }
 
+    /// 全量清空提交后必须返回事务实际删除的图片资产，供文件层随后回收。
+    #[test]
+    fn clear_all_history_returns_deleted_image_assets() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动图片清空存储线程失败");
+        let first = executor
+            .upsert_image(image_input(
+                67,
+                77,
+                directory.join("images-clear"),
+                100,
+            ))
+            .expect("写入待清空图片失败");
+        executor
+            .upsert_text(text_input(68, "保留计数文本", "保留计数文本", 200))
+            .expect("写入混合文本失败");
+
+        let result = executor.clear_all_history().expect("清空图片历史失败");
+        assert_eq!(result.deleted_count, 2);
+        assert_eq!(result.recycled_images, vec![first.metadata]);
+        assert_eq!(
+            executor
+                .status()
+                .expect("读取清空后状态失败")
+                .clipboard_item_count,
+            0
+        );
+        drop(executor);
+        remove_directory(&directory);
+    }
+
     /// 全量 DELETE 失败必须回滚所有行，不推进修订号，并允许后续重试复用该值。
     #[test]
     fn clear_all_history_rolls_back_and_reuses_reserved_revision_after_failure() {
@@ -2624,7 +2803,35 @@ mod tests {
         remove_directory(&directory);
     }
 
-    /// 删除 API 必须拒绝非文本记录，避免未来图片元数据与磁盘缓存失去一致性。
+    /// 图片删除事务必须返回完整资产身份，重复请求不得再次产生回收任务。
+    #[test]
+    fn delete_history_returns_image_assets_after_commit() {
+        let directory = temporary_directory();
+        let root = directory.join("images-delete");
+        let executor = StorageExecutor::open_at(&directory).expect("启动图片删除存储线程失败");
+        let inserted = executor
+            .upsert_image(image_input(79, 89, root, 700))
+            .expect("写入待删除图片失败");
+        let request = DeleteHistoryInput {
+            id: inserted.id,
+            content_hash: *inserted.metadata.content_hash(),
+        };
+
+        let deleted = executor
+            .delete_history(request.clone())
+            .expect("删除图片历史失败");
+        assert!(deleted.was_deleted);
+        assert_eq!(deleted.recycled_image, Some(inserted.metadata));
+        let repeated = executor
+            .delete_history(request)
+            .expect("重复删除图片历史失败");
+        assert!(!repeated.was_deleted);
+        assert!(repeated.recycled_image.is_none());
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 删除 API 仍须拒绝图片以外的未知类型，避免无生命周期契约的数据被误删。
     #[test]
     fn delete_history_rejects_non_text_item_without_mutation() {
         let directory = temporary_directory();

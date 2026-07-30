@@ -4,6 +4,7 @@
 //! 在 commit/rollback 前持续冻结文件身份，停止或 finalize 发送端断开时保留未知状态资产。
 
 use std::{
+    collections::VecDeque,
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -21,6 +22,7 @@ use crate::{
         decode_dib, decode_registered_png, MAX_DIB_ENCODED_BYTES, MAX_PNG_ENCODED_BYTES,
     },
     image_storage::{ImageStorageRootKind, PreparedImageStorage},
+    storage::StorageClient,
 };
 
 use super::{
@@ -30,6 +32,10 @@ use super::{
 
 /// finalize 等待轮询间隔；既能及时 stop，又避免忙轮询。
 const FINALIZE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// 删除/清空控制请求的有界容量；提交端使用背压，禁止静默覆盖回收任务。
+const CONTROL_QUEUE_CAPACITY: usize = 16;
+/// 单个资产回收的有限重试次数；进程退出不会无限等待不可恢复的文件系统错误。
+const RECYCLE_ATTEMPTS: usize = 3;
 
 /// 图片编码输入格式；DIBV5 与 DIB 保留来源身份但共享同一安全解析器。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,11 +351,31 @@ struct ImageRequest {
     response: SyncSender<Result<ImageWorkerResult, ImageWorkerError>>,
 }
 
-/// latest-wins 邮箱状态。
+/// 必须按序执行且不可覆盖的资产回收请求。
+struct RecycleRequest {
+    /// 数据库删除事务提交后返回的完整资产身份。
+    metadata: ImageMetadata,
+    /// 实际删文件前用于复核同一资产是否已被重新引用的受限存储客户端。
+    storage: StorageClient,
+    /// 回收完成回执；错误不包含本地路径。
+    response: SyncSender<Result<(), ImageWorkerError>>,
+}
+
+/// worker 每次取得的一项工作；控制任务优先，避免连续图片捕获饿死回收。
+enum ImageWork {
+    /// 容量一 latest-wins 捕获。
+    Capture(ImageRequest),
+    /// 有界 FIFO 资产回收。
+    Recycle(RecycleRequest),
+}
+
+/// latest-wins 捕获槽与不可覆盖控制 FIFO 的共享状态。
 #[derive(Default)]
 struct InboxState {
     /// 尚未开始的唯一最新请求。
     latest: Option<ImageRequest>,
+    /// 已接受且必须排空的资产回收请求。
+    controls: VecDeque<RecycleRequest>,
     /// stop 后拒绝新请求并令等待线程退出。
     closed: bool,
 }
@@ -361,6 +387,8 @@ struct ImageInbox {
     state: Mutex<InboxState>,
     /// 新请求或关闭事件唤醒 worker。
     changed: Condvar,
+    /// 控制 FIFO 腾出空间后唤醒背压提交端。
+    control_space: Condvar,
 }
 
 impl ImageInbox {
@@ -378,12 +406,36 @@ impl ImageInbox {
         Ok(())
     }
 
-    /// 等待并取走当前最新请求；关闭且无请求时结束线程。
-    fn wait_latest(&self) -> Option<ImageRequest> {
+    /// 以背压方式提交不可覆盖的资产回收；仅业务 worker 调用，不阻塞 UI 线程。
+    fn push_recycle(&self, request: RecycleRequest) -> Result<(), ImageWorkerError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ImageWorkerError::Disconnected)?;
+        while state.controls.len() >= CONTROL_QUEUE_CAPACITY && !state.closed {
+            state = self
+                .control_space
+                .wait(state)
+                .map_err(|_| ImageWorkerError::Disconnected)?;
+        }
+        if state.closed {
+            return Err(ImageWorkerError::Disconnected);
+        }
+        state.controls.push_back(request);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// 优先取走控制 FIFO，再消费当前最新捕获；关闭且排空后结束线程。
+    fn wait_work(&self) -> Option<ImageWork> {
         let mut state = self.state.lock().ok()?;
         loop {
+            if let Some(request) = state.controls.pop_front() {
+                self.control_space.notify_one();
+                return Some(ImageWork::Recycle(request));
+            }
             if let Some(request) = state.latest.take() {
-                return Some(request);
+                return Some(ImageWork::Capture(request));
             }
             if state.closed {
                 return None;
@@ -392,12 +444,13 @@ impl ImageInbox {
         }
     }
 
-    /// 关闭入口并丢弃未开始请求。
+    /// 关闭入口并丢弃未开始的捕获；已经接受的控制 FIFO 仍会完整排空。
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
             state.latest = None;
             self.changed.notify_all();
+            self.control_space.notify_all();
         }
     }
 }
@@ -418,6 +471,21 @@ impl ImageWorkerSender {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         self.inbox.push_latest(ImageRequest {
             input,
+            response: response_sender,
+        })?;
+        Ok(response_receiver)
+    }
+
+    /// 提交不可覆盖的资产回收并返回完成接收端；队列满时对业务线程施加背压。
+    pub fn recycle(
+        &self,
+        storage: StorageClient,
+        metadata: ImageMetadata,
+    ) -> Result<Receiver<Result<(), ImageWorkerError>>, ImageWorkerError> {
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        self.inbox.push_recycle(RecycleRequest {
+            metadata,
+            storage,
             response: response_sender,
         })?;
         Ok(response_receiver)
@@ -505,14 +573,21 @@ impl Drop for ImageWorker {
     }
 }
 
-/// 串行消费 latest 请求，发布成功后等待单次 finalize。
+/// 串行消费捕获和控制请求，确保发布与回收不会并发触碰同一资产。
 fn worker_loop(
     storage: PreparedImageStorage,
     inbox: Arc<ImageInbox>,
     stop_requested: Arc<AtomicBool>,
     finalize_abandoned: Arc<AtomicU64>,
 ) {
-    while let Some(request) = inbox.wait_latest() {
+    while let Some(work) = inbox.wait_work() {
+        let request = match work {
+            ImageWork::Capture(request) => request,
+            ImageWork::Recycle(request) => {
+                handle_recycle(&storage, request);
+                continue;
+            }
+        };
         let decoded = match request.input.format {
             ImageInputFormat::RegisteredPng => decode_registered_png(&request.input.bytes)
                 .map_err(|_| ImageWorkerError::PngDecodeFailed),
@@ -531,6 +606,39 @@ fn worker_loop(
         };
         handle_published(request, published, &stop_requested, &finalize_abandoned);
     }
+}
+
+/// 对已提交删除的资产执行有限重试；始终向等待的业务线程返回最终结果。
+fn handle_recycle(storage: &PreparedImageStorage, request: RecycleRequest) {
+    // 图片发布与回收由当前线程串行；在此复核后，同哈希捕获无法在删除前完成新事务，
+    // 因而可阻止迟到回收删除刚被重新采用的资产。
+    match request
+        .storage
+        .is_image_asset_referenced(request.metadata.clone())
+    {
+        Ok(true) => {
+            let _ = request.response.send(Ok(()));
+            return;
+        }
+        Ok(false) => {}
+        Err(_) => {
+            let _ = request.response.send(Err(ImageWorkerError::PublishFailed));
+            return;
+        }
+    }
+    let mut result = Err(ImageWorkerError::PublishFailed);
+    for attempt in 0..RECYCLE_ATTEMPTS {
+        result = storage
+            .recycle_assets(&request.metadata)
+            .map_err(|_| ImageWorkerError::PublishFailed);
+        if result.is_ok() {
+            break;
+        }
+        if attempt + 1 < RECYCLE_ATTEMPTS {
+            thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+        }
+    }
+    let _ = request.response.send(result);
 }
 
 /// 保留“回滚不完整”独立分类，其他发布细节统一收敛为普通发布失败。
@@ -606,12 +714,15 @@ mod tests {
     use crate::{
         domain::CanonicalImagePixels,
         image_pipeline::encode_original_png,
-        image_storage::{prepare_image_storage, ImageStoragePreference},
+        image_storage::{
+            prepare_image_storage, ImageStoragePreference, ImageStorageRootKind,
+        },
+        storage::{ImageUpsertInput, StorageExecutor},
     };
 
     use super::{
         map_publish_error, select_image_input, validate_input_length, ImageInbox, ImageInput,
-        ImageInputError, ImageInputFormat, ImagePublishError, ImageRequest, ImageWorker,
+        ImageInputError, ImageInputFormat, ImagePublishError, ImageRequest, ImageWork, ImageWorker,
         ImageWorkerError,
     };
 
@@ -716,10 +827,10 @@ mod tests {
             first_receiver.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Disconnected)
         ));
-        assert_eq!(
-            inbox.wait_latest().expect("应取得最新请求").input.bytes,
-            vec![2]
-        );
+        let Some(ImageWork::Capture(request)) = inbox.wait_work() else {
+            panic!("应取得最新捕获请求");
+        };
+        assert_eq!(request.input.bytes, vec![2]);
     }
 
     /// PNG、DIBV5、DIB 都能走独立 worker 发布并 commit。
@@ -822,6 +933,92 @@ mod tests {
         assert!(!paths.image_absolute.exists());
         assert!(!paths.thumbnail_absolute.exists());
         cleanup(&root);
+    }
+
+    /// 数据库删除提交后提交回收，必须删除原图和缩略图；重复回收保持幂等成功。
+    #[test]
+    fn recycle_removes_committed_assets_idempotently() {
+        let root = test_root("recycle");
+        let database_root = test_root("recycle-db");
+        let storage_executor =
+            StorageExecutor::open_at(&database_root).expect("启动回收引用存储失败");
+        let storage = prepare_image_storage(ImageStoragePreference::Custom(root.clone()))
+            .expect("准备存储失败");
+        let paths = storage.layout().asset_paths(&pixels().content_hash());
+        let worker = ImageWorker::start(storage).expect("启动 worker 失败");
+        let sender = worker.sender();
+        let result = sender
+            .submit(ImageInput::registered_png(png_bytes()).expect("构造输入失败"))
+            .expect("提交图片失败")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("等待图片结果超时")
+            .expect("图片处理失败");
+        let (metadata, finalize) = result.into_parts();
+        finalize.commit().expect("提交图片资产失败");
+        assert!(paths.image_absolute.exists());
+        assert!(paths.thumbnail_absolute.exists());
+
+        for _ in 0..2 {
+            sender
+                .recycle(storage_executor.client(), metadata.clone())
+                .expect("提交回收失败")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("等待回收超时")
+                .expect("回收图片资产失败");
+        }
+        assert!(!paths.image_absolute.exists());
+        assert!(!paths.thumbnail_absolute.exists());
+        worker.stop().expect("停止 worker 失败");
+        drop(storage_executor);
+        cleanup(&root);
+        cleanup(&database_root);
+    }
+
+    /// 迟到回收执行前同一资产已重新写入数据库时，必须保留新记录仍引用的文件。
+    #[test]
+    fn recycle_skips_assets_referenced_again_before_execution() {
+        let root = test_root("recycle-referenced");
+        let database_root = test_root("recycle-referenced-db");
+        let storage_executor =
+            StorageExecutor::open_at(&database_root).expect("启动引用复核存储失败");
+        let storage = prepare_image_storage(ImageStoragePreference::Custom(root.clone()))
+            .expect("准备存储失败");
+        let canonical_root = storage.canonical_root().to_path_buf();
+        let paths = storage.layout().asset_paths(&pixels().content_hash());
+        let worker = ImageWorker::start(storage).expect("启动 worker 失败");
+        let sender = worker.sender();
+        let result = sender
+            .submit(ImageInput::registered_png(png_bytes()).expect("构造输入失败"))
+            .expect("提交图片失败")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("等待图片结果超时")
+            .expect("图片处理失败");
+        let (metadata, finalize) = result.into_parts();
+        finalize.commit().expect("提交图片资产失败");
+
+        storage_executor
+            .upsert_image(ImageUpsertInput {
+                metadata: metadata.clone(),
+                canonical_root,
+                root_kind: ImageStorageRootKind::Custom,
+                source_exe: None,
+                source_app: None,
+                copied_at: 1,
+            })
+            .expect("重新写入同哈希图片失败");
+        sender
+            .recycle(storage_executor.client(), metadata)
+            .expect("提交迟到回收失败")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("等待迟到回收超时")
+            .expect("引用复核不应失败");
+        assert!(paths.image_absolute.exists());
+        assert!(paths.thumbnail_absolute.exists());
+
+        worker.stop().expect("停止 worker 失败");
+        drop(storage_executor);
+        cleanup(&root);
+        cleanup(&database_root);
     }
 
     /// finalize 句柄直接丢弃时保留资产并记录 abandoned。

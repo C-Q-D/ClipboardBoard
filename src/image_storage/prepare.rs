@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::domain::{image_metadata::content_hash_hex, ImageAssetRootId};
+use crate::domain::{image_metadata::content_hash_hex, ImageAssetRootId, ImageMetadata};
 
 use super::{
     windows_guard::{PublishShardGuard, WindowsStorageGuard},
@@ -200,6 +200,48 @@ impl PreparedImageStorage {
             staging_directory: self.layout.staging_directory().to_path_buf(),
             _shard_guard: shard_guard,
         })
+    }
+
+    /// 在当前受管根内幂等回收一组已提交删除的原图与缩略图。
+    ///
+    /// 调用方必须先提交数据库删除事务；根身份或相对路径与当前 capability 不一致时拒绝
+    /// 操作，避免根据数据库中的异常路径删除任意文件。
+    pub(crate) fn recycle_assets(
+        &self,
+        metadata: &ImageMetadata,
+    ) -> Result<(), ImageStoragePrepareError> {
+        if metadata.root_id() != self.root_id {
+            return Err(ImageStoragePrepareError::new(
+                ImageStoragePrepareErrorKind::UnsafePath,
+                "图片资产根身份不匹配",
+            ));
+        }
+        let prepared = self.prepare_asset_publish(metadata.content_hash())?;
+        if metadata.image_path().as_path() != prepared.paths.image_relative
+            || metadata.thumbnail_path().as_path() != prepared.paths.thumbnail_relative
+        {
+            return Err(ImageStoragePrepareError::new(
+                ImageStoragePrepareErrorKind::UnsafePath,
+                "图片资产路径与布局不匹配",
+            ));
+        }
+
+        // 先删可重建缩略图，再删耐久原图；任一步失败均可由同一元数据安全重试。
+        remove_managed_file(&prepared.paths.thumbnail_absolute, "回收图片缩略图")?;
+        remove_managed_file(&prepared.paths.image_absolute, "回收图片原图")?;
+        Ok(())
+    }
+}
+
+/// 删除一个已经由根和哈希双重绑定的文件；不存在代表此前已完成回收。
+fn remove_managed_file(
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), ImageStoragePrepareError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ImageStoragePrepareError::from_io(operation, error)),
     }
 }
 

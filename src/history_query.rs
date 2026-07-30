@@ -6,7 +6,7 @@
 use std::{
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -98,10 +98,12 @@ pub enum HistoryPageCoordinatorError {
     RequestAlreadyActive,
     /// 当前数据集已经到达内存上限或没有下一页游标。
     DatasetExhausted,
+    /// 续页失败后必须由显式用户动作解除重试门禁。
+    RetryRequired,
 }
 
 /// 当前唯一活动请求的三元身份。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct ActiveRequest {
     /// 数据集 generation。
     generation: HistoryDatasetGeneration,
@@ -109,6 +111,64 @@ struct ActiveRequest {
     token: HistoryRequestToken,
     /// 首页为空；WCB-INT-10 将使用复合游标。
     requested_cursor: Option<HistoryCursor>,
+    /// 请求签发时的条目上限；worker 返回更多条目时必须整页拒绝。
+    issued_limit: u32,
+    /// 请求签发的单调时钟；只用于 request-to-accept 数值观测。
+    requested_at: Instant,
+}
+
+impl ActiveRequest {
+    /// 只比较跨线程传输的稳定身份，不把本地时钟或签发上限作为响应字段。
+    fn matches(&self, result: &HistoryPageResult) -> bool {
+        self.generation == result.generation
+            && self.token == result.token
+            && self.requested_cursor == result.requested_cursor
+    }
+}
+
+/// 对外公开的纯数值分页性能快照，不包含查询、游标、路径或活动请求。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HistoryPerformanceSnapshot {
+    /// 当前数据集已成功接受的页数。
+    pub accepted_pages: u64,
+    /// 当前数据集已加载的唯一条目总数。
+    pub loaded_items: usize,
+    /// 已加载条目中的文本数量。
+    pub text_items: usize,
+    /// 已加载条目中的图片数量。
+    pub image_items: usize,
+    /// 当前数据集在页内或跨页丢弃的重复条目数。
+    pub duplicate_items: usize,
+    /// 最近一次成功页从请求签发到 UI 接受的耗时。
+    pub last_request_to_accept_duration: Duration,
+    /// 当前数据集所有成功页 request-to-accept 耗时之和。
+    pub total_request_to_accept_duration: Duration,
+}
+
+/// 协调器返回给 reducer 的纯分页决策；协调器不持有 Slint 模型。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryPageApplication {
+    /// 成功首页已经去重，应替换当前可见数据集。
+    Replace(Vec<UiClipboardItem>),
+    /// 成功续页已经去重，应追加到当前可见数据集。
+    Append(Vec<UiClipboardItem>),
+    /// 首页查询、提交或响应协议失败。
+    FirstPageFailed,
+    /// 续页查询、提交或响应协议失败，原游标仍可用于显式重试。
+    NextPageFailed,
+}
+
+/// 当前数据集的私有可变分页状态；公开快照只复制其中的数值性能字段。
+#[derive(Clone, Debug, Default)]
+struct HistoryPaginationState {
+    /// 最近成功页返回的数据库游标。
+    next_cursor: Option<HistoryCursor>,
+    /// 已接受的唯一条目数量。
+    loaded_items: usize,
+    /// 续页失败后是否等待显式重试动作。
+    retry_required: bool,
+    /// 与最终唯一条目同源更新的纯数值性能指标。
+    performance: HistoryPerformanceSnapshot,
 }
 
 /// UI 线程独占的分页身份协调器，不执行查询也不触碰 Slint。
@@ -121,6 +181,8 @@ pub struct HistoryPageCoordinator {
     current_generation: Option<HistoryDatasetGeneration>,
     /// 当前最多一个活动请求。
     active: Option<ActiveRequest>,
+    /// 当前数据集的游标、容量、重试与性能状态。
+    pagination: HistoryPaginationState,
 }
 
 impl Default for HistoryPageCoordinator {
@@ -131,6 +193,7 @@ impl Default for HistoryPageCoordinator {
             next_token: 0,
             current_generation: None,
             active: None,
+            pagination: HistoryPaginationState::default(),
         }
     }
 }
@@ -148,6 +211,7 @@ impl HistoryPageCoordinator {
         self.next_generation = next;
         self.current_generation = Some(generation);
         self.active = None;
+        self.pagination = HistoryPaginationState::default();
         Ok(generation)
     }
 
@@ -155,12 +219,22 @@ impl HistoryPageCoordinator {
     pub fn invalidate(&mut self) {
         self.current_generation = None;
         self.active = None;
+        self.pagination = HistoryPaginationState::default();
     }
 
     /// 为当前数据集分配首页请求；强制 cursor=None、limit=30。
     pub fn request_first_page(
         &mut self,
+        query: HistoryQuery,
+    ) -> Result<HistoryPageRequest, HistoryPageCoordinatorError> {
+        self.request_first_page_at(query, Instant::now())
+    }
+
+    /// 使用可注入单调时钟签发首页请求，供确定性耗时测试复用生产协议。
+    fn request_first_page_at(
+        &mut self,
         mut query: HistoryQuery,
+        requested_at: Instant,
     ) -> Result<HistoryPageRequest, HistoryPageCoordinatorError> {
         let generation = self
             .current_generation
@@ -180,6 +254,8 @@ impl HistoryPageCoordinator {
             generation,
             token,
             requested_cursor: None,
+            issued_limit: query.limit,
+            requested_at,
         });
         Ok(HistoryPageRequest {
             generation,
@@ -191,9 +267,16 @@ impl HistoryPageCoordinator {
     /// 为当前数据集分配滚动续页请求；同一数据集只允许一个活动 token。
     pub fn request_next_page(
         &mut self,
+        query: HistoryQuery,
+    ) -> Result<HistoryPageRequest, HistoryPageCoordinatorError> {
+        self.request_next_page_at(query, Instant::now())
+    }
+
+    /// 使用协调器私有游标和容量签发续页，并记录可注入的单调时钟起点。
+    fn request_next_page_at(
+        &mut self,
         mut query: HistoryQuery,
-        cursor: Option<HistoryCursor>,
-        loaded_count: usize,
+        requested_at: Instant,
     ) -> Result<HistoryPageRequest, HistoryPageCoordinatorError> {
         let generation = self
             .current_generation
@@ -201,8 +284,14 @@ impl HistoryPageCoordinator {
         if self.active.is_some() {
             return Err(HistoryPageCoordinatorError::RequestAlreadyActive);
         }
-        let cursor = cursor.ok_or(HistoryPageCoordinatorError::DatasetExhausted)?;
-        let remaining = MAX_LOADED_ITEMS.saturating_sub(loaded_count);
+        if self.pagination.retry_required {
+            return Err(HistoryPageCoordinatorError::RetryRequired);
+        }
+        let cursor = self
+            .pagination
+            .next_cursor
+            .ok_or(HistoryPageCoordinatorError::DatasetExhausted)?;
+        let remaining = MAX_LOADED_ITEMS.saturating_sub(self.pagination.loaded_items);
         if remaining == 0 {
             return Err(HistoryPageCoordinatorError::DatasetExhausted);
         }
@@ -218,6 +307,8 @@ impl HistoryPageCoordinator {
             generation,
             token,
             requested_cursor: Some(cursor),
+            issued_limit: query.limit,
+            requested_at,
         });
         Ok(HistoryPageRequest {
             generation,
@@ -226,40 +317,85 @@ impl HistoryPageCoordinator {
         })
     }
 
-    /// 接受当前可见数据集的一次精确身份响应；成功和失败都会消费活动 token。
-    pub fn accept_page(&mut self, visible: bool, result: &HistoryPageResult) -> bool {
-        let identity = ActiveRequest {
-            generation: result.generation,
-            token: result.token,
-            requested_cursor: result.requested_cursor,
-        };
-        if visible
-            && self.current_generation == Some(result.generation)
-            && self.active == Some(identity)
-        {
-            self.active = None;
-            true
-        } else {
-            false
-        }
+    /// 接受当前可见数据集的一次精确身份响应，并返回已经去重的 reducer 决策。
+    pub fn accept_page(
+        &mut self,
+        visible: bool,
+        result: HistoryPageResult,
+        current_items: &[UiClipboardItem],
+    ) -> Option<HistoryPageApplication> {
+        self.accept_page_at(visible, result, current_items, Instant::now())
     }
 
-    /// 当请求无法提交到 worker 时，按原三元身份消费活动 token。
-    pub fn fail_submission(&mut self, visible: bool, request: &HistoryPageRequest) -> bool {
-        let identity = ActiveRequest {
-            generation: request.generation,
-            token: request.token,
-            requested_cursor: request.query.cursor,
-        };
-        if visible
-            && self.current_generation == Some(request.generation)
-            && self.active == Some(identity)
+    /// 使用可注入接受时刻完成响应状态转移；时钟倒退时耗时按零处理。
+    fn accept_page_at(
+        &mut self,
+        visible: bool,
+        result: HistoryPageResult,
+        current_items: &[UiClipboardItem],
+        accepted_at: Instant,
+    ) -> Option<HistoryPageApplication> {
+        let active = self.active.as_ref()?;
+        if !visible
+            || self.current_generation != Some(result.generation)
+            || !active.matches(&result)
         {
-            self.active = None;
-            true
-        } else {
-            false
+            return None;
         }
+        let active = self.active.take().expect("已验证活动请求必须存在");
+        let is_first_page = active.requested_cursor.is_none();
+        let page = match result.outcome {
+            Ok(page) if page.items.len() <= active.issued_limit as usize => page,
+            Ok(_) | Err(_) => return Some(self.fail_page(is_first_page)),
+        };
+
+        let request_to_accept_duration = accepted_at
+            .checked_duration_since(active.requested_at)
+            .unwrap_or(Duration::ZERO);
+        let application = if is_first_page {
+            // 同一 generation 也可能因显式刷新重新签发首页；只有成功首页才能原子替换
+            // 旧数据集观测，失败首页仍保留原卡片和指标供用户继续操作。
+            self.pagination = HistoryPaginationState::default();
+            let (items, duplicate_items) = deduplicate_page(page.items, &[]);
+            self.pagination.next_cursor = (items.len() < MAX_LOADED_ITEMS)
+                .then_some(page.next_cursor)
+                .flatten();
+            self.update_success_metrics(&items, duplicate_items, request_to_accept_duration);
+            HistoryPageApplication::Replace(items)
+        } else {
+            let (items, duplicate_items) = deduplicate_page(page.items, current_items);
+            let remaining = MAX_LOADED_ITEMS.saturating_sub(current_items.len());
+            let items = items.into_iter().take(remaining).collect::<Vec<_>>();
+            self.pagination.next_cursor = (current_items.len() + items.len() < MAX_LOADED_ITEMS)
+                .then_some(page.next_cursor)
+                .flatten();
+            let mut final_items = Vec::with_capacity(current_items.len() + items.len());
+            final_items.extend_from_slice(current_items);
+            final_items.extend(items.iter().cloned());
+            self.update_success_metrics(&final_items, duplicate_items, request_to_accept_duration);
+            HistoryPageApplication::Append(items)
+        };
+        self.pagination.retry_required = false;
+        Some(application)
+    }
+
+    /// 当请求无法提交到 worker 时，按原三元身份消费活动 token并返回固定失败决策。
+    pub fn fail_submission(
+        &mut self,
+        visible: bool,
+        request: &HistoryPageRequest,
+    ) -> Option<HistoryPageApplication> {
+        let active = self.active.as_ref()?;
+        if !visible
+            || self.current_generation != Some(request.generation)
+            || active.generation != request.generation
+            || active.token != request.token
+            || active.requested_cursor != request.query.cursor
+        {
+            return None;
+        }
+        let active = self.active.take().expect("已验证活动请求必须存在");
+        Some(self.fail_page(active.requested_cursor.is_none()))
     }
 
     /// 返回是否存在尚未结束的请求，供底部边沿状态机抑制重复派发。
@@ -271,6 +407,93 @@ impl HistoryPageCoordinator {
     pub const fn current_generation(&self) -> Option<HistoryDatasetGeneration> {
         self.current_generation
     }
+
+    /// 返回公开纯性能快照；内部游标、重试和活动 token 不会越过该边界。
+    pub const fn performance_snapshot(&self) -> HistoryPerformanceSnapshot {
+        self.pagination.performance
+    }
+
+    /// 返回当前是否等待显式续页重试；只在 crate 内供 reducer 驱动 UI 提示。
+    pub(crate) const fn retry_required(&self) -> bool {
+        self.pagination.retry_required
+    }
+
+    /// 显式用户动作解除一次续页重试门禁，下一次请求仍会分配新 token。
+    pub(crate) fn allow_retry(&mut self) {
+        self.pagination.retry_required = false;
+    }
+
+    /// 返回最近成功页的数据库游标，仅供 reducer 和确定性测试验证内部状态。
+    #[cfg(test)]
+    pub(crate) const fn next_cursor(&self) -> Option<HistoryCursor> {
+        self.pagination.next_cursor
+    }
+
+    /// 把当前页失败映射到固定决策；续页失败保留原游标并进入重试门禁。
+    fn fail_page(&mut self, is_first_page: bool) -> HistoryPageApplication {
+        if is_first_page {
+            HistoryPageApplication::FirstPageFailed
+        } else {
+            self.pagination.retry_required = true;
+            HistoryPageApplication::NextPageFailed
+        }
+    }
+
+    /// 由最终唯一卡片集合一次性更新容量、分类和 request-to-accept 数值。
+    fn update_success_metrics(
+        &mut self,
+        items: &[UiClipboardItem],
+        duplicate_items: usize,
+        duration: Duration,
+    ) {
+        let (text_items, image_items) = count_item_types(items);
+        self.pagination.loaded_items = items.len();
+        self.pagination.performance.accepted_pages =
+            self.pagination.performance.accepted_pages.saturating_add(1);
+        self.pagination.performance.loaded_items = items.len();
+        self.pagination.performance.text_items = text_items;
+        self.pagination.performance.image_items = image_items;
+        self.pagination.performance.duplicate_items = self
+            .pagination
+            .performance
+            .duplicate_items
+            .saturating_add(duplicate_items);
+        self.pagination.performance.last_request_to_accept_duration = duration;
+        self.pagination.performance.total_request_to_accept_duration = self
+            .pagination
+            .performance
+            .total_request_to_accept_duration
+            .checked_add(duration)
+            .unwrap_or(Duration::MAX);
+    }
+}
+
+/// 按稳定记录 ID 对当前页去重；返回数据库顺序和本次丢弃数量。
+fn deduplicate_page(
+    items: Vec<UiClipboardItem>,
+    existing: &[UiClipboardItem],
+) -> (Vec<UiClipboardItem>, usize) {
+    let mut seen = existing
+        .iter()
+        .map(|item| item.id)
+        .collect::<std::collections::HashSet<_>>();
+    let original_len = items.len();
+    let items = items
+        .into_iter()
+        .filter(|item| seen.insert(item.id))
+        .collect::<Vec<_>>();
+    let duplicate_items = original_len.saturating_sub(items.len());
+    (items, duplicate_items)
+}
+
+/// 从最终唯一卡片集合统计文本和图片数量，保证分类数与 loaded_items 同源。
+fn count_item_types(items: &[UiClipboardItem]) -> (usize, usize) {
+    items
+        .iter()
+        .fold((0, 0), |(text, image), item| match item.kind {
+            UiClipboardItemKind::Text => (text.saturating_add(1), image),
+            UiClipboardItemKind::Image(_) => (text, image.saturating_add(1)),
+        })
 }
 
 /// latest-wins 请求邮箱的共享状态。
@@ -673,6 +896,52 @@ mod tests {
         }
     }
 
+    /// 生成只含稳定身份的文本卡片，分页测试不需要真实正文或文件系统。
+    fn text_item(id: u64) -> UiClipboardItem {
+        UiClipboardItem {
+            id,
+            preview: format!("文本-{id}"),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [id as u8; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Text,
+        }
+    }
+
+    /// 生成只含虚拟缩略图定位的图片卡片，测试不会读取该路径。
+    fn image_item(id: u64) -> UiClipboardItem {
+        UiClipboardItem {
+            id,
+            preview: format!("图片-{id}"),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [id as u8; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Image(UiImageSummary {
+                thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
+                width: 320,
+                height: 200,
+            }),
+        }
+    }
+
+    /// 用指定卡片和数据库游标构造与请求精确匹配的成功结果。
+    fn successful_result(
+        request: &HistoryPageRequest,
+        items: Vec<UiClipboardItem>,
+        next_cursor: Option<HistoryCursor>,
+    ) -> HistoryPageResult {
+        HistoryPageResult {
+            generation: request.generation,
+            token: request.token,
+            requested_cursor: request.query.cursor,
+            outcome: Ok(UiHistoryPage { items, next_cursor }),
+        }
+    }
+
     /// 旧 generation、错误 token、非空 cursor 和重复响应都必须被拒绝。
     #[test]
     fn 首页响应必须精确匹配活动三元身份且只接受一次() {
@@ -683,16 +952,19 @@ mod tests {
             .expect("创建首页请求失败");
         let mut wrong = empty_result(&request);
         wrong.token = HistoryRequestToken(request.token.as_u64() + 1);
-        assert!(!coordinator.accept_page(true, &wrong));
+        assert_eq!(coordinator.accept_page(true, wrong, &[]), None);
         wrong = empty_result(&request);
         wrong.requested_cursor = Some(HistoryCursor {
             copied_at: 1,
             id: 1,
         });
-        assert!(!coordinator.accept_page(true, &wrong));
+        assert_eq!(coordinator.accept_page(true, wrong, &[]), None);
         let result = empty_result(&request);
-        assert!(coordinator.accept_page(true, &result));
-        assert!(!coordinator.accept_page(true, &result));
+        assert_eq!(
+            coordinator.accept_page(true, result.clone(), &[]),
+            Some(HistoryPageApplication::Replace(Vec::new()))
+        );
+        assert_eq!(coordinator.accept_page(true, result, &[]), None);
     }
 
     /// 续页批量必须按 2,000 上限收缩，并拒绝覆盖同代次活动请求。
@@ -705,13 +977,13 @@ mod tests {
         for (loaded, expected) in [(1_950, 50), (1_980, 20), (1_999, 1)] {
             let mut coordinator = HistoryPageCoordinator::default();
             coordinator.begin_dataset().unwrap();
-            let request = coordinator
-                .request_next_page(query("page"), Some(cursor), loaded)
-                .unwrap();
+            coordinator.pagination.next_cursor = Some(cursor);
+            coordinator.pagination.loaded_items = loaded;
+            let request = coordinator.request_next_page(query("page")).unwrap();
             assert_eq!(request.query.cursor, Some(cursor));
             assert_eq!(request.query.limit, expected);
             assert_eq!(
-                coordinator.request_next_page(query("duplicate"), Some(cursor), loaded),
+                coordinator.request_next_page(query("duplicate")),
                 Err(HistoryPageCoordinatorError::RequestAlreadyActive)
             );
         }
@@ -719,8 +991,10 @@ mod tests {
         for loaded in [2_000, 2_001] {
             let mut coordinator = HistoryPageCoordinator::default();
             coordinator.begin_dataset().unwrap();
+            coordinator.pagination.next_cursor = Some(cursor);
+            coordinator.pagination.loaded_items = loaded;
             assert_eq!(
-                coordinator.request_next_page(query("full"), Some(cursor), loaded),
+                coordinator.request_next_page(query("full")),
                 Err(HistoryPageCoordinatorError::DatasetExhausted)
             );
         }
@@ -735,17 +1009,20 @@ mod tests {
         };
         let mut coordinator = HistoryPageCoordinator::default();
         coordinator.begin_dataset().unwrap();
-        let request = coordinator
-            .request_next_page(query("page"), Some(cursor), 30)
-            .unwrap();
+        coordinator.pagination.next_cursor = Some(cursor);
+        coordinator.pagination.loaded_items = 30;
+        let request = coordinator.request_next_page(query("page")).unwrap();
         let mut wrong = empty_result(&request);
         wrong.requested_cursor = Some(HistoryCursor {
             copied_at: 99,
             id: 9,
         });
-        assert!(!coordinator.accept_page(true, &wrong));
-        assert!(coordinator.fail_submission(true, &request));
-        assert!(!coordinator.fail_submission(true, &request));
+        assert_eq!(coordinator.accept_page(true, wrong, &[]), None);
+        assert_eq!(
+            coordinator.fail_submission(true, &request),
+            Some(HistoryPageApplication::NextPageFailed)
+        );
+        assert_eq!(coordinator.fail_submission(true, &request), None);
         assert!(!coordinator.has_active_request());
     }
 
@@ -978,7 +1255,434 @@ mod tests {
             panic!("转换结果应为图片");
         };
         assert_eq!((image.width, image.height), (320, 200));
-        assert!(image.thumbnail_path.ends_with(format!("aa/{hash_hex}.webp")));
+        assert!(image
+            .thumbnail_path
+            .ends_with(format!("aa/{hash_hex}.webp")));
         assert!(item.copy_enabled());
+    }
+
+    /// 文本与图片页必须更新同一份纯性能快照，分类数与唯一条目总数保持同源。
+    #[test]
+    fn 混合页共用统一分页状态和性能快照() {
+        let started_at = Instant::now();
+        let accepted_at = started_at + Duration::from_millis(17);
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        let request = coordinator
+            .request_first_page_at(query("mixed"), started_at)
+            .expect("创建首页请求失败");
+        let text = UiClipboardItem {
+            id: 1,
+            preview: "文本".to_owned(),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [1; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Text,
+        };
+        let image = UiClipboardItem {
+            id: 2,
+            preview: "图片".to_owned(),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [2; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Image(UiImageSummary {
+                thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
+                width: 320,
+                height: 200,
+            }),
+        };
+        let result = HistoryPageResult {
+            generation: request.generation,
+            token: request.token,
+            requested_cursor: request.query.cursor,
+            outcome: Ok(UiHistoryPage {
+                items: vec![text.clone(), image.clone(), image.clone()],
+                next_cursor: None,
+            }),
+        };
+
+        assert_eq!(
+            coordinator.accept_page_at(true, result, &[], accepted_at),
+            Some(HistoryPageApplication::Replace(vec![text, image]))
+        );
+        assert_eq!(
+            coordinator.performance_snapshot(),
+            HistoryPerformanceSnapshot {
+                accepted_pages: 1,
+                loaded_items: 2,
+                text_items: 1,
+                image_items: 1,
+                duplicate_items: 1,
+                last_request_to_accept_duration: Duration::from_millis(17),
+                total_request_to_accept_duration: Duration::from_millis(17),
+            }
+        );
+    }
+
+    /// worker 返回超过签发 limit 的页必须整页失败，不能截断后接受已经前移的游标。
+    #[test]
+    fn 超过签发_limit_的续页整页拒绝并保留原游标() {
+        let started_at = Instant::now();
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        let first = coordinator
+            .request_first_page_at(query("oversized"), started_at)
+            .expect("创建首页请求失败");
+        let first_item = UiClipboardItem {
+            id: 1,
+            preview: "首页".to_owned(),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [1; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Text,
+        };
+        let original_cursor = HistoryCursor {
+            copied_at: 100,
+            id: 1,
+        };
+        let first_result = HistoryPageResult {
+            generation: first.generation,
+            token: first.token,
+            requested_cursor: first.query.cursor,
+            outcome: Ok(UiHistoryPage {
+                items: vec![first_item.clone()],
+                next_cursor: Some(original_cursor),
+            }),
+        };
+        let first_application = coordinator
+            .accept_page_at(
+                true,
+                first_result,
+                &[],
+                started_at + Duration::from_millis(3),
+            )
+            .expect("首页应被接受");
+        assert_eq!(
+            first_application,
+            HistoryPageApplication::Replace(vec![first_item.clone()])
+        );
+        let metrics_before = coordinator.performance_snapshot();
+        let next = coordinator
+            .request_next_page_at(query("oversized"), started_at + Duration::from_millis(4))
+            .expect("创建续页请求失败");
+        assert_eq!(next.query.limit, NEXT_PAGE_LIMIT);
+        let oversized_items = (2..=u64::from(NEXT_PAGE_LIMIT) + 2)
+            .map(|id| UiClipboardItem {
+                id,
+                preview: format!("续页-{id}"),
+                source: "测试".to_owned(),
+                relative_time: "刚刚".to_owned(),
+                content_hash: [id as u8; 32],
+                copy_count: 1,
+                is_pinned: false,
+                kind: UiClipboardItemKind::Text,
+            })
+            .collect();
+        let advanced_cursor = HistoryCursor {
+            copied_at: 1,
+            id: 999,
+        };
+        let oversized_result = HistoryPageResult {
+            generation: next.generation,
+            token: next.token,
+            requested_cursor: next.query.cursor,
+            outcome: Ok(UiHistoryPage {
+                items: oversized_items,
+                next_cursor: Some(advanced_cursor),
+            }),
+        };
+
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                oversized_result,
+                &[first_item],
+                started_at + Duration::from_millis(8),
+            ),
+            Some(HistoryPageApplication::NextPageFailed)
+        );
+        assert_eq!(coordinator.next_cursor(), Some(original_cursor));
+        assert!(coordinator.retry_required());
+        assert_eq!(coordinator.performance_snapshot(), metrics_before);
+    }
+
+    /// 显式测试时钟早于签发起点时耗时按零处理，不能 panic 或产生虚假大值。
+    #[test]
+    fn 请求接受时钟倒退按零计时() {
+        let accepted_at = Instant::now();
+        let requested_at = accepted_at + Duration::from_millis(10);
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        let request = coordinator
+            .request_first_page_at(query("clock"), requested_at)
+            .expect("创建首页请求失败");
+
+        assert_eq!(
+            coordinator.accept_page_at(true, empty_result(&request), &[], accepted_at),
+            Some(HistoryPageApplication::Replace(Vec::new()))
+        );
+        assert_eq!(
+            coordinator
+                .performance_snapshot()
+                .last_request_to_accept_duration,
+            Duration::ZERO
+        );
+    }
+
+    /// 同一 generation 再次成功首页必须替换旧页、续页和累计观测，不能沿用旧指标。
+    #[test]
+    fn 同代次再次成功首页重置旧分页观测() {
+        let started_at = Instant::now();
+        let mut coordinator = HistoryPageCoordinator::default();
+        let generation = coordinator.begin_dataset().expect("建立数据集失败");
+        let first = coordinator
+            .request_first_page_at(query("refresh"), started_at)
+            .expect("创建首次首页失败");
+        let original_cursor = HistoryCursor {
+            copied_at: 90,
+            id: 2,
+        };
+        let first_items = vec![text_item(1), image_item(2)];
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(&first, first_items.clone(), Some(original_cursor)),
+                &[],
+                started_at + Duration::from_millis(2),
+            ),
+            Some(HistoryPageApplication::Replace(first_items.clone()))
+        );
+        let next = coordinator
+            .request_next_page_at(query("refresh"), started_at + Duration::from_millis(3))
+            .expect("创建续页失败");
+        let appended = text_item(3);
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(&next, vec![first_items[0].clone(), appended.clone()], None,),
+                &first_items,
+                started_at + Duration::from_millis(7),
+            ),
+            Some(HistoryPageApplication::Append(vec![appended]))
+        );
+        assert_eq!(coordinator.performance_snapshot().accepted_pages, 2);
+        assert_eq!(coordinator.performance_snapshot().duplicate_items, 1);
+
+        let refreshed = coordinator
+            .request_first_page_at(query("refresh"), started_at + Duration::from_millis(10))
+            .expect("同代次创建刷新首页失败");
+        assert_eq!(refreshed.generation, generation);
+        let refreshed_text = text_item(10);
+        let refreshed_image = image_item(11);
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(
+                    &refreshed,
+                    vec![
+                        refreshed_text.clone(),
+                        refreshed_image.clone(),
+                        refreshed_image.clone(),
+                    ],
+                    None,
+                ),
+                &[first_items[0].clone(), first_items[1].clone(), text_item(3)],
+                started_at + Duration::from_millis(16),
+            ),
+            Some(HistoryPageApplication::Replace(vec![
+                refreshed_text,
+                refreshed_image,
+            ]))
+        );
+        assert_eq!(
+            coordinator.performance_snapshot(),
+            HistoryPerformanceSnapshot {
+                accepted_pages: 1,
+                loaded_items: 2,
+                text_items: 1,
+                image_items: 1,
+                duplicate_items: 1,
+                last_request_to_accept_duration: Duration::from_millis(6),
+                total_request_to_accept_duration: Duration::from_millis(6),
+            }
+        );
+        assert!(!coordinator.retry_required());
+        assert_eq!(coordinator.next_cursor(), None);
+    }
+
+    /// worker 返回条目数恰好等于签发 limit 时合法，不能把满页误判为协议超限。
+    #[test]
+    fn 等于签发_limit_的首页合法接受() {
+        let started_at = Instant::now();
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        let request = coordinator
+            .request_first_page_at(query("exact"), started_at)
+            .expect("创建首页失败");
+        let items = (1..=u64::from(FIRST_PAGE_LIMIT))
+            .map(text_item)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(&request, items.clone(), None),
+                &[],
+                started_at + Duration::from_millis(1),
+            ),
+            Some(HistoryPageApplication::Replace(items))
+        );
+        assert_eq!(
+            coordinator.performance_snapshot().loaded_items,
+            FIRST_PAGE_LIMIT as usize
+        );
+    }
+
+    /// 容量只剩 20 条时按收缩 limit 校验，返回 21 条必须整页失败且不接受前移游标。
+    #[test]
+    fn 收缩后的签发_limit_仍执行超限整页拒绝() {
+        let started_at = Instant::now();
+        let original_cursor = HistoryCursor {
+            copied_at: 50,
+            id: 1_980,
+        };
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        coordinator.pagination.next_cursor = Some(original_cursor);
+        coordinator.pagination.loaded_items = 1_980;
+        coordinator.pagination.performance.loaded_items = 1_980;
+        coordinator.pagination.performance.text_items = 1_980;
+        let metrics_before = coordinator.performance_snapshot();
+        let request = coordinator
+            .request_next_page_at(query("remaining"), started_at)
+            .expect("创建收缩续页失败");
+        assert_eq!(request.query.limit, 20);
+        let oversized = (2_000..=2_020).map(text_item).collect::<Vec<_>>();
+
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(
+                    &request,
+                    oversized,
+                    Some(HistoryCursor {
+                        copied_at: 1,
+                        id: 2_020,
+                    }),
+                ),
+                &[],
+                started_at + Duration::from_millis(2),
+            ),
+            Some(HistoryPageApplication::NextPageFailed)
+        );
+        assert_eq!(coordinator.next_cursor(), Some(original_cursor));
+        assert_eq!(coordinator.performance_snapshot(), metrics_before);
+    }
+
+    /// 错误身份和匹配失败结果都不得改变已经成功接受的页数、分类或耗时。
+    #[test]
+    fn 迟到与失败结果不污染成功性能指标() {
+        let started_at = Instant::now();
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        let first = coordinator
+            .request_first_page_at(query("stable"), started_at)
+            .expect("创建首页失败");
+        let cursor = HistoryCursor {
+            copied_at: 10,
+            id: 1,
+        };
+        let current = vec![text_item(1)];
+        coordinator.accept_page_at(
+            true,
+            successful_result(&first, current.clone(), Some(cursor)),
+            &[],
+            started_at + Duration::from_millis(3),
+        );
+        let metrics_before = coordinator.performance_snapshot();
+        let next = coordinator
+            .request_next_page_at(query("stable"), started_at + Duration::from_millis(4))
+            .expect("创建续页失败");
+        let mut stale = successful_result(&next, vec![image_item(2)], None);
+        stale.token = HistoryRequestToken(next.token.as_u64().saturating_add(1));
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                stale,
+                &current,
+                started_at + Duration::from_millis(8),
+            ),
+            None
+        );
+        assert_eq!(coordinator.performance_snapshot(), metrics_before);
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                HistoryPageResult {
+                    generation: next.generation,
+                    token: next.token,
+                    requested_cursor: next.query.cursor,
+                    outcome: Err(HistoryQueryFailure::StorageUnavailable),
+                },
+                &current,
+                started_at + Duration::from_millis(9),
+            ),
+            Some(HistoryPageApplication::NextPageFailed)
+        );
+        assert_eq!(coordinator.performance_snapshot(), metrics_before);
+    }
+
+    /// 累计 request-to-accept 耗时接近 Duration 上限时必须饱和而不是回绕。
+    #[test]
+    fn 累计请求接受耗时在上限处饱和() {
+        let started_at = Instant::now();
+        let cursor = HistoryCursor {
+            copied_at: 10,
+            id: 1,
+        };
+        let current = vec![text_item(1)];
+        let mut coordinator = HistoryPageCoordinator::default();
+        coordinator.begin_dataset().expect("建立数据集失败");
+        coordinator.pagination.next_cursor = Some(cursor);
+        coordinator.pagination.loaded_items = 1;
+        coordinator.pagination.performance = HistoryPerformanceSnapshot {
+            accepted_pages: 1,
+            loaded_items: 1,
+            text_items: 1,
+            total_request_to_accept_duration: Duration::MAX
+                .checked_sub(Duration::from_millis(5))
+                .expect("测试上限减法应有效"),
+            ..HistoryPerformanceSnapshot::default()
+        };
+        let request = coordinator
+            .request_next_page_at(query("duration"), started_at)
+            .expect("创建续页失败");
+
+        assert_eq!(
+            coordinator.accept_page_at(
+                true,
+                successful_result(&request, vec![image_item(2)], None),
+                &current,
+                started_at + Duration::from_millis(10),
+            ),
+            Some(HistoryPageApplication::Append(vec![image_item(2)]))
+        );
+        let metrics = coordinator.performance_snapshot();
+        assert_eq!(metrics.accepted_pages, 2);
+        assert_eq!(
+            metrics.last_request_to_accept_duration,
+            Duration::from_millis(10)
+        );
+        assert_eq!(metrics.total_request_to_accept_duration, Duration::MAX);
+        assert_eq!(
+            metrics.text_items + metrics.image_items,
+            metrics.loaded_items
+        );
     }
 }

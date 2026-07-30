@@ -14,8 +14,9 @@ use crate::history_mutation::{
     DeleteMutationSender, PinMutationRequest, PinMutationResult, PinMutationSender,
 };
 use crate::history_query::{
-    HistoryPageCoordinator, HistoryPageCoordinatorError, HistoryPageRequest, HistoryPageResult,
-    HistoryRequestSender, HistoryResultReceiver, MAX_LOADED_ITEMS,
+    HistoryPageApplication, HistoryPageCoordinator, HistoryPageCoordinatorError,
+    HistoryPageRequest, HistoryPageResult, HistoryPerformanceSnapshot, HistoryRequestSender,
+    HistoryResultReceiver, MAX_LOADED_ITEMS,
 };
 use crate::search::{SearchCoordinator, SearchCoordinatorError};
 use crate::storage::HistoryQuery;
@@ -153,10 +154,6 @@ struct UiState {
     history_pages: HistoryPageCoordinator,
     /// 本次 reducer 事件产生的最新后台请求；事件入口会在离开状态借用后提交。
     pending_history_request: Option<HistoryPageRequest>,
-    /// 当前成功首页返回的下一页游标，WCB-INT-10 将据此续页。
-    next_history_cursor: Option<crate::storage::HistoryCursor>,
-    /// 续页失败后只允许显式重试或离开底部再进入，布局重绘不能形成请求风暴。
-    history_retry_required: bool,
     /// 上一次几何通知是否位于底部阈值内，用于检测 outside→inside 边沿。
     history_was_near_bottom: bool,
     /// 当前唯一在途收藏请求；隐藏面板不会取消已经接受的持久化事务。
@@ -213,8 +210,6 @@ impl Default for UiState {
             search_generation: None,
             history_pages: HistoryPageCoordinator::default(),
             pending_history_request: None,
-            next_history_cursor: None,
-            history_retry_required: false,
             history_was_near_bottom: false,
             pending_pin_mutation: None,
             next_pin_mutation_token: 1,
@@ -291,8 +286,6 @@ impl UiState {
                 self.search.cancel();
                 self.history_pages.invalidate();
                 self.pending_history_request = None;
-                self.next_history_cursor = None;
-                self.history_retry_required = false;
                 self.history_was_near_bottom = false;
                 UiAction::Quit
             }
@@ -375,8 +368,8 @@ impl UiState {
                 UiAction::None
             }
             UiEvent::RetryHistoryPage => {
-                if self.panel_visible && self.history_retry_required {
-                    self.history_retry_required = false;
+                if self.panel_visible && self.history_pages.retry_required() {
+                    self.history_pages.allow_retry();
                     self.request_next_history_page();
                 }
                 UiAction::None
@@ -489,8 +482,6 @@ impl UiState {
         self.search.cancel();
         self.history_pages.invalidate();
         self.pending_history_request = None;
-        self.next_history_cursor = None;
-        self.history_retry_required = false;
         self.history_was_near_bottom = false;
     }
 
@@ -941,8 +932,6 @@ impl UiState {
         self.search_status = SearchStatus::Idle;
         self.search_generation = None;
         self.pending_history_request = None;
-        self.next_history_cursor = None;
-        self.history_retry_required = false;
         self.history_was_near_bottom = false;
         self.snapshot.selected_index = None;
         self.pin_error_visible = false;
@@ -957,8 +946,6 @@ impl UiState {
 
     /// 推进 SQLite 数据集；可见时立即生成当前筛选的首页请求。
     fn begin_history_dataset(&mut self, request_now: bool) {
-        self.next_history_cursor = None;
-        self.history_retry_required = false;
         self.history_was_near_bottom = false;
         match self.history_pages.begin_dataset() {
             Ok(_) if request_now => {
@@ -981,7 +968,8 @@ impl UiState {
                 HistoryPageCoordinatorError::TokenExhausted
                 | HistoryPageCoordinatorError::NoActiveDataset
                 | HistoryPageCoordinatorError::RequestAlreadyActive
-                | HistoryPageCoordinatorError::DatasetExhausted,
+                | HistoryPageCoordinatorError::DatasetExhausted
+                | HistoryPageCoordinatorError::RetryRequired,
             ) => self.mark_history_identity_error(),
         }
     }
@@ -1013,29 +1001,27 @@ impl UiState {
         if !entered_bottom {
             return;
         }
-        if self.history_retry_required {
+        if self.history_pages.retry_required() {
             // 离开后重新进入等同一次明确重试，仍沿用成功页保存的数据库游标。
-            self.history_retry_required = false;
+            self.history_pages.allow_retry();
         }
         self.request_next_history_page();
     }
 
     /// 按当前筛选、数据库游标和剩余容量生成唯一续页请求。
     fn request_next_history_page(&mut self) {
-        if self.history_pages.has_active_request()
-            || self.next_history_cursor.is_none()
-            || self.snapshot.items.len() >= MAX_LOADED_ITEMS
+        if self.history_pages.has_active_request() || self.snapshot.items.len() >= MAX_LOADED_ITEMS
         {
             return;
         }
-        match self.history_pages.request_next_page(
-            self.build_search_query(),
-            self.next_history_cursor,
-            self.snapshot.items.len(),
-        ) {
+        match self
+            .history_pages
+            .request_next_page(self.build_search_query())
+        {
             Ok(request) => self.pending_history_request = Some(request),
             Err(HistoryPageCoordinatorError::RequestAlreadyActive)
-            | Err(HistoryPageCoordinatorError::DatasetExhausted) => {}
+            | Err(HistoryPageCoordinatorError::DatasetExhausted)
+            | Err(HistoryPageCoordinatorError::RetryRequired) => {}
             Err(_) => self.mark_history_identity_error(),
         }
     }
@@ -1057,8 +1043,6 @@ impl UiState {
             self.mark_history_identity_error();
             return UiAction::None;
         }
-        self.next_history_cursor = None;
-        self.history_retry_required = false;
         self.history_was_near_bottom = false;
 
         match self.search.submit(self.build_search_query(), now) {
@@ -1120,45 +1104,28 @@ impl UiState {
 
     /// 应用从 latest 结果槽提取的首页或续页；只接受精确三元身份。
     fn apply_history_page_result(&mut self, result: HistoryPageResult) {
-        if !self.history_pages.accept_page(self.panel_visible, &result) {
+        let selected_identity = self
+            .snapshot
+            .selected_index
+            .and_then(|index| self.snapshot.items.get(index))
+            .map(|item| (item.id, item.content_hash));
+        let Some(application) =
+            self.history_pages
+                .accept_page(self.panel_visible, result, &self.snapshot.items)
+        else {
             return;
-        }
-        let is_first_page = result.requested_cursor.is_none();
-        match result.outcome {
-            Ok(page) => {
-                self.history_retry_required = false;
-                let selected_identity = self
-                    .snapshot
-                    .selected_index
-                    .and_then(|index| self.snapshot.items.get(index))
-                    .map(|item| (item.id, item.content_hash));
-                self.next_history_cursor = page.next_cursor;
-                if is_first_page {
-                    self.history.replace(page.items.clone());
-                    self.snapshot.items = page.items;
-                    self.snapshot.selected_index = selected_identity.and_then(|(id, hash)| {
-                        self.snapshot
-                            .items
-                            .iter()
-                            .position(|item| item.id == id && item.content_hash == hash)
-                    });
-                    self.select_first_if_needed();
-                } else {
-                    let mut seen = self
-                        .snapshot
+        };
+        match application {
+            HistoryPageApplication::Replace(items) => {
+                self.history.replace(items.clone());
+                self.snapshot.items = items;
+                self.snapshot.selected_index = selected_identity.and_then(|(id, hash)| {
+                    self.snapshot
                         .items
                         .iter()
-                        .map(|item| item.id)
-                        .collect::<std::collections::HashSet<_>>();
-                    let remaining = MAX_LOADED_ITEMS.saturating_sub(self.snapshot.items.len());
-                    self.snapshot.items.extend(
-                        page.items
-                            .into_iter()
-                            .filter(|item| seen.insert(item.id))
-                            .take(remaining),
-                    );
-                    self.history.replace(self.snapshot.items.clone());
-                }
+                        .position(|item| item.id == id && item.content_hash == hash)
+                });
+                self.select_first_if_needed();
                 self.prune_capture_revisions();
                 self.search_status = if self.snapshot.items.is_empty() {
                     SearchStatus::Empty
@@ -1166,28 +1133,34 @@ impl UiState {
                     SearchStatus::Results
                 };
             }
-            Err(_) => {
-                if is_first_page {
-                    self.search_status = SearchStatus::Error;
+            HistoryPageApplication::Append(items) => {
+                self.snapshot.items.extend(items);
+                self.history.replace(self.snapshot.items.clone());
+                self.prune_capture_revisions();
+                self.search_status = if self.snapshot.items.is_empty() {
+                    SearchStatus::Empty
                 } else {
-                    self.history_retry_required = true;
-                }
+                    SearchStatus::Results
+                };
             }
+            HistoryPageApplication::FirstPageFailed => self.search_status = SearchStatus::Error,
+            HistoryPageApplication::NextPageFailed => {}
         }
     }
 
     /// 查询请求未能进入 worker 时按原请求身份收口；续页进入固定重试态，首页显示固定错误。
     fn mark_history_submission_failed(&mut self, request: &HistoryPageRequest) {
-        if !self
+        match self
             .history_pages
             .fail_submission(self.panel_visible, request)
         {
-            return;
-        }
-        if request.query.cursor.is_some() {
-            self.history_retry_required = true;
-        } else {
-            self.search_status = SearchStatus::Error;
+            Some(HistoryPageApplication::FirstPageFailed) => {
+                self.search_status = SearchStatus::Error
+            }
+            Some(HistoryPageApplication::NextPageFailed)
+            | Some(HistoryPageApplication::Replace(_))
+            | Some(HistoryPageApplication::Append(_))
+            | None => {}
         }
     }
 
@@ -1270,6 +1243,7 @@ impl UiState {
             search_filter: self.search_filter,
             search_status: self.search_status,
             search_generation: self.search_generation,
+            history_performance: self.history_pages.performance_snapshot(),
             panel_visible: self.panel_visible,
             panel_generation: self.panel_generation,
             quitting: self.quitting,
@@ -1337,6 +1311,8 @@ pub struct UiStateSnapshot {
     pub search_status: SearchStatus,
     /// 当前搜索代次；旧计时器测试使用它证明结果没有闪回。
     pub search_generation: Option<u64>,
+    /// 当前数据集的纯数值分页性能快照；不包含游标、重试状态或活动请求。
+    pub history_performance: HistoryPerformanceSnapshot,
     /// 当前看板可见性。
     pub panel_visible: bool,
     /// 当前面板打开代次；只用于验证关闭事件是否仍属于当前实例。
@@ -1667,7 +1643,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.search_text.clone(),
                 state.search_filter,
                 state.search_status,
-                state.history_retry_required,
+                state.history_pages.retry_required(),
                 state.pending_pin_mutation,
                 state.pin_error_visible,
                 state.pending_delete_mutation,
@@ -1694,7 +1670,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     state.mark_history_submission_failed(&failed_request);
                     snapshot = state.snapshot.clone();
                     search_status = state.search_status;
-                    history_retry_required = state.history_retry_required;
+                    history_retry_required = state.history_pages.retry_required();
                 });
             }
         }
@@ -2450,8 +2426,8 @@ mod tests {
     #[cfg(windows)]
     use super::{activation_attempt, ActivationAttempt};
     use super::{
-        bind_clear_history_mutation_sender, close_clear_history_mutation_bridge,
-        apply_thumbnail_result, event_may_refresh_model, perform_show_action,
+        apply_thumbnail_result, bind_clear_history_mutation_sender,
+        close_clear_history_mutation_bridge, event_may_refresh_model, perform_show_action,
         reserve_thumbnail_cache_slot, schedule_thumbnail_requests, selection_item_bounds,
         selection_viewport_y, visible_snapshot_items, UiAction, UiState,
         CLEAR_ALL_CONFIRMATION_PHRASE, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
@@ -3178,7 +3154,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             (1..=85).collect::<Vec<_>>()
         );
-        assert!(state.next_history_cursor.is_none());
+        assert!(state.history_pages.next_cursor().is_none());
     }
 
     /// 同一底部区域重复通知不得重发；失败后只有点击或离开再进入可生成新 token。
@@ -3209,8 +3185,8 @@ mod tests {
             &failed,
             Err(HistoryQueryFailure::StorageUnavailable),
         ));
-        assert!(state.history_retry_required);
-        assert_eq!(state.next_history_cursor, Some(cursor));
+        assert!(state.history_pages.retry_required());
+        assert_eq!(state.history_pages.next_cursor(), Some(cursor));
         assert_eq!(state.snapshot.items.len(), 30);
 
         state.apply(near_bottom);
@@ -3274,7 +3250,43 @@ mod tests {
 
         assert_eq!(state.snapshot.items.len(), 31);
         assert_eq!(state.snapshot.items[30].id, 31);
-        assert_eq!(state.next_history_cursor, Some(database_cursor));
+        assert_eq!(state.history_pages.next_cursor(), Some(database_cursor));
+    }
+
+    /// 真实 reducer 接受混合页后，公开状态快照只能读取纯数值性能观测。
+    #[test]
+    fn 混合页性能快照通过公开状态读取() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let request = state
+            .take_pending_history_request()
+            .expect("打开面板后应签发首页请求");
+        let text = test_item(0);
+        let mut image = test_item(1);
+        image.kind = UiClipboardItemKind::Image(UiImageSummary {
+            thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
+            width: 320,
+            height: 200,
+        });
+        state.apply_history_page_result(page_result(
+            &request,
+            Ok(UiHistoryPage {
+                items: vec![text, image.clone(), image],
+                next_cursor: None,
+            }),
+        ));
+
+        let public_snapshot = state.snapshot();
+        assert_eq!(public_snapshot.history_performance.accepted_pages, 1);
+        assert_eq!(public_snapshot.history_performance.loaded_items, 2);
+        assert_eq!(public_snapshot.history_performance.text_items, 1);
+        assert_eq!(public_snapshot.history_performance.image_items, 1);
+        assert_eq!(public_snapshot.history_performance.duplicate_items, 1);
+        assert_eq!(
+            public_snapshot.history_performance.text_items
+                + public_snapshot.history_performance.image_items,
+            public_snapshot.history_performance.loaded_items
+        );
     }
 
     /// 第 31 条以后的卡片仍可被鼠标选择、键盘到达并生成稳定复制动作。

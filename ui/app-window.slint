@@ -220,8 +220,23 @@ export component AppWindow inherits Window {
                                 clicked => { search-filter-requested(2); }
                             }
                             Text {
-                                text: "收藏";
+                                text: "图片";
                                 color: search-filter == 2 ? #080808 : #8c8c8c;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle {
+                            width: 64px;
+                            border-radius: 6px;
+                            background: search-filter == 3 ? #f5f5f5 : #141414;
+                            TouchArea {
+                                clicked => { search-filter-requested(3); }
+                            }
+                            Text {
+                                text: "收藏";
+                                color: search-filter == 3 ? #080808 : #8c8c8c;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }

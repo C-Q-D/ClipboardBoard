@@ -143,7 +143,7 @@ struct UiState {
     search: SearchCoordinator,
     /// 当前搜索框原始输入；结果匹配时使用去除首尾空白后的副本。
     search_text: String,
-    /// 当前基础筛选标签；图片筛选在后续图片原子启用。
+    /// 当前基础筛选标签；只能取全部、文本、图片或收藏四个受限值。
     search_filter: SearchFilter,
     /// 当前搜索结果状态，供 UI 区分加载中、空结果和错误。
     search_status: SearchStatus,
@@ -1103,11 +1103,15 @@ impl UiState {
         let keyword = self.search_text.trim();
         HistoryQuery {
             keyword: (!keyword.is_empty()).then(|| keyword.to_owned()),
-            // “全部”和“收藏”允许文本/图片混合；“文本”标签保持精确类型筛选。
-            item_type: (self.search_filter == SearchFilter::Text).then(|| "text".to_owned()),
+            // 类型标签只映射为两个固定数据库值；“全部”和“收藏”允许文本/图片混合。
+            item_type: match self.search_filter {
+                SearchFilter::Text => Some("text".to_owned()),
+                SearchFilter::Image => Some("image".to_owned()),
+                SearchFilter::All | SearchFilter::Pinned => None,
+            },
             is_pinned: match self.search_filter {
                 SearchFilter::Pinned => Some(true),
-                SearchFilter::All | SearchFilter::Text => None,
+                SearchFilter::All | SearchFilter::Text | SearchFilter::Image => None,
             },
             limit: UI_FIRST_BATCH_SIZE as u32,
             ..HistoryQuery::default()
@@ -3967,21 +3971,20 @@ mod tests {
         assert_eq!(state.history.items().len(), 1);
     }
 
-    /// 全部和收藏允许混合类型，只有文本标签在 SQLite 输入边界限制为 text。
+    /// 全部和收藏允许混合类型，文本与图片标签在 SQLite 输入边界映射为固定类型。
     #[test]
-    fn 全部与收藏查询混合类型而文本标签精确筛选() {
+    fn 全部文本图片与收藏查询映射正确() {
         let mut state = UiState::default();
-        for filter in [SearchFilter::All, SearchFilter::Text, SearchFilter::Pinned] {
+        for (filter, expected_type, expected_pinned) in [
+            (SearchFilter::All, None, None),
+            (SearchFilter::Text, Some("text"), None),
+            (SearchFilter::Image, Some("image"), None),
+            (SearchFilter::Pinned, None, Some(true)),
+        ] {
             state.search_filter = filter;
             let query = state.build_search_query();
-            assert_eq!(
-                query.item_type.as_deref(),
-                (filter == SearchFilter::Text).then_some("text")
-            );
-            assert_eq!(
-                query.is_pinned,
-                (filter == SearchFilter::Pinned).then_some(true)
-            );
+            assert_eq!(query.item_type.as_deref(), expected_type);
+            assert_eq!(query.is_pinned, expected_pinned);
         }
     }
 

@@ -3646,6 +3646,80 @@ mod tests {
         remove_directory(&directory);
     }
 
+    /// 图片类型与关键词组合后的复合游标必须始终停留在图片集合，不能重复或混入文本。
+    #[test]
+    fn history_query_image_filter_cursor_pages_are_stable() {
+        let directory = temporary_directory();
+        let image_root = directory.join("filter-images");
+        let executor = StorageExecutor::open_at(&directory).expect("启动图片筛选查询线程失败");
+        for (hash_value, copied_at) in [(71_u8, 100_i64), (72, 100), (73, 99)] {
+            executor
+                .upsert_image(image_input(hash_value, 91, image_root.clone(), copied_at))
+                .expect("写入图片筛选记录失败");
+        }
+        executor
+            .upsert_text(TextUpsertInput {
+                content_hash: test_hash(74),
+                text_content: "图片文字但不是图片记录".to_owned(),
+                preview_text: "图片文字但不是图片记录".to_owned(),
+                source_exe: Some("editor.exe".to_owned()),
+                source_app: Some("文本编辑器".to_owned()),
+                copied_at: 101,
+            })
+            .expect("写入图片关键词文本干扰记录失败");
+
+        let first_page = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("图片".to_owned()),
+                item_type: Some("image".to_owned()),
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .expect("读取图片筛选首页失败");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.content_hash)
+                .collect::<Vec<_>>(),
+            vec![test_hash(72), test_hash(71)]
+        );
+        assert!(first_page
+            .items
+            .iter()
+            .all(|item| item.item_type == "image"));
+
+        let second_page = executor
+            .query_history_summaries(HistoryQuery {
+                keyword: Some("图片".to_owned()),
+                item_type: Some("image".to_owned()),
+                cursor: first_page.next_cursor,
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .expect("读取图片筛选第二页失败");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.content_hash)
+                .collect::<Vec<_>>(),
+            vec![test_hash(73)]
+        );
+        assert_eq!(second_page.next_cursor, None);
+
+        let all_hashes = [first_page, second_page]
+            .into_iter()
+            .flat_map(|page| page.items.into_iter().map(|item| item.content_hash))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_hashes,
+            vec![test_hash(72), test_hash(71), test_hash(73)]
+        );
+        drop(executor);
+        remove_directory(&directory);
+    }
+
     /// 验证按 ID 读取完整 payload 保留正文、可空字段、来源和数据库原始哈希。
     #[test]
     fn history_payload_by_id_returns_full_row_or_none() {

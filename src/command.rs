@@ -182,14 +182,16 @@ pub struct UiSnapshot {
     pub selected_index: Option<usize>,
 }
 
-/// 看板当前支持的基础历史筛选；图片筛选要等图片历史原子完成后再启用。
+/// 看板当前支持的受限历史筛选；UI 索引只能转换成这里声明的固定查询类型。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SearchFilter {
     /// 不限制内容类型或收藏状态。
     #[default]
     All,
-    /// 只显示当前已经支持的文本记录。
+    /// 只显示文本记录。
     Text,
+    /// 只显示图片记录。
+    Image,
     /// 只显示用户收藏的记录。
     Pinned,
 }
@@ -199,7 +201,8 @@ impl SearchFilter {
     pub const fn from_index(index: i32) -> Self {
         match index {
             1 => Self::Text,
-            2 => Self::Pinned,
+            2 => Self::Image,
+            3 => Self::Pinned,
             _ => Self::All,
         }
     }
@@ -209,7 +212,8 @@ impl SearchFilter {
         match self {
             Self::All => 0,
             Self::Text => 1,
-            Self::Pinned => 2,
+            Self::Image => 2,
+            Self::Pinned => 3,
         }
     }
 }
@@ -360,7 +364,7 @@ pub enum UiEvent {
 mod tests {
     //! 此测试模块验证 ClipboardIO 结果只转换为受限摘要、来源和时间文案。
 
-    use super::UiClipboardItem;
+    use super::{SearchFilter, UiClipboardItem};
     use crate::clipboard::{
         ClipboardCapturePayload, ClipboardCaptureRequest, ClipboardCaptureResult,
     };
@@ -459,5 +463,22 @@ mod tests {
         let request = ClipboardCaptureRequest::new(9, None);
         assert_eq!(request.sequence, 9);
         assert!(request.source.is_none());
+    }
+
+    /// 四个标签使用稳定索引；负数和未来索引必须保守回退全部，不能构造任意查询类型。
+    #[test]
+    fn 搜索筛选索引只接受四个固定标签() {
+        for (index, filter) in [
+            (0, SearchFilter::All),
+            (1, SearchFilter::Text),
+            (2, SearchFilter::Image),
+            (3, SearchFilter::Pinned),
+        ] {
+            assert_eq!(SearchFilter::from_index(index), filter);
+            assert_eq!(filter.as_index(), index);
+        }
+        assert_eq!(SearchFilter::from_index(-1), SearchFilter::All);
+        assert_eq!(SearchFilter::from_index(4), SearchFilter::All);
+        assert_eq!(SearchFilter::from_index(i32::MAX), SearchFilter::All);
     }
 }

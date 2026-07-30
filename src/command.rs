@@ -4,7 +4,7 @@
 //! `slint::invoke_from_event_loop` 的 `Send + 'static` 闭包，并且不会把 UI 所有权泄漏给后台线程。
 
 #[cfg(windows)]
-use crate::clipboard::ClipboardCaptureResult;
+use crate::clipboard::{ClipboardCapturePayload, ClipboardCaptureResult};
 use crate::history_mutation::{
     ClearHistoryMutationResult, DeleteMutationResult, PinMutationResult,
 };
@@ -39,7 +39,10 @@ impl UiClipboardItem {
     /// [`Self::from_persisted_result`]，避免 UI 在 SQLite 之外猜测 ID 和计数。
     #[cfg(windows)]
     pub fn from_capture(capture: &ClipboardCaptureResult) -> Self {
-        let summary = capture.payload.summary();
+        let ClipboardCapturePayload::Text(payload) = &capture.payload else {
+            return Self::default();
+        };
+        let summary = payload.summary();
         let content_hash = summary.content_hash;
         let preview = summary.preview;
         let source = capture
@@ -282,7 +285,9 @@ mod tests {
     //! 此测试模块验证 ClipboardIO 结果只转换为受限摘要、来源和时间文案。
 
     use super::UiClipboardItem;
-    use crate::clipboard::{ClipboardCaptureRequest, ClipboardCaptureResult};
+    use crate::clipboard::{
+        ClipboardCapturePayload, ClipboardCaptureRequest, ClipboardCaptureResult,
+    };
     use crate::domain::ClipboardPayload;
     use crate::platform::windows::ProcessSource;
     use crate::storage::TextUpsertResult;
@@ -297,7 +302,7 @@ mod tests {
                 display_name: "Code".to_owned(),
                 process_id: 42,
             }),
-            payload: ClipboardPayload::from_text("第一行\n第二行"),
+            payload: ClipboardPayload::from_text("第一行\n第二行").into(),
         };
 
         let item = UiClipboardItem::from_capture(&capture);
@@ -305,7 +310,10 @@ mod tests {
         assert_eq!(item.preview, "第一行\n第二行");
         assert_eq!(item.source, "Code");
         assert_eq!(item.relative_time, "刚刚");
-        assert_eq!(item.content_hash, capture.payload.summary().content_hash);
+        let ClipboardCapturePayload::Text(payload) = &capture.payload else {
+            panic!("测试捕获应为文本");
+        };
+        assert_eq!(item.content_hash, payload.summary().content_hash);
         assert_eq!(item.copy_count, 1);
         assert!(!item.is_pinned);
     }
@@ -316,7 +324,7 @@ mod tests {
         let capture = ClipboardCaptureResult {
             sequence: 7,
             source: None,
-            payload: ClipboardPayload::from_text("无来源文本"),
+            payload: ClipboardPayload::from_text("无来源文本").into(),
         };
         let item = UiClipboardItem::from_capture(&capture);
         assert_eq!(item.source, "未知来源");

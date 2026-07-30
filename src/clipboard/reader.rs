@@ -63,6 +63,8 @@ pub enum ClipboardReadError {
     UnicodeTextUnavailable,
     /// 当前剪贴板没有注册 `PNG` 格式，或系统无法取得其格式编号。
     RegisteredPngUnavailable,
+    /// Windows 无法注册或取得 `PNG` 剪贴板格式编号；不得把该故障当作格式缺失降级。
+    ClipboardFormatRegistrationFailed,
     /// 剪贴板返回的 HGLOBAL 无法读取。
     GlobalMemoryUnavailable,
     /// 注册 PNG 的编码字节超过固定上限。
@@ -107,6 +109,58 @@ pub struct DibClipboardBytes {
     format: DibClipboardFormat,
     /// 在剪贴板打开期间复制出的拥有型字节。
     bytes: Vec<u8>,
+}
+
+/// 图片捕获的拥有型编码；Debug 只输出格式和长度，不泄漏图片字节。
+#[derive(Clone, Eq, PartialEq)]
+pub enum ClipboardImageBytes {
+    /// Windows 注册 `PNG` 格式的原始编码。
+    RegisteredPng(Vec<u8>),
+    /// `CF_DIBV5` 的设备无关位图字节。
+    DibV5(Vec<u8>),
+    /// `CF_DIB` 的设备无关位图字节。
+    Dib(Vec<u8>),
+}
+
+impl std::fmt::Debug for ClipboardImageBytes {
+    /// 输出有限元数据，诊断日志不得包含图片正文。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (format, length) = match self {
+            Self::RegisteredPng(bytes) => ("png", bytes.len()),
+            Self::DibV5(bytes) => ("dibv5", bytes.len()),
+            Self::Dib(bytes) => ("dib", bytes.len()),
+        };
+        formatter
+            .debug_struct("ClipboardImageBytes")
+            .field("format", &format)
+            .field("encoded_len", &length)
+            .finish()
+    }
+}
+
+impl ClipboardImageBytes {
+    /// 返回拥有编码的字节长度，供有界队列和测试检查。
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Self::RegisteredPng(bytes) | Self::DibV5(bytes) | Self::Dib(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// 一次剪贴板捕获的唯一拥有型 payload；跨类型优先级由读取入口固定。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardCapturePayload {
+    /// Unicode 文本领域 payload。
+    Text(ClipboardPayload),
+    /// PNG、DIBV5 或 DIB 的唯一最优图片编码。
+    Image(ClipboardImageBytes),
+}
+
+impl From<ClipboardPayload> for ClipboardCapturePayload {
+    /// 兼容现有文本测试和调用方的显式转换。
+    fn from(value: ClipboardPayload) -> Self {
+        Self::Text(value)
+    }
 }
 
 impl DibClipboardBytes {
@@ -186,6 +240,61 @@ pub fn read_text_with_backend<B: ClipboardBackend>(
         return Err(ClipboardReadError::CloseFailed);
     }
 
+    if sequence_after != sequence_before {
+        return Err(ClipboardReadError::SequenceChanged {
+            expected: sequence_before,
+            observed: sequence_after,
+        });
+    }
+    read_result
+}
+
+/// 在一次打开/关闭周期内按 PNG、DIBV5、DIB、Unicode 文本选择唯一 payload。
+///
+/// “不可用”才允许降级；已选格式的超限、内存或解码前读取错误必须直接返回，避免同一
+/// 剪贴板在不同机器上因错误掩盖而被记录成另一类型。
+pub fn read_capture_payload_with_backend<B: ClipboardBackend>(
+    backend: &mut B,
+    expected_sequence: Option<u32>,
+    policy: RetryPolicy,
+) -> Result<ClipboardCapturePayload, ClipboardReadError> {
+    let sequence_before = backend.sequence();
+    if let Some(expected) = expected_sequence {
+        if sequence_before != expected {
+            return Err(ClipboardReadError::SequenceChanged {
+                expected,
+                observed: sequence_before,
+            });
+        }
+    }
+
+    open_with_retry(backend, policy)?;
+    let read_result = match backend.read_registered_png_bytes(MAX_PNG_ENCODED_BYTES) {
+        Ok(bytes) => Ok(ClipboardCapturePayload::Image(
+            ClipboardImageBytes::RegisteredPng(bytes),
+        )),
+        Err(ClipboardReadError::RegisteredPngUnavailable) => {
+            match backend.read_dib_bytes(MAX_DIB_ENCODED_BYTES) {
+                Ok(dib) => {
+                    let image = match dib.format() {
+                        DibClipboardFormat::DibV5 => ClipboardImageBytes::DibV5(dib.into_bytes()),
+                        DibClipboardFormat::Dib => ClipboardImageBytes::Dib(dib.into_bytes()),
+                    };
+                    Ok(ClipboardCapturePayload::Image(image))
+                }
+                Err(ClipboardReadError::DibUnavailable) => backend
+                    .read_unicode_text(MAX_TEXT_BYTES)
+                    .map(ClipboardCapturePayload::Text),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let sequence_after = backend.sequence();
+    let close_succeeded = backend.close();
+    if !close_succeeded {
+        return Err(ClipboardReadError::CloseFailed);
+    }
     if sequence_after != sequence_before {
         return Err(ClipboardReadError::SequenceChanged {
             expected: sequence_before,
@@ -371,7 +480,10 @@ impl ClipboardBackend for Win32ClipboardBackend {
     ) -> Result<Vec<u8>, ClipboardReadError> {
         let format_name: Vec<u16> = "PNG\0".encode_utf16().collect();
         let format = unsafe { RegisterClipboardFormatW(format_name.as_ptr()) };
-        if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
+        if format == 0 {
+            return Err(ClipboardReadError::ClipboardFormatRegistrationFailed);
+        }
+        if unsafe { IsClipboardFormatAvailable(format) } == 0 {
             return Err(ClipboardReadError::RegisteredPngUnavailable);
         }
 
@@ -478,10 +590,11 @@ mod tests {
     //! 此测试模块通过假后端验证文本、注册 PNG、重试、sequence 和资源上限边界。
 
     use super::{
-        parse_utf16_text, read_dib_bytes_with_backend, read_registered_png_bytes_with_backend,
-        read_text_with_backend, select_dib_clipboard_format, ClipboardBackend, ClipboardReadError,
-        DibClipboardBytes, DibClipboardFormat, RetryPolicy, CF_DIBV5_FORMAT, CF_DIB_FORMAT,
-        MAX_TEXT_BYTES,
+        parse_utf16_text, read_capture_payload_with_backend, read_dib_bytes_with_backend,
+        read_registered_png_bytes_with_backend, read_text_with_backend,
+        select_dib_clipboard_format, ClipboardBackend, ClipboardCapturePayload,
+        ClipboardImageBytes, ClipboardReadError, DibClipboardBytes, DibClipboardFormat,
+        RetryPolicy, CF_DIBV5_FORMAT, CF_DIB_FORMAT, MAX_TEXT_BYTES,
     };
     use crate::domain::ClipboardPayload;
     use crate::image_decode::{MAX_DIB_ENCODED_BYTES, MAX_PNG_ENCODED_BYTES};
@@ -565,6 +678,117 @@ mod tests {
             total_timeout: Duration::ZERO,
             retry_interval: Duration::ZERO,
         }
+    }
+
+    /// PNG、DIB 和文本同时存在时必须只返回 PNG，且一次打开后完成全部选择。
+    #[test]
+    fn capture_prefers_png_over_dib_and_text_in_one_open_cycle() {
+        let mut backend = FakeBackend {
+            opens: VecDeque::from([true]),
+            sequences: VecDeque::from([31, 31]),
+            last_sequence: 31,
+            text: Ok(ClipboardPayload::from_text("辅助文本")),
+            png: Ok(vec![1, 2, 3]),
+            dib: Ok(DibClipboardBytes::new(
+                DibClipboardFormat::DibV5,
+                vec![4, 5],
+            )),
+            close_ok: true,
+        };
+
+        let payload =
+            read_capture_payload_with_backend(&mut backend, Some(31), policy()).expect("捕获失败");
+        assert_eq!(
+            payload,
+            ClipboardCapturePayload::Image(ClipboardImageBytes::RegisteredPng(vec![1, 2, 3]))
+        );
+        assert!(backend.opens.is_empty());
+    }
+
+    /// 注册 PNG 不可用时必须保留 DIBV5/DIB 的实际格式身份，不读取文本。
+    #[test]
+    fn capture_falls_back_to_dibv5_then_dib() {
+        for (format, expected) in [
+            (
+                DibClipboardFormat::DibV5,
+                ClipboardImageBytes::DibV5(vec![8, 9]),
+            ),
+            (
+                DibClipboardFormat::Dib,
+                ClipboardImageBytes::Dib(vec![8, 9]),
+            ),
+        ] {
+            let mut backend = FakeBackend {
+                opens: VecDeque::from([true]),
+                sequences: VecDeque::from([32, 32]),
+                last_sequence: 32,
+                text: Ok(ClipboardPayload::from_text("不应读取")),
+                png: Err(ClipboardReadError::RegisteredPngUnavailable),
+                dib: Ok(DibClipboardBytes::new(format, vec![8, 9])),
+                close_ok: true,
+            };
+            assert_eq!(
+                read_capture_payload_with_backend(&mut backend, Some(32), policy())
+                    .expect("DIB 捕获失败"),
+                ClipboardCapturePayload::Image(expected)
+            );
+        }
+    }
+
+    /// 所有图片格式不可用时才读取 Unicode 文本，保持原有文本捕获语义。
+    #[test]
+    fn capture_falls_back_to_unicode_text() {
+        let mut backend = FakeBackend {
+            opens: VecDeque::from([true]),
+            sequences: VecDeque::from([33, 33]),
+            last_sequence: 33,
+            text: Ok(ClipboardPayload::from_text("文本回退")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
+            close_ok: true,
+        };
+        assert_eq!(
+            read_capture_payload_with_backend(&mut backend, Some(33), policy())
+                .expect("文本回退失败"),
+            ClipboardCapturePayload::Text(ClipboardPayload::from_text("文本回退"))
+        );
+    }
+
+    /// 已选 PNG 的超限错误不得被 DIB 或文本掩盖，关闭仍必须执行。
+    #[test]
+    fn selected_png_error_does_not_fall_through() {
+        let mut backend = FakeBackend {
+            opens: VecDeque::from([true]),
+            sequences: VecDeque::from([34, 34]),
+            last_sequence: 34,
+            text: Ok(ClipboardPayload::from_text("不应回退")),
+            png: Ok(vec![0; MAX_PNG_ENCODED_BYTES + 1]),
+            dib: Ok(DibClipboardBytes::new(DibClipboardFormat::Dib, vec![1])),
+            close_ok: true,
+        };
+        assert_eq!(
+            read_capture_payload_with_backend(&mut backend, Some(34), policy()),
+            Err(ClipboardReadError::PngEncodedTooLarge)
+        );
+        assert!(backend.opens.is_empty());
+    }
+
+    /// PNG 格式注册故障不是“不可用”，不得被低优先级 DIB 或文本掩盖。
+    #[test]
+    fn png_registration_failure_does_not_fall_through() {
+        let mut backend = FakeBackend {
+            opens: VecDeque::from([true]),
+            sequences: VecDeque::from([35, 35]),
+            last_sequence: 35,
+            text: Ok(ClipboardPayload::from_text("不应回退")),
+            png: Err(ClipboardReadError::ClipboardFormatRegistrationFailed),
+            dib: Ok(DibClipboardBytes::new(DibClipboardFormat::DibV5, vec![1])),
+            close_ok: true,
+        };
+        assert_eq!(
+            read_capture_payload_with_backend(&mut backend, Some(35), policy()),
+            Err(ClipboardReadError::ClipboardFormatRegistrationFailed)
+        );
     }
 
     /// 中英文、换行和空内容都必须在关闭剪贴板后仍可作为拥有型 payload 使用。

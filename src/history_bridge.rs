@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    clipboard::ClipboardCapturePayload,
     clipboard::{
         ClipboardCaptureInbox, ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWorkItem,
         ClipboardWriteError, ClipboardWriteExpectationStore, ClipboardWriter,
@@ -237,10 +238,13 @@ where
     F: FnMut(UiEvent) -> bool,
     U: FnMut(TextUpsertInput) -> Result<TextUpsertResult, StorageError>,
 {
-    let summary = capture.payload.summary();
+    let ClipboardCapturePayload::Text(payload) = capture.payload else {
+        return Ok(CaptureProcessOutcome::Skipped);
+    };
+    let summary = payload.summary();
     let input = TextUpsertInput {
         content_hash: summary.content_hash,
-        text_content: capture.payload.as_text().to_owned(),
+        text_content: payload.as_text().to_owned(),
         preview_text: summary.preview,
         source_exe: capture
             .source
@@ -286,8 +290,8 @@ mod tests {
     };
     use crate::{
         clipboard::{
-            ClipboardCaptureInbox, ClipboardCaptureResult, ClipboardWriteError,
-            ClipboardWriteExpectationStore,
+            ClipboardCaptureInbox, ClipboardCapturePayload, ClipboardCaptureResult,
+            ClipboardImageBytes, ClipboardWriteError, ClipboardWriteExpectationStore,
         },
         command::UiEvent,
         domain::ClipboardPayload,
@@ -314,8 +318,39 @@ mod tests {
                 display_name: "编辑器".to_owned(),
                 process_id: 10,
             }),
-            payload: ClipboardPayload::from_text(text),
+            payload: ClipboardPayload::from_text(text).into(),
         }
+    }
+
+    /// IMG-HIST-03 激活前，图片捕获必须安全跳过且不得调用文本 upsert 或投递 UI。
+    #[test]
+    fn image_capture_is_skipped_without_text_persistence() {
+        let capture = ClipboardCaptureResult {
+            sequence: 99,
+            source: None,
+            payload: ClipboardCapturePayload::Image(ClipboardImageBytes::RegisteredPng(vec![
+                1, 2, 3,
+            ])),
+        };
+        let mut upsert_calls = 0;
+        let mut emit_calls = 0;
+        let outcome = process_capture_with_upsert(
+            capture,
+            100,
+            |_| {
+                upsert_calls += 1;
+                Err(crate::storage::StorageError::ChannelClosed)
+            },
+            |_| {
+                emit_calls += 1;
+                true
+            },
+        )
+        .expect("图片应安全跳过");
+
+        assert_eq!(outcome, CaptureProcessOutcome::Skipped);
+        assert_eq!(upsert_calls, 0);
+        assert_eq!(emit_calls, 0);
     }
 
     /// UI 在首条投递时关闭，也必须继续排空停止期间已经发布的后续 Capture。

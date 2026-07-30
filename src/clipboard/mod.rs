@@ -13,7 +13,8 @@ pub use io_worker::{
     ClipboardIoWorker, ClipboardWorkItem, ClipboardWorkerError,
 };
 pub use reader::{
-    read_text_with_backend, ClipboardBackend, ClipboardReadError, RetryPolicy, MAX_TEXT_BYTES,
+    read_capture_payload_with_backend, read_text_with_backend, ClipboardBackend,
+    ClipboardCapturePayload, ClipboardImageBytes, ClipboardReadError, RetryPolicy, MAX_TEXT_BYTES,
 };
 pub use writer::{
     ClipboardWriteError, ClipboardWriteExpectationStore, ClipboardWriteFormat, ClipboardWriter,

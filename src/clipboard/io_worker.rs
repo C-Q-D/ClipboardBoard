@@ -10,7 +10,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use super::reader::{
-    read_text_with_backend, ClipboardReadError, RetryPolicy, Win32ClipboardBackend,
+    read_capture_payload_with_backend, read_text_with_backend, ClipboardCapturePayload,
+    ClipboardReadError, RetryPolicy, Win32ClipboardBackend,
 };
 use super::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
 use crate::domain::ClipboardPayload;
@@ -50,8 +51,8 @@ pub struct ClipboardCaptureResult {
     pub sequence: u32,
     /// 与该序号同时捕获的来源快照；不会从 worker 重新查询前台窗口。
     pub source: Option<ProcessSource>,
-    /// 已脱离 HGLOBAL 生命周期的正文 payload。
-    pub payload: ClipboardPayload,
+    /// 已脱离 HGLOBAL 生命周期的唯一文本或图片 payload。
+    pub payload: ClipboardCapturePayload,
 }
 
 /// UI 请求只复制某条历史时提交的轻量命令；正文仍必须从存储线程按 ID 读取。
@@ -523,13 +524,13 @@ fn worker_loop(
 ) {
     while let Some(request) = queue.pop() {
         let mut backend = Win32ClipboardBackend;
-        let result = read_text_with_backend(
-            &mut backend,
-            request.expected_sequence,
-            RetryPolicy::default(),
-        );
         match request.response {
             ReadResponse::Payload(response) => {
+                let result = read_text_with_backend(
+                    &mut backend,
+                    request.expected_sequence,
+                    RetryPolicy::default(),
+                );
                 let _ = response.send(result);
             }
             ReadResponse::Capture {
@@ -537,6 +538,11 @@ fn worker_loop(
                 sequence,
                 source,
             } => {
+                let result = read_capture_payload_with_backend(
+                    &mut backend,
+                    request.expected_sequence,
+                    RetryPolicy::default(),
+                );
                 let capture_result = result.map(|payload| ClipboardCaptureResult {
                     sequence,
                     source,
@@ -560,9 +566,12 @@ fn should_publish_capture(
     expectations: &ClipboardWriteExpectationStore,
 ) -> bool {
     !capture_result.as_ref().is_ok_and(|capture| {
+        let ClipboardCapturePayload::Text(payload) = &capture.payload else {
+            return false;
+        };
         expectations.consume_if_matches(
             capture.sequence,
-            capture.payload.summary().content_hash,
+            payload.summary().content_hash,
             ClipboardWriteFormat::UnicodeText,
         )
     })
@@ -578,6 +587,7 @@ mod tests {
         ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
     };
     use crate::clipboard::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
+    use crate::clipboard::ClipboardCapturePayload;
     use crate::domain::ClipboardPayload;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -671,12 +681,12 @@ mod tests {
         inbox.publish(Ok(ClipboardCaptureResult {
             sequence: 20,
             source: None,
-            payload: ClipboardPayload::from_text("A"),
+            payload: ClipboardPayload::from_text("A").into(),
         }));
         inbox.publish(Ok(ClipboardCaptureResult {
             sequence: 21,
             source: None,
-            payload: ClipboardPayload::from_text("B"),
+            payload: ClipboardPayload::from_text("B").into(),
         }));
 
         let result = inbox
@@ -684,7 +694,10 @@ mod tests {
             .expect("结果桥应有最新结果")
             .expect("B 应成功");
         assert_eq!(result.sequence, 21);
-        assert_eq!(result.payload.as_text(), "B");
+        let ClipboardCapturePayload::Text(payload) = result.payload else {
+            panic!("最新结果应为文本");
+        };
+        assert_eq!(payload.as_text(), "B");
         assert!(inbox.try_take().is_none());
     }
 
@@ -695,7 +708,7 @@ mod tests {
         inbox.publish(Ok(ClipboardCaptureResult {
             sequence: 30,
             source: None,
-            payload: ClipboardPayload::from_text("保留到关闭后"),
+            payload: ClipboardPayload::from_text("保留到关闭后").into(),
         }));
         inbox.close();
 
@@ -813,7 +826,7 @@ mod tests {
         inbox.publish(Ok(ClipboardCaptureResult {
             sequence: 41,
             source: None,
-            payload: ClipboardPayload::from_text("待处理捕获"),
+            payload: ClipboardPayload::from_text("待处理捕获").into(),
         }));
         inbox
             .request_copy(ClipboardCopyRequest::new(3, [3; 32]))
@@ -878,7 +891,7 @@ mod tests {
         let result = Ok(ClipboardCaptureResult {
             sequence: 44,
             source: None,
-            payload,
+            payload: payload.into(),
         });
 
         assert!(!should_publish_capture(&result, &expectations));

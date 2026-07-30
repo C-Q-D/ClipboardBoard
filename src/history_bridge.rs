@@ -13,10 +13,11 @@ use crate::{
     clipboard::{
         ClipboardCaptureInbox, ClipboardCapturePayload, ClipboardCaptureResult,
         ClipboardCopyRequest, ClipboardImageBytes, ClipboardWorkItem, ClipboardWriteError,
-        ClipboardWriteExpectationStore, ClipboardWriter,
+        ClipboardWriteExpectationStore, ClipboardWriteFormat, ClipboardWriter,
     },
     command::{UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
+    image_decode::decode_dib,
     image_pipeline::{ImageInput, ImageRootSnapshot, ImageWorkerError, ImageWorkerSender},
     storage::{
         HistoryPayload, ImageUpsertInput, StorageClient, StorageError, TextUpsertInput,
@@ -203,7 +204,14 @@ pub fn run_clipboard_pump<F>(
                         |event| ui_open && emit(event),
                     ),
                     ClipboardCapturePayload::Image(image) => {
-                        if let Some(context) = image_context.as_ref() {
+                        if suppress_self_image_capture(
+                            &write_expectations,
+                            capture.sequence,
+                            &image,
+                            |bytes| decode_dib(bytes).ok().map(|pixels| pixels.content_hash()),
+                        ) {
+                            Ok(CaptureProcessOutcome::Skipped)
+                        } else if let Some(context) = image_context.as_ref() {
                             process_image_capture(
                                 &storage,
                                 context,
@@ -234,6 +242,28 @@ pub fn run_clipboard_pump<F>(
             }
         }
     }
+}
+
+/// 仅对存在精确 DIBV5 候选的事件解码哈希，并在三元组匹配时一次性抑制自身写回。
+fn suppress_self_image_capture<F>(
+    expectations: &ClipboardWriteExpectationStore,
+    sequence: u32,
+    image: &ClipboardImageBytes,
+    decode_hash: F,
+) -> bool
+where
+    F: FnOnce(&[u8]) -> Option<[u8; 32]>,
+{
+    let ClipboardImageBytes::DibV5(bytes) = image else {
+        return false;
+    };
+    if !expectations.has_candidate(sequence, ClipboardWriteFormat::DibV5) {
+        return false;
+    }
+    let Some(content_hash) = decode_hash(bytes) else {
+        return false;
+    };
+    expectations.consume_if_matches(sequence, content_hash, ClipboardWriteFormat::DibV5)
 }
 
 /// 图片经过发布验证和数据库事务后，按最终资产采用结果消费一次 finalize。
@@ -418,13 +448,14 @@ mod tests {
 
     use super::{
         process_capture, process_capture_with_upsert, process_copy_payload, process_image_capture,
-        run_clipboard_pump, CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
-        ImageCaptureContext,
+        run_clipboard_pump, suppress_self_image_capture, CaptureProcessError,
+        CaptureProcessOutcome, CopyProcessError, ImageCaptureContext,
     };
     use crate::{
         clipboard::{
             ClipboardCaptureInbox, ClipboardCapturePayload, ClipboardCaptureResult,
             ClipboardImageBytes, ClipboardWriteError, ClipboardWriteExpectationStore,
+            ClipboardWriteFormat,
         },
         command::{UiClipboardItemKind, UiEvent},
         domain::{CanonicalImagePixels, ClipboardPayload},
@@ -457,6 +488,24 @@ mod tests {
         }
     }
 
+    /// 构造一张 1×1、顶向下 BGRA 的最小合法 DIBV5，供真实解码抑制接缝使用。
+    fn one_pixel_dib_v5() -> Vec<u8> {
+        let mut dib = vec![0_u8; 128];
+        dib[0..4].copy_from_slice(&124_u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32_u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        dib[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&0x00ff_0000_u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x0000_ff00_u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x0000_00ff_u32.to_le_bytes());
+        dib[52..56].copy_from_slice(&0xff00_0000_u32.to_le_bytes());
+        dib[124..128].copy_from_slice(&[3, 2, 1, 255]);
+        dib
+    }
+
     /// IMG-HIST-03 激活前，图片捕获必须安全跳过且不得调用文本 upsert 或投递 UI。
     #[test]
     fn image_capture_is_skipped_without_text_persistence() {
@@ -486,6 +535,212 @@ mod tests {
         assert_eq!(outcome, CaptureProcessOutcome::Skipped);
         assert_eq!(upsert_calls, 0);
         assert_eq!(emit_calls, 0);
+    }
+
+    /// 没有候选或格式不符时不得调用抑制解码器，避免普通图片重复解码。
+    #[test]
+    fn 普通图片无候选时不执行抑制解码() {
+        let expectations = ClipboardWriteExpectationStore::new();
+        let image = ClipboardImageBytes::DibV5(one_pixel_dib_v5());
+        let mut decode_calls = 0;
+        assert!(!suppress_self_image_capture(
+            &expectations,
+            90,
+            &image,
+            |_| {
+                decode_calls += 1;
+                None
+            },
+        ));
+        assert_eq!(decode_calls, 0);
+
+        let png = ClipboardImageBytes::RegisteredPng(vec![1, 2, 3]);
+        assert!(!suppress_self_image_capture(
+            &expectations,
+            90,
+            &png,
+            |_| {
+                decode_calls += 1;
+                None
+            },
+        ));
+        assert_eq!(decode_calls, 0);
+    }
+
+    /// 候选哈希不匹配不能消费；随后同一三元组匹配时只消费一次。
+    #[test]
+    fn 图片自身预期按三元组一次性消费() {
+        let expectations = ClipboardWriteExpectationStore::new();
+        let token = expectations
+            .arm([21; 32], ClipboardWriteFormat::DibV5)
+            .expect("登记图片自身预期失败");
+        expectations.bind_sequence(token, 91);
+        let image = ClipboardImageBytes::DibV5(one_pixel_dib_v5());
+
+        assert!(!suppress_self_image_capture(
+            &expectations,
+            91,
+            &image,
+            |_| Some([22; 32]),
+        ));
+        assert!(expectations.has_candidate(91, ClipboardWriteFormat::DibV5));
+        assert!(suppress_self_image_capture(
+            &expectations,
+            91,
+            &image,
+            |_| Some([21; 32]),
+        ));
+        assert!(!suppress_self_image_capture(
+            &expectations,
+            91,
+            &image,
+            |_| panic!("已消费预期不能再次解码"),
+        ));
+    }
+
+    /// pump 必须在真实图片 worker 前抑制自身 DIBV5，且不发布资产、写数据库或投递 UI。
+    #[test]
+    fn 自身_dibv5_在图片流水线前被抑制() {
+        let directory = test_directory("suppress-self-dibv5");
+        let image_root = directory.join("images");
+        let storage = StorageExecutor::open_at(&directory).expect("启动自身抑制测试存储失败");
+        let worker = ImageWorker::start(
+            prepare_image_storage(ImageStoragePreference::Custom(image_root.clone()))
+                .expect("准备自身抑制图片目录失败"),
+        )
+        .expect("启动自身抑制图片 worker 失败");
+        let context = ImageCaptureContext::new(worker.sender(), worker.root_snapshot().clone());
+        let inbox = ClipboardCaptureInbox::new();
+        let expectations = ClipboardWriteExpectationStore::new();
+        let hash = CanonicalImagePixels::new(1, 1, vec![1, 2, 3, 255])
+            .expect("构造自身抑制规范像素失败")
+            .content_hash();
+        let token = expectations
+            .arm(hash, ClipboardWriteFormat::DibV5)
+            .expect("登记自身 DIBV5 预期失败");
+        expectations.bind_sequence(token, 92);
+        inbox.publish(Ok(ClipboardCaptureResult {
+            sequence: 92,
+            source: None,
+            payload: ClipboardCapturePayload::Image(ClipboardImageBytes::DibV5(one_pixel_dib_v5())),
+        }));
+        inbox.close();
+        let mut emit_calls = 0;
+
+        run_clipboard_pump(
+            inbox,
+            storage.client(),
+            expectations.clone(),
+            Some(context),
+            |_| {
+                emit_calls += 1;
+                true
+            },
+        );
+
+        assert_eq!(emit_calls, 0);
+        assert!(!expectations.has_candidate(92, ClipboardWriteFormat::DibV5));
+        assert!(storage
+            .list_history_summaries(None, 30)
+            .expect("查询自身抑制历史失败")
+            .items
+            .is_empty());
+        assert!(std::fs::read_dir(image_root.join("original"))
+            .expect("读取自身抑制原图目录失败")
+            .next()
+            .is_none());
+        assert!(std::fs::read_dir(image_root.join("thumbnail"))
+            .expect("读取自身抑制缩略图目录失败")
+            .next()
+            .is_none());
+        worker.stop().expect("停止自身抑制图片 worker 失败");
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理自身抑制测试目录失败");
+    }
+
+    /// sequence、哈希或实际格式不匹配时，pump 必须继续发布图片并更新 SQLite。
+    #[test]
+    fn 错误图片预期不会阻止真实捕获发布() {
+        let directory = test_directory("publish-mismatched-expectation");
+        let image_root = directory.join("images");
+        let storage = StorageExecutor::open_at(&directory).expect("启动错配预期测试存储失败");
+        let worker = ImageWorker::start(
+            prepare_image_storage(ImageStoragePreference::Custom(image_root))
+                .expect("准备错配预期图片目录失败"),
+        )
+        .expect("启动错配预期图片 worker 失败");
+        let context = ImageCaptureContext::new(worker.sender(), worker.root_snapshot().clone());
+        let inbox = ClipboardCaptureInbox::new();
+        let expectations = ClipboardWriteExpectationStore::new();
+        let pixels =
+            CanonicalImagePixels::new(1, 1, vec![1, 2, 3, 255]).expect("构造错配预期规范像素失败");
+        let hash = pixels.content_hash();
+        let dib = one_pixel_dib_v5();
+        let mut png = Vec::new();
+        encode_original_png(&pixels, &mut png).expect("编码错配预期 PNG 失败");
+
+        for (expected_sequence, expected_hash) in
+            [(200, hash), (202, [99; 32]), (203, hash), (204, hash)]
+        {
+            let token = expectations
+                .arm(expected_hash, ClipboardWriteFormat::DibV5)
+                .expect("登记错配图片预期失败");
+            expectations.bind_sequence(token, expected_sequence);
+        }
+        let pump_inbox = inbox.clone();
+        let pump_storage = storage.client();
+        let (event_sender, event_receiver) = sync_channel(4);
+        let pump = thread::spawn(move || {
+            run_clipboard_pump(
+                pump_inbox,
+                pump_storage,
+                expectations,
+                Some(context),
+                |event| event_sender.send(event).is_ok(),
+            );
+        });
+        let mut events = Vec::new();
+        for capture in [
+            ClipboardCaptureResult {
+                sequence: 201,
+                source: None,
+                payload: ClipboardCapturePayload::Image(ClipboardImageBytes::DibV5(dib.clone())),
+            },
+            ClipboardCaptureResult {
+                sequence: 202,
+                source: None,
+                payload: ClipboardCapturePayload::Image(ClipboardImageBytes::DibV5(dib.clone())),
+            },
+            ClipboardCaptureResult {
+                sequence: 203,
+                source: None,
+                payload: ClipboardCapturePayload::Image(ClipboardImageBytes::RegisteredPng(png)),
+            },
+            ClipboardCaptureResult {
+                sequence: 204,
+                source: None,
+                payload: ClipboardCapturePayload::Image(ClipboardImageBytes::Dib(dib)),
+            },
+        ] {
+            inbox.publish(Ok(capture));
+            events.push(
+                event_receiver
+                    .recv()
+                    .expect("错配图片捕获未经过真实流水线投递"),
+            );
+        }
+        inbox.close();
+        pump.join().expect("错配图片结果泵异常退出");
+
+        assert_eq!(events.len(), 4);
+        let page = storage
+            .list_history_summaries(None, 30)
+            .expect("查询错配预期历史失败");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].copy_count, 4);
+        worker.stop().expect("停止错配预期图片 worker 失败");
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理错配预期测试目录失败");
     }
 
     /// 图片文件发布、数据库提交和 finalize 必须形成可重复去重的完整顺序。

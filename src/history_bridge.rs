@@ -881,6 +881,7 @@ mod tests {
             created_at: 1,
             copied_at: 2,
             last_used_at: None,
+            image: None,
         }
     }
 

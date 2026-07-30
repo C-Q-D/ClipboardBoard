@@ -95,11 +95,14 @@ LIMIT ?7
 
 /// 按主键读取完整 payload；可空正文和原始哈希字节保持数据库语义。
 const HISTORY_PAYLOAD_SQL: &str = r#"
-SELECT id, item_type, text_content, preview_text, content_hash,
-       source_exe, source_app, copy_count, is_pinned, created_at,
-       copied_at, last_used_at
-FROM clipboard_items
-WHERE id = ?1
+SELECT item.id, item.item_type, item.text_content, item.preview_text, item.content_hash,
+       item.source_exe, item.source_app, item.copy_count, item.is_pinned, item.created_at,
+       item.copied_at, item.last_used_at, item.image_root_id, item.image_path,
+       item.thumbnail_path, item.image_width, item.image_height, item.image_format,
+       item.content_size, root.root_path
+FROM clipboard_items AS item
+LEFT JOIN image_asset_roots AS root ON root.root_id = item.image_root_id
+WHERE item.id = ?1
 "#;
 
 /// 返回给调用方的只读存储状态和真实连接线程探针。
@@ -384,6 +387,8 @@ pub struct HistoryPayload {
     pub copied_at: i64,
     /// 最近使用时间；从未使用时为空。
     pub last_used_at: Option<i64>,
+    /// 图片记录的完整受限资产身份；文本和未知类型为空。
+    pub image: Option<HistoryImageSummary>,
 }
 
 /// 可发送给存储线程的内部命令；不对外暴露连接、Statement 或 SQL 句柄。
@@ -1787,25 +1792,101 @@ fn get_history_payload(
     connection: &Connection,
     id: i64,
 ) -> Result<Option<HistoryPayload>, StorageError> {
-    let payload = connection
-        .query_row(HISTORY_PAYLOAD_SQL, params![id], |row| {
-            Ok(HistoryPayload {
-                id: row.get(0)?,
-                item_type: row.get(1)?,
-                text_content: row.get(2)?,
-                preview_text: row.get(3)?,
-                content_hash: row.get(4)?,
-                source_exe: row.get(5)?,
-                source_app: row.get(6)?,
-                copy_count: row.get(7)?,
-                is_pinned: row.get::<_, i64>(8)? != 0,
-                created_at: row.get(9)?,
-                copied_at: row.get(10)?,
-                last_used_at: row.get(11)?,
-            })
+    let mut statement = connection.prepare(HISTORY_PAYLOAD_SQL)?;
+    let mut rows = statement.query(params![id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(history_payload_from_row(row)?))
+}
+
+/// 将按 ID 查询行映射为文本或图片完整载荷，并集中校验图片字段组合。
+fn history_payload_from_row(row: &Row<'_>) -> Result<HistoryPayload, StorageError> {
+    let id: i64 = row.get(0)?;
+    let item_type: String = row.get(1)?;
+    let text_content: Option<String> = row.get(2)?;
+    let content_hash: Vec<u8> = row.get(4)?;
+    let root_id_blob: Option<Vec<u8>> = row.get(12)?;
+    let image_path: Option<String> = row.get(13)?;
+    let thumbnail_path: Option<String> = row.get(14)?;
+    let image_width: Option<u32> = row.get(15)?;
+    let image_height: Option<u32> = row.get(16)?;
+    let image_format: Option<String> = row.get(17)?;
+    let content_size: Option<i64> = row.get(18)?;
+    let canonical_root: Option<String> = row.get(19)?;
+
+    let has_any_image_field = root_id_blob.is_some()
+        || image_path.is_some()
+        || thumbnail_path.is_some()
+        || image_width.is_some()
+        || image_height.is_some()
+        || image_format.is_some()
+        || content_size.is_some()
+        || canonical_root.is_some();
+    let image = if item_type == "image" {
+        if text_content.is_some() {
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+        let content_hash_array: [u8; 32] =
+            content_hash.as_slice().try_into().map_err(|_| {
+                StorageError::InvalidContentHashLength {
+                    id,
+                    length: content_hash.len(),
+                }
+            })?;
+        let root_id_blob = root_id_blob.ok_or(StorageError::InvalidImageAssetMetadata)?;
+        let root_id: [u8; 32] = root_id_blob
+            .as_slice()
+            .try_into()
+            .map_err(|_| StorageError::InvalidImageAssetMetadata)?;
+        let content_size = u64::try_from(
+            content_size.ok_or(StorageError::InvalidImageAssetMetadata)?,
+        )
+        .map_err(|_| StorageError::InvalidImageAssetMetadata)?;
+        let canonical_root = PathBuf::from(
+            canonical_root.ok_or(StorageError::InvalidImageAssetMetadata)?,
+        );
+        if !canonical_root.is_absolute() {
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+        if image_format.as_deref() != Some("png") {
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+        Some(HistoryImageSummary {
+            metadata: ImageMetadata::new(
+                content_hash_array,
+                ImageAssetRootId::new(root_id),
+                image_path.ok_or(StorageError::InvalidImageAssetMetadata)?,
+                thumbnail_path.ok_or(StorageError::InvalidImageAssetMetadata)?,
+                image_width.ok_or(StorageError::InvalidImageAssetMetadata)?,
+                image_height.ok_or(StorageError::InvalidImageAssetMetadata)?,
+                content_size,
+            )
+            .map_err(|_| StorageError::InvalidImageAssetMetadata)?,
+            canonical_root,
         })
-        .optional()?;
-    Ok(payload)
+    } else {
+        if has_any_image_field {
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+        None
+    };
+
+    Ok(HistoryPayload {
+        id,
+        item_type,
+        text_content,
+        preview_text: row.get(3)?,
+        content_hash,
+        source_exe: row.get(5)?,
+        source_app: row.get(6)?,
+        copy_count: row.get(7)?,
+        is_pinned: row.get::<_, i64>(8)? != 0,
+        created_at: row.get(9)?,
+        copied_at: row.get(10)?,
+        last_used_at: row.get(11)?,
+        image,
+    })
 }
 
 #[cfg(test)]
@@ -3597,6 +3678,7 @@ mod tests {
         assert_eq!(payload.created_at, 123);
         assert_eq!(payload.copied_at, 123);
         assert_eq!(payload.last_used_at, None);
+        assert_eq!(payload.image, None);
         assert_eq!(
             executor
                 .get_history_payload(i64::MAX)
@@ -3604,6 +3686,133 @@ mod tests {
             None
         );
         drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 图片按 ID 载荷必须返回已校验元数据和根定位，且正文保持为空。
+    #[test]
+    fn history_payload_by_id_returns_validated_image_asset() {
+        let directory = temporary_directory();
+        let canonical_root = directory.join("images-copy");
+        let executor =
+            StorageExecutor::open_at(&directory).expect("启动图片 payload 查询线程失败");
+        let inserted = executor
+            .upsert_image(image_input(72, 82, canonical_root.clone(), 321))
+            .expect("写入图片 payload 测试记录失败");
+
+        let payload = executor
+            .get_history_payload(inserted.id)
+            .expect("读取图片 payload 失败")
+            .expect("已写入图片却未返回 payload");
+        let image = payload.image.expect("图片 payload 必须包含资产身份");
+
+        assert_eq!(payload.item_type, "image");
+        assert_eq!(payload.text_content, None);
+        assert_eq!(payload.content_hash, test_hash(72));
+        assert_eq!(image.metadata, inserted.metadata);
+        assert_eq!(image.canonical_root, canonical_root);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 根注册表返回相对路径时必须拒绝整个图片载荷，不能拼接到进程工作目录。
+    #[test]
+    fn history_payload_rejects_relative_image_root() {
+        let directory = temporary_directory();
+        let executor =
+            StorageExecutor::open_at(&directory).expect("启动坏根 payload 查询线程失败");
+        let inserted = executor
+            .upsert_image(image_input(
+                73,
+                83,
+                directory.join("images-invalid-root"),
+                322,
+            ))
+            .expect("写入坏根 payload 测试记录失败");
+        {
+            let connection =
+                Connection::open(directory.join("clipboard.db")).expect("打开坏根测试数据库失败");
+            connection
+                .execute(
+                    "UPDATE image_asset_roots SET root_path = 'relative-root' WHERE root_id = ?1",
+                    params![test_hash(83).as_slice()],
+                )
+                .expect("篡改图片根路径失败");
+        }
+
+        assert!(matches!(
+            executor.get_history_payload(inserted.id),
+            Err(crate::storage::StorageError::InvalidImageAssetMetadata)
+        ));
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 即使数据库约束被绕过，图片 payload 也必须拒绝缺字段、格式和值身份错配。
+    #[test]
+    fn history_payload_rejects_corrupted_image_field_combinations() {
+        let directory = temporary_directory();
+        let executor =
+            StorageExecutor::open_at(&directory).expect("启动损坏图片字段测试线程失败");
+        let missing_path = executor
+            .upsert_image(image_input(74, 84, directory.join("missing-path"), 323))
+            .expect("写入缺路径测试记录失败");
+        let invalid_format = executor
+            .upsert_image(image_input(75, 85, directory.join("invalid-format"), 324))
+            .expect("写入坏格式测试记录失败");
+        let mismatched_path = executor
+            .upsert_image(image_input(76, 86, directory.join("mismatched-path"), 325))
+            .expect("写入错配路径测试记录失败");
+        let text = executor
+            .upsert_text(text_input(77, "普通文本", "普通文本", 326))
+            .expect("写入残留字段文本失败");
+        drop(executor);
+
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开损坏字段数据库失败");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("关闭测试数据库 CHECK 约束失败");
+        connection
+            .execute(
+                "UPDATE clipboard_items SET image_path = NULL WHERE id = ?1",
+                params![missing_path.id],
+            )
+            .expect("制造缺路径记录失败");
+        connection
+            .execute(
+                "UPDATE clipboard_items SET image_format = 'PNG' WHERE id = ?1",
+                params![invalid_format.id],
+            )
+            .expect("制造坏格式记录失败");
+        let other_hash_hex = "4d".repeat(32);
+        connection
+            .execute(
+                "UPDATE clipboard_items SET image_path = ?1 WHERE id = ?2",
+                params![
+                    format!("4d/{other_hash_hex}.png"),
+                    mismatched_path.id
+                ],
+            )
+            .expect("制造路径哈希错配记录失败");
+        connection
+            .execute(
+                "UPDATE clipboard_items SET image_format = 'png' WHERE id = ?1",
+                params![text.id],
+            )
+            .expect("制造文本残留图片格式失败");
+        for id in [
+            missing_path.id,
+            invalid_format.id,
+            mismatched_path.id,
+            text.id,
+        ] {
+            assert!(matches!(
+                super::get_history_payload(&connection, id),
+                Err(crate::storage::StorageError::InvalidImageAssetMetadata)
+            ));
+        }
+        drop(connection);
         remove_directory(&directory);
     }
 
@@ -3641,6 +3850,7 @@ mod tests {
         assert_eq!(payload.source_exe, None);
         assert_eq!(payload.source_app, None);
         assert_eq!(payload.last_used_at, None);
+        assert_eq!(payload.image, None);
         drop(executor);
         remove_directory(&directory);
     }

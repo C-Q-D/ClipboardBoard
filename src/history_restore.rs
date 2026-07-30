@@ -403,6 +403,7 @@ mod tests {
             created_at: 1,
             copied_at: 1,
             last_used_at: None,
+            image: None,
         };
         let result = super::build_ui_item(&summary, &payload, 1_000);
         assert!(matches!(
@@ -441,6 +442,7 @@ mod tests {
             created_at: 1,
             copied_at: 1,
             last_used_at: None,
+            image: None,
         };
 
         assert!(matches!(

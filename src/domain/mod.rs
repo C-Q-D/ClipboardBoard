@@ -5,10 +5,14 @@
 
 pub mod clipboard_item;
 pub mod hash;
+pub mod image_content;
 pub mod image_metadata;
 
 pub use clipboard_item::{ClipboardItemSummary, ClipboardPayload, TEXT_SUMMARY_MAX_CHARS};
 pub use hash::{hash_text, normalize_text, TEXT_HASH_DOMAIN};
+pub use image_content::{
+    CanonicalImageError, CanonicalImagePixels, CANONICAL_IMAGE_HASH_DOMAIN,
+};
 pub use image_metadata::{
     ImageAssetRelativePath, ImageAssetRootId, ImageMetadata, ImageMetadataError,
     ImageOriginalFormat,

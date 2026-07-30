@@ -25,6 +25,12 @@ export struct ClipboardCard {
     // 图片原始尺寸仅用于摘要文案，不参与卡片动态测量。
     image_width: int,
     image_height: int,
+    // 后台缩略图在 UI 线程转换后的受限图片；未完成时保持默认空图片。
+    thumbnail: image,
+    // 显式状态用于区分空图片与加载中占位，不在 Slint 内推断图片内容。
+    thumbnail_loaded: bool,
+    // 文件缺失或损坏时显示稳定失败占位。
+    thumbnail_failed: bool,
 }
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -436,14 +442,28 @@ export component AppWindow inherits Window {
                             self.viewport-height
                         );
                     }
+                    changed visible-height => {
+                        history-viewport-changed(
+                            self.viewport-y,
+                            self.visible-height,
+                            self.viewport-height
+                        );
+                    }
+                    changed viewport-height => {
+                        history-viewport-changed(
+                            self.viewport-y,
+                            self.visible-height,
+                            self.viewport-height
+                        );
+                    }
 
                     for card[index] in cards: Rectangle {
-                        // 106px delegate = 96px 卡片 + 10px 透明间隔，保持原有视觉密度。
-                        height: 106px;
+                        // 图片卡片提供 176px 预览区，文本卡片保持原有 96px 密度。
+                        height: card.is_image ? 186px : 106px;
                         background: transparent;
 
                         card-background := Rectangle {
-                            height: 96px;
+                            height: card.is_image ? 176px : 96px;
                             width: parent.width;
                             // 固定高度虚拟卡片必须裁剪子元素，禁止长预览绘制到卡片间隔。
                             clip: true;
@@ -456,6 +476,7 @@ export component AppWindow inherits Window {
                             border-radius: 10px;
 
                             VerticalLayout {
+                                visible: !card.is_image;
                                 width: parent.width - 144px;
                                 height: parent.height;
                                 padding: 14px;
@@ -495,6 +516,53 @@ export component AppWindow inherits Window {
                                 }
                             }
 
+                            if card.is_image: Rectangle {
+                                x: 14px;
+                                y: 12px;
+                                width: parent.width - 172px;
+                                height: 112px;
+                                background: #0d0d0d;
+                                border-width: 1px;
+                                border-color: #303030;
+                                border-radius: 6px;
+                                clip: true;
+
+                                Image {
+                                    visible: card.thumbnail_loaded;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    source: card.thumbnail;
+                                    image-fit: cover;
+                                }
+
+                                Text {
+                                    visible: !card.thumbnail_loaded;
+                                    text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
+                                    color: #666666;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            if card.is_image: Text {
+                                x: 14px;
+                                y: 132px;
+                                width: parent.width - 172px;
+                                text: "图片  " + card.image_width + " × " + card.image_height;
+                                color: #f5f5f5;
+                                font-size: 12px;
+                            }
+
+                            if card.is_image: Text {
+                                x: 14px;
+                                y: 151px;
+                                width: parent.width - 172px;
+                                text: card.source + "  ·  " + card.relative_time;
+                                color: #777777;
+                                font-size: 11px;
+                            }
+
                             card-touch := TouchArea {
                                 // 右侧 144px 属于删除、收藏和复制按钮，主体选择区与操作区不重叠。
                                 width: parent.width - 144px;
@@ -505,7 +573,7 @@ export component AppWindow inherits Window {
 
                             delete-button := Rectangle {
                                 x: parent.width - 138px;
-                                y: 30px;
+                                y: (parent.height - self.height) / 2;
                                 width: 36px;
                                 height: 36px;
                                 border-radius: 6px;
@@ -535,7 +603,7 @@ export component AppWindow inherits Window {
 
                             pin-button := Rectangle {
                                 x: parent.width - 94px;
-                                y: 30px;
+                                y: (parent.height - self.height) / 2;
                                 width: 36px;
                                 height: 36px;
                                 border-radius: 6px;
@@ -565,7 +633,7 @@ export component AppWindow inherits Window {
 
                             copy-button := Rectangle {
                                 x: parent.width - 50px;
-                                y: 30px;
+                                y: (parent.height - self.height) / 2;
                                 width: 44px;
                                 height: 36px;
                                 border-radius: 6px;

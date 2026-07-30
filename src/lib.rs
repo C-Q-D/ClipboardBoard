@@ -25,6 +25,7 @@ pub mod history_query;
 pub mod search;
 // 存储模块只暴露单线程执行器，不把 SQLite 连接、Statement 或 SQL 句柄泄漏到业务调用方。
 pub mod storage;
+pub mod thumbnail_loader;
 
 // ClipboardIO 依赖 Windows 剪贴板和全局内存 API，只在 Windows 目标暴露，避免跨平台构建
 // 引入无法实现的原生句柄类型。

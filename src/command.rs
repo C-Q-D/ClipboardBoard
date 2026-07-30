@@ -135,7 +135,12 @@ impl UiClipboardItem {
             .source_app
             .as_deref()
             .filter(|value| !value.is_empty())
-            .or_else(|| result.source_exe.as_deref().filter(|value| !value.is_empty()))
+            .or_else(|| {
+                result
+                    .source_exe
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or("未知来源")
             .to_owned();
         let metadata = &result.metadata;
@@ -265,6 +270,8 @@ pub enum UiEvent {
     SearchDebounceElapsed { generation: u64 },
     /// SQLite 查询 worker 的无正文唤醒；UI 从绑定的 latest 结果槽提取真实结果。
     HistoryQueryWake,
+    /// 后台缩略图线程完成一次受限像素读取；UI 线程必须重新校验面板代次和卡片身份。
+    ThumbnailLoaded(crate::thumbnail_loader::ThumbnailLoadResult),
     /// 收藏 worker 已完成一次事务；结果不携带正文且必须与活动 mutation 完整匹配。
     PinMutationCompleted(PinMutationResult),
     /// 删除 worker 已完成一次事务；DEL-02 只建立事件接缝，DEL-03 再消费并更新快照。

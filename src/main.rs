@@ -10,6 +10,7 @@ use clipboard_board::app::post_ui_event;
 use clipboard_board::app::{
     bind_app_window, bind_clear_history_mutation_sender, bind_copy_request_inbox,
     bind_delete_mutation_sender, bind_history_query_bridge, bind_pin_mutation_sender,
+    bind_thumbnail_loader_sender,
 };
 #[cfg(windows)]
 use clipboard_board::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
@@ -38,6 +39,8 @@ use clipboard_board::image_storage::{prepare_image_storage, ImageStoragePreferen
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
 use clipboard_board::storage::{StorageClient, StorageExecutor};
+#[cfg(windows)]
+use clipboard_board::thumbnail_loader::ThumbnailLoader;
 #[cfg(windows)]
 use slint::ComponentHandle;
 #[cfg(windows)]
@@ -168,6 +171,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    let thumbnail_loader = match ThumbnailLoader::start(|result| {
+        post_ui_event(UiEvent::ThumbnailLoaded(result)).is_ok()
+    }) {
+        Ok(loader) => loader,
+        Err(error) => {
+            clear_history_mutations.close();
+            delete_mutations.close();
+            pin_mutations.close();
+            history_requests.close();
+            history_results.close();
+            let _ = hotkey_manager.stop();
+            let _ = capture_pump.join();
+            let _ = history_query_worker.join();
+            let _ = pin_mutation_worker.join();
+            let _ = delete_mutation_worker.join();
+            let _ = clear_history_worker.join();
+            let _ = image_worker.stop();
+            return Err(error.into());
+        }
+    };
+    bind_thumbnail_loader_sender(thumbnail_loader.sender());
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Running));
     let event_loop_result = slint::run_event_loop_until_quit();
     diagnostics::emit(DiagnosticEvent::thread_state(ThreadState::Stopping));
@@ -199,6 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "清空历史线程异常退出")
         .map(|_| ());
+    // 缩略图线程只读取已提交文件，UI 退出后先排空它，避免清理阶段仍向事件循环投递。
+    let thumbnail_loader_result = thumbnail_loader.stop();
     // 捕获泵和图片 mutation 均已完成 finalize/回收，随后才能停止独占资产根的 ImageWorker。
     let image_worker_result = image_worker.stop();
     // 先关闭并 join 所有业务线程，再建立存储关闭线性化点，避免退出期丢失捕获或查询。
@@ -215,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pin_mutation_result?;
     delete_mutation_result?;
     clear_history_result?;
+    thumbnail_loader_result?;
     storage_result?;
     Ok(())
 }

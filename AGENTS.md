@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| ATOMIC-IMAGE-HISTORY-UI-001 | 原子开发 | `docs/planning/图片历史接入与预览原子计划.md` |
+| — | — | 当前无活动计划，等待用户验证 ATOM-36/37 图片历史与缩略图卡片 |
 
 <!-- codex-plan-index:end -->

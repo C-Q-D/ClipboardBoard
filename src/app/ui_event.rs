@@ -19,10 +19,14 @@ use crate::history_query::{
 };
 use crate::search::{SearchCoordinator, SearchCoordinatorError};
 use crate::storage::HistoryQuery;
+use crate::thumbnail_loader::{ThumbnailLoadRequest, ThumbnailLoadResult, ThumbnailLoaderSender};
 use crate::AppWindow;
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{
+    CloseRequestResponse, ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer,
+    SharedString, VecModel,
+};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
 use std::time::Duration;
@@ -44,6 +48,12 @@ pub const UI_FIRST_BATCH_SIZE: usize = 30;
 const HISTORY_CARD_HEIGHT: i32 = 106;
 /// 距离列表底部两行以内视为进入续页区域。
 const HISTORY_BOTTOM_THRESHOLD: i32 = HISTORY_CARD_HEIGHT * 2;
+/// 图片卡片固定高度；视口调度无需解码正文或测量图片。
+const IMAGE_CARD_HEIGHT: i32 = 186;
+/// 视口上下各多加载两张图片卡片，减少快速滚动时的空白闪烁。
+const THUMBNAIL_VIEWPORT_BUFFER: i32 = IMAGE_CARD_HEIGHT * 2;
+/// UI 纹理缓存上限；超过时整体回收，避免长时间滚动持续增长。
+const THUMBNAIL_CACHE_CAPACITY: usize = 64;
 /// 清空全部强确认必须逐字匹配的固定短语；不做 trim 或大小写等宽松处理。
 const CLEAR_ALL_CONFIRMATION_PHRASE: &str = "清空全部";
 
@@ -343,6 +353,7 @@ impl UiState {
                 self.apply_search_if_current(generation, now)
             }
             UiEvent::HistoryQueryWake => UiAction::None,
+            UiEvent::ThumbnailLoaded(_) => UiAction::None,
             UiEvent::PinMutationCompleted(result) => {
                 self.apply_pin_mutation_result(result);
                 UiAction::None
@@ -1278,6 +1289,20 @@ impl UiState {
 thread_local! {
     /// 每个线程各自持有状态；只有运行 Slint 事件循环的线程会收到后台提交的事件。
     static UI_STATE: RefCell<UiState> = RefCell::new(UiState::default());
+    /// 缩略图请求端只在 UI 线程使用，后台线程无法取得 Slint 图片对象。
+    static UI_THUMBNAIL_LOADER: RefCell<Option<ThumbnailLoaderSender>> = const { RefCell::new(None) };
+    /// 已提交身份用于抑制滚动重绘产生的重复请求。
+    static UI_THUMBNAIL_REQUESTED: RefCell<HashSet<(u64, u64, [u8; 32])>> = RefCell::new(HashSet::new());
+    /// 解码像素只能在 UI 线程转换为 Slint Image，并按稳定记录身份缓存。
+    static UI_THUMBNAIL_CACHE: RefCell<HashMap<(u64, [u8; 32]), Image>> = RefCell::new(HashMap::new());
+    /// 失败身份显示稳定占位，避免布局变化重复读取同一坏文件。
+    static UI_THUMBNAIL_FAILED: RefCell<HashSet<(u64, [u8; 32])>> = RefCell::new(HashSet::new());
+    /// 最近一次视口重算得到的图片身份；滚出缓冲区的迟到结果不得进入纹理缓存。
+    static UI_THUMBNAIL_VISIBLE: RefCell<HashSet<(u64, [u8; 32])>> = RefCell::new(HashSet::new());
+    /// 成功和失败身份共享的先进先出淘汰顺序；每次只淘汰一个旧身份，不整表闪回。
+    static UI_THUMBNAIL_CACHE_ORDER: RefCell<VecDeque<(u64, [u8; 32])>> = const { RefCell::new(VecDeque::new()) };
+    /// 最近一次真实列表视口；模型增删和分页后必须沿用它重新计算可见图片。
+    static UI_THUMBNAIL_VIEWPORT: RefCell<(i32, i32)> = const { RefCell::new((0, 500)) };
     /// UI 线程持有的弱窗口引用，避免事件入口形成窗口强引用环。
     static UI_WINDOW: RefCell<Option<slint::Weak<AppWindow>>> = const { RefCell::new(None) };
     #[cfg(windows)]
@@ -1525,6 +1550,13 @@ pub fn bind_clear_history_mutation_sender(sender: ClearHistoryMutationSender) {
     });
 }
 
+/// 在 UI 线程绑定缩略图后台加载器；请求端有界且提交过程不阻塞滚动。
+pub fn bind_thumbnail_loader_sender(sender: ThumbnailLoaderSender) {
+    UI_THUMBNAIL_LOADER.with(|slot| {
+        *slot.borrow_mut() = Some(sender);
+    });
+}
+
 /// 关闭查询双向桥；Quit 调用后 worker 不再接受排队请求，迟到结果也不再唤醒 UI。
 fn close_history_query_bridge() {
     UI_HISTORY_REQUESTS.with(|slot| {
@@ -1572,6 +1604,23 @@ fn close_clear_history_mutation_bridge() {
 /// 已成功进入队列，实际状态更新要等事件循环运行到该闭包后才发生。
 pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     slint::invoke_from_event_loop(move || {
+        let thumbnail_result = match &event {
+            UiEvent::ThumbnailLoaded(result) => Some(result.clone()),
+            _ => None,
+        };
+        let viewport = match &event {
+            UiEvent::HistoryViewportChanged {
+                viewport_y,
+                visible_height,
+                ..
+            } => Some((*viewport_y, *visible_height)),
+            _ => None,
+        };
+        if let Some(viewport) = viewport {
+            UI_THUMBNAIL_VIEWPORT.with(|current| {
+                *current.borrow_mut() = viewport;
+            });
+        }
         let history_result = if matches!(&event, UiEvent::HistoryQueryWake) {
             UI_HISTORY_RESULTS.with(|slot| {
                 slot.borrow()
@@ -1693,8 +1742,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 });
             }
         }
+        // 后台结果必须在 UI 线程重新核对当前面板代次和稳定身份，旧会话结果直接丢弃。
+        let thumbnail_applied = thumbnail_result
+            .as_ref()
+            .is_some_and(|result| apply_thumbnail_result(result, &snapshot));
         // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
-        let refresh_model = may_refresh_model && action != UiAction::Reassert;
+        let refresh_model =
+            (may_refresh_model || thumbnail_applied) && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
             #[cfg(windows)]
@@ -1703,6 +1757,9 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             close_pin_mutation_bridge();
             close_delete_mutation_bridge();
             close_clear_history_mutation_bridge();
+            UI_THUMBNAIL_LOADER.with(|slot| {
+                slot.borrow_mut().take();
+            });
             // 退出调用必须在 Slint 事件线程执行，后台 Win32 回调只负责投递事件。
             if let Err(error) = slint::quit_event_loop() {
                 eprintln!("退出 Slint 事件循环失败：{error}");
@@ -1747,12 +1804,17 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
+                let retained_viewport_y =
+                    thumbnail_applied.then(|| window.get_history_viewport_y());
                 set_window_snapshot(
                     &window,
                     &snapshot,
                     pending_pin_mutation.as_ref(),
                     pending_delete_mutation.as_ref(),
                 );
+                if let Some(viewport_y) = retained_viewport_y {
+                    window.set_history_viewport_y(viewport_y);
+                }
             }
             // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
             window.set_selected_index(
@@ -1761,8 +1823,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     .and_then(|index| i32::try_from(index).ok())
                     .unwrap_or(-1),
             );
-            if refresh_model || action == UiAction::ScrollSelection {
-                ensure_selection_visible(&window, snapshot.selected_index);
+            if (refresh_model && !thumbnail_applied) || action == UiAction::ScrollSelection {
+                ensure_selection_visible(&window, &snapshot);
             }
 
             if let UiAction::QueueCopy { id, content_hash } = action {
@@ -1776,7 +1838,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     let show_result = perform_show_action(
                         || window.show(),
                         || {
-                            ensure_selection_visible(&window, snapshot.selected_index);
+                            ensure_selection_visible(&window, &snapshot);
                             #[cfg(windows)]
                             {
                                 let positioned = position_panel(&window);
@@ -1841,6 +1903,24 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 UiAction::Quit => unreachable!("退出动作必须在窗口副作用前处理"),
             }
         });
+
+        // 首次显示/模型变化加载顶部可见区域；真实滚动事件按当前视口重新计算。
+        let panel_visible = UI_STATE.with(|state| state.borrow().panel_visible);
+        if panel_visible && action != UiAction::Quit {
+            let (viewport_y, visible_height) =
+                UI_THUMBNAIL_VIEWPORT.with(|current| *current.borrow());
+            if may_refresh_model || viewport.is_some() {
+                schedule_thumbnail_requests(
+                    &snapshot,
+                    current_panel_generation(),
+                    viewport_y,
+                    visible_height,
+                );
+            }
+        } else if action == UiAction::Hide {
+            UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+            UI_THUMBNAIL_REQUESTED.with(|requested| requested.borrow_mut().clear());
+        }
     })
 }
 
@@ -1849,6 +1929,7 @@ fn event_may_refresh_model(event: &UiEvent) -> bool {
     !matches!(
         event,
         UiEvent::MoveSelection { .. }
+            | UiEvent::ThumbnailLoaded(_)
             | UiEvent::SelectItem { .. }
             | UiEvent::CopyItem { .. }
             | UiEvent::HistoryViewportChanged { .. }
@@ -1861,6 +1942,150 @@ fn event_may_refresh_model(event: &UiEvent) -> bool {
             | UiEvent::ClearAllCancelled
             | UiEvent::ClearAllConfirmed { .. }
     )
+}
+
+/// 接受当前会话仍存在的缩略图结果，并在 UI 线程构造 Slint 图片。
+fn apply_thumbnail_result(result: &ThumbnailLoadResult, snapshot: &UiSnapshot) -> bool {
+    // 每个结果都结束对应在途身份；即使已滚出视口，滚回后也必须允许重新加载。
+    UI_THUMBNAIL_REQUESTED.with(|requested| {
+        requested
+            .borrow_mut()
+            .remove(&(result.panel_generation, result.id, result.content_hash));
+    });
+    let current = UI_STATE.with(|state| {
+        let state = state.borrow();
+        state.panel_visible
+            && state.panel_generation == result.panel_generation
+            && UI_THUMBNAIL_VISIBLE
+                .with(|visible| visible.borrow().contains(&(result.id, result.content_hash)))
+            && snapshot
+                .items
+                .iter()
+                .any(|item| item.id == result.id && item.content_hash == result.content_hash)
+    });
+    if !current {
+        return false;
+    }
+    let identity = (result.id, result.content_hash);
+    let Ok(pixels) = &result.outcome else {
+        reserve_thumbnail_cache_slot(identity);
+        UI_THUMBNAIL_FAILED.with(|failed| {
+            failed.borrow_mut().insert(identity);
+        });
+        return true;
+    };
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(pixels.width, pixels.height);
+    if buffer.make_mut_bytes().len() != pixels.rgba.len() {
+        return false;
+    }
+    buffer.make_mut_bytes().copy_from_slice(&pixels.rgba);
+    let image = Image::from_rgba8(buffer);
+    reserve_thumbnail_cache_slot(identity);
+    UI_THUMBNAIL_CACHE.with(|cache| {
+        cache.borrow_mut().insert(identity, image);
+    });
+    UI_THUMBNAIL_FAILED.with(|failed| {
+        failed.borrow_mut().remove(&identity);
+    });
+    true
+}
+
+/// 为新结果预留一个有界槽位；满载时只淘汰最早身份，避免当前模型整表闪回。
+fn reserve_thumbnail_cache_slot(identity: (u64, [u8; 32])) {
+    UI_THUMBNAIL_CACHE_ORDER.with(|order| {
+        let mut order = order.borrow_mut();
+        order.retain(|candidate| *candidate != identity);
+        if order.len() >= THUMBNAIL_CACHE_CAPACITY {
+            // 当前视口身份优先保留；固定卡片下可见集远小于缓存上限，通常总能淘汰不可见项。
+            let evict_index = UI_THUMBNAIL_VISIBLE.with(|visible| {
+                let visible = visible.borrow();
+                order
+                    .iter()
+                    .position(|candidate| !visible.contains(candidate))
+                    .unwrap_or(0)
+            });
+            if let Some(evicted) = order.remove(evict_index) {
+                UI_THUMBNAIL_CACHE.with(|cache| {
+                    cache.borrow_mut().remove(&evicted);
+                });
+                UI_THUMBNAIL_FAILED.with(|failed| {
+                    failed.borrow_mut().remove(&evicted);
+                });
+            }
+        }
+        order.push_back(identity);
+    });
+}
+
+/// 按已知固定卡片高度计算视口附近图片，并向有界后台线程非阻塞提交。
+fn schedule_thumbnail_requests(
+    snapshot: &UiSnapshot,
+    panel_generation: u64,
+    viewport_y: i32,
+    visible_height: i32,
+) {
+    let panel_visible = UI_STATE.with(|state| state.borrow().panel_visible);
+    if !panel_visible || panel_generation == 0 || visible_height <= 0 {
+        UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+        return;
+    }
+    let top = viewport_y.saturating_neg().max(0);
+    let load_top = top.saturating_sub(THUMBNAIL_VIEWPORT_BUFFER);
+    let load_bottom = top
+        .saturating_add(visible_height)
+        .saturating_add(THUMBNAIL_VIEWPORT_BUFFER);
+    UI_THUMBNAIL_REQUESTED.with(|requested| {
+        requested
+            .borrow_mut()
+            .retain(|(generation, _, _)| *generation == panel_generation);
+    });
+    UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+    let mut item_top = 0_i32;
+    for item in visible_snapshot_items(snapshot) {
+        let (item_height, thumbnail_path) = match &item.kind {
+            crate::command::UiClipboardItemKind::Text => (HISTORY_CARD_HEIGHT, None),
+            crate::command::UiClipboardItemKind::Image(image) => {
+                (IMAGE_CARD_HEIGHT, Some(image.thumbnail_path.clone()))
+            }
+        };
+        let item_bottom = item_top.saturating_add(item_height);
+        if item_bottom >= load_top && item_top <= load_bottom {
+            if let Some(path) = thumbnail_path {
+                let identity = (item.id, item.content_hash);
+                UI_THUMBNAIL_VISIBLE.with(|visible| {
+                    visible.borrow_mut().insert(identity);
+                });
+                let cache_hit = UI_THUMBNAIL_CACHE
+                    .with(|cache| cache.borrow().contains_key(&identity))
+                    || UI_THUMBNAIL_FAILED.with(|failed| failed.borrow().contains(&identity));
+                let request_key = (panel_generation, item.id, item.content_hash);
+                let already_requested = UI_THUMBNAIL_REQUESTED
+                    .with(|requested| requested.borrow().contains(&request_key));
+                if !cache_hit && !already_requested {
+                    let request = ThumbnailLoadRequest {
+                        panel_generation,
+                        id: item.id,
+                        content_hash: item.content_hash,
+                        path,
+                    };
+                    let submitted = UI_THUMBNAIL_LOADER.with(|slot| {
+                        slot.borrow()
+                            .as_ref()
+                            .is_some_and(|sender| sender.try_submit(request).is_ok())
+                    });
+                    if submitted {
+                        UI_THUMBNAIL_REQUESTED.with(|requested| {
+                            requested.borrow_mut().insert(request_key);
+                        });
+                    }
+                }
+            }
+        }
+        if item_top > load_bottom {
+            break;
+        }
+        item_top = item_bottom;
+    }
 }
 
 #[cfg(windows)]
@@ -2013,10 +2238,7 @@ fn set_window_snapshot(
             delete_pending: pending_delete.is_some_and(|pending| {
                 pending.id == item.id && pending.content_hash == item.content_hash
             }),
-            is_image: matches!(
-                item.kind,
-                crate::command::UiClipboardItemKind::Image(_)
-            ),
+            is_image: matches!(item.kind, crate::command::UiClipboardItemKind::Image(_)),
             copy_enabled: item.copy_enabled(),
             image_width: match &item.kind {
                 crate::command::UiClipboardItemKind::Image(image) => {
@@ -2030,6 +2252,17 @@ fn set_window_snapshot(
                 }
                 crate::command::UiClipboardItemKind::Text => 0,
             },
+            thumbnail: UI_THUMBNAIL_CACHE.with(|cache| {
+                cache
+                    .borrow()
+                    .get(&(item.id, item.content_hash))
+                    .cloned()
+                    .unwrap_or_default()
+            }),
+            thumbnail_loaded: UI_THUMBNAIL_CACHE
+                .with(|cache| cache.borrow().contains_key(&(item.id, item.content_hash))),
+            thumbnail_failed: UI_THUMBNAIL_FAILED
+                .with(|failed| failed.borrow().contains(&(item.id, item.content_hash))),
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
@@ -2058,9 +2291,10 @@ fn visible_snapshot_items(snapshot: &UiSnapshot) -> impl Iterator<Item = &UiClip
     snapshot.items.iter().take(MAX_LOADED_ITEMS)
 }
 
-/// 根据固定 106px 卡片高度计算保持选中项可见所需的负向视口偏移。
+/// 根据已计算的混合卡片边界求保持选中项可见所需的负向视口偏移。
 fn selection_viewport_y(
-    selected_index: usize,
+    item_top: f32,
+    item_bottom: f32,
     current_viewport_y: f32,
     visible_height: f32,
     content_height: f32,
@@ -2071,8 +2305,6 @@ fn selection_viewport_y(
 
     let max_offset = (content_height - visible_height).max(0.0);
     let current_offset = (-current_viewport_y).clamp(0.0, max_offset);
-    let item_top = selected_index as f32 * 106.0;
-    let item_bottom = item_top + 106.0;
     let target_offset = if item_top < current_offset {
         item_top
     } else if item_bottom > current_offset + visible_height {
@@ -2084,15 +2316,35 @@ fn selection_viewport_y(
     -target_offset.clamp(0.0, max_offset)
 }
 
+/// 累加文本和图片的已知固定高度，返回指定索引的精确上下边界。
+fn selection_item_bounds(snapshot: &UiSnapshot, selected_index: usize) -> Option<(f32, f32)> {
+    let mut top = 0_f32;
+    for (index, item) in visible_snapshot_items(snapshot).enumerate() {
+        let height = match item.kind {
+            crate::command::UiClipboardItemKind::Text => HISTORY_CARD_HEIGHT as f32,
+            crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as f32,
+        };
+        if index == selected_index {
+            return Some((top, top + height));
+        }
+        top += height;
+    }
+    None
+}
+
 /// 在 UI 线程把选中卡片滚入视口；空列表或尚未完成布局时安全回到顶部。
-fn ensure_selection_visible(window: &AppWindow, selected_index: Option<usize>) {
-    let Some(selected_index) = selected_index else {
+fn ensure_selection_visible(window: &AppWindow, snapshot: &UiSnapshot) {
+    let Some(selected_index) = snapshot.selected_index else {
         window.set_history_viewport_y(0.0);
+        return;
+    };
+    let Some((item_top, item_bottom)) = selection_item_bounds(snapshot, selected_index) else {
         return;
     };
 
     let target = selection_viewport_y(
-        selected_index,
+        item_top,
+        item_bottom,
         window.get_history_viewport_y(),
         window.get_history_visible_height(),
         window.get_history_viewport_height(),
@@ -2195,13 +2447,14 @@ mod tests {
     use super::{activation_attempt, ActivationAttempt};
     use super::{
         bind_clear_history_mutation_sender, close_clear_history_mutation_bridge,
-        event_may_refresh_model, perform_show_action, selection_viewport_y, visible_snapshot_items,
-        UiAction, UiState, CLEAR_ALL_CONFIRMATION_PHRASE, UI_FIRST_BATCH_SIZE,
-        UI_HISTORY_MEMORY_CAPACITY,
+        apply_thumbnail_result, event_may_refresh_model, perform_show_action,
+        reserve_thumbnail_cache_slot, schedule_thumbnail_requests, selection_item_bounds,
+        selection_viewport_y, visible_snapshot_items, UiAction, UiState,
+        CLEAR_ALL_CONFIRMATION_PHRASE, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{
-        SearchFilter, SearchStatus, UiClipboardItem, UiClipboardItemKind, UiEvent,
-        UiImageSummary, UiSnapshot,
+        SearchFilter, SearchStatus, UiClipboardItem, UiClipboardItemKind, UiEvent, UiImageSummary,
+        UiSnapshot,
     };
     use crate::history_mutation::{
         clear_history_mutation_channel, ClearHistoryMutationFailure, ClearHistoryMutationRequest,
@@ -2210,6 +2463,7 @@ mod tests {
         PinMutationResult,
     };
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
+    use crate::thumbnail_loader::{ThumbnailLoadFailure, ThumbnailLoadResult};
     use std::time::{Duration, Instant};
 
     /// 构造具有稳定哈希的测试卡片，便于验证首批边界而不混入重复去重行为。
@@ -3972,11 +4226,115 @@ mod tests {
     /// 选中项进入视口上方、下方和内容边界时，偏移必须使用负向 viewport-y 并夹紧。
     #[test]
     fn 选中项视口定位使用固定卡片高度() {
-        assert_eq!(selection_viewport_y(0, 0.0, 212.0, 1000.0), 0.0);
-        assert_eq!(selection_viewport_y(4, 0.0, 212.0, 1000.0), -318.0);
-        assert_eq!(selection_viewport_y(29, 0.0, 212.0, 3180.0), -2968.0);
-        assert_eq!(selection_viewport_y(1, -318.0, 212.0, 1000.0), -106.0);
-        assert_eq!(selection_viewport_y(1, 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(selection_viewport_y(0.0, 106.0, 0.0, 212.0, 1000.0), 0.0);
+        assert_eq!(
+            selection_viewport_y(424.0, 530.0, 0.0, 212.0, 1000.0),
+            -318.0
+        );
+        assert_eq!(
+            selection_viewport_y(3074.0, 3180.0, 0.0, 212.0, 3180.0),
+            -2968.0
+        );
+        assert_eq!(
+            selection_viewport_y(106.0, 212.0, -318.0, 212.0, 1000.0),
+            -106.0
+        );
+        assert_eq!(selection_viewport_y(106.0, 212.0, 0.0, 0.0, 1000.0), 0.0);
+    }
+
+    /// 图片和文本使用各自固定高度，前序图片不能让后续选择偏移少算。
+    #[test]
+    fn 混合卡片选择边界累加图片高度() {
+        let mut image = test_item(0);
+        image.kind = UiClipboardItemKind::Image(UiImageSummary {
+            thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
+            width: 100,
+            height: 80,
+        });
+        let snapshot = UiSnapshot {
+            items: vec![image, test_item(1), test_item(2)],
+            selected_index: Some(2),
+        };
+
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((292.0, 398.0)));
+    }
+
+    /// 滚出视口的迟到结果虽然被拒绝，但必须结束在途身份，滚回后才能重新请求。
+    #[test]
+    fn 迟到缩略图结果释放在途身份() {
+        let item = test_item(0);
+        super::UI_THUMBNAIL_REQUESTED.with(|requested| {
+            requested
+                .borrow_mut()
+                .insert((9, item.id, item.content_hash));
+        });
+
+        let applied = apply_thumbnail_result(
+            &ThumbnailLoadResult {
+                panel_generation: 9,
+                id: item.id,
+                content_hash: item.content_hash,
+                outcome: Err(ThumbnailLoadFailure::Unavailable),
+            },
+            &UiSnapshot {
+                items: vec![item.clone()],
+                selected_index: None,
+            },
+        );
+
+        assert!(!applied);
+        super::UI_THUMBNAIL_REQUESTED.with(|requested| {
+            assert!(!requested
+                .borrow()
+                .contains(&(9, item.id, item.content_hash)));
+        });
+    }
+
+    /// 隐藏面板的模型刷新不得安排图片读取，并应清除旧可见集。
+    #[test]
+    fn 隐藏面板不调度缩略图() {
+        super::UI_STATE.with(|state| {
+            *state.borrow_mut() = UiState::default();
+        });
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| {
+            visible.borrow_mut().insert((99, [0x33; 32]));
+        });
+
+        schedule_thumbnail_requests(
+            &UiSnapshot {
+                items: vec![test_item(0)],
+                selected_index: None,
+            },
+            4,
+            0,
+            500,
+        );
+
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| {
+            assert!(visible.borrow().is_empty());
+        });
+    }
+
+    /// 缓存满载时只淘汰最早身份，不能整表清空造成同屏图片闪回。
+    #[test]
+    fn 缩略图缓存按单项淘汰保持有界() {
+        super::UI_THUMBNAIL_CACHE_ORDER.with(|order| order.borrow_mut().clear());
+        super::UI_THUMBNAIL_FAILED.with(|failed| failed.borrow_mut().clear());
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+        for id in 0_u64..=64 {
+            let identity = (id, [id as u8; 32]);
+            reserve_thumbnail_cache_slot(identity);
+            super::UI_THUMBNAIL_FAILED.with(|failed| {
+                failed.borrow_mut().insert(identity);
+            });
+        }
+
+        super::UI_THUMBNAIL_FAILED.with(|failed| {
+            let failed = failed.borrow();
+            assert_eq!(failed.len(), 64);
+            assert!(!failed.contains(&(0, [0; 32])));
+            assert!(failed.contains(&(64, [64; 32])));
+        });
     }
 
     /// 收藏点击只建立 pending 和明确期望状态，数据库成功前不能乐观改变星标。

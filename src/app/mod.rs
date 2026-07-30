@@ -7,6 +7,6 @@ mod ui_event;
 pub use ui_event::bind_copy_request_inbox;
 pub use ui_event::{
     bind_app_window, bind_clear_history_mutation_sender, bind_delete_mutation_sender,
-    bind_history_query_bridge, bind_pin_mutation_sender, post_ui_event, ui_state_snapshot,
-    UiStateSnapshot,
+    bind_history_query_bridge, bind_pin_mutation_sender, bind_thumbnail_loader_sender,
+    post_ui_event, ui_state_snapshot, UiStateSnapshot,
 };

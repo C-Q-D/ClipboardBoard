@@ -8,20 +8,26 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{GlobalFree, HANDLE};
+use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
+use crate::image_copy::PreparedImageClipboard;
+
 /// Windows 预定义 Unicode 文本格式编号；与读取端保持同一格式契约。
 pub const CF_UNICODETEXT_FORMAT: u32 = 13;
+/// Windows 预定义 DIBV5 格式编号；内存必须从 `BITMAPV5HEADER` 开始。
+pub const CF_DIBV5_FORMAT: u32 = 17;
 
-/// 当前原子只允许写回 Unicode 文本；图片和富文本由后续原子扩展。
+/// 应用主动写回的系统剪贴板格式身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardWriteFormat {
     /// Windows `CF_UNICODETEXT` 格式。
     UnicodeText,
+    /// Windows `CF_DIBV5` 格式。
+    DibV5,
 }
 
 /// 一次自身写回事务的匹配键；sequence 在写入成功后绑定，消费前必须精确匹配。
@@ -165,20 +171,37 @@ impl ClipboardWriteExpectationStore {
                 index += 1;
                 continue;
             };
-            if expected_sequence == sequence {
-                if expectation.content_hash == content_hash && expectation.format == format {
-                    state.pending.remove(index);
-                    return true;
-                }
-                // sequence 已经被其他格式/正文占用，不能让这条预期永久阻塞后续事件。
+            if expected_sequence == sequence
+                && expectation.content_hash == content_hash
+                && expectation.format == format
+            {
                 state.pending.remove(index);
-                continue;
+                return true;
             }
             // 事件可能乱序到达，不能仅因观察到更晚 sequence 就删除更早的自身预期；
             // 由上面的 TTL 统一回收没有等到精确事件的异常事务。
             index += 1;
         }
         false
+    }
+
+    /// 查询是否存在精确 sequence/format 候选，不消费也不暴露哈希或队列内容。
+    ///
+    /// 图片捕获只有在本方法返回 true 时才需要提前解码以比较规范像素哈希，避免普通
+    /// 图片捕获为了抑制检查重复解码。
+    pub fn has_candidate(&self, sequence: u32, format: ClipboardWriteFormat) -> bool {
+        let _write_guard = self.lock_write();
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        state.pending.retain(|expectation| {
+            now.checked_duration_since(expectation.armed_at)
+                .is_some_and(|age| age < WRITE_EXPECTATION_TTL)
+        });
+        state.pending.iter().any(|expectation| {
+            expectation.sequence == Some(sequence) && expectation.format == format
+        })
     }
 }
 
@@ -193,7 +216,7 @@ pub enum ClipboardWriteError {
     AllocationFailed,
     /// 无法锁定刚分配的全局内存。
     LockFailed,
-    /// Windows 拒绝接收 Unicode 文本句柄。
+    /// Windows 拒绝接收当前系统剪贴板格式句柄。
     SetFailed,
     /// 写入结束后无法关闭系统剪贴板。
     CloseFailed,
@@ -209,7 +232,7 @@ impl Display for ClipboardWriteError {
             Self::EmptyFailed => "无法清空系统剪贴板",
             Self::AllocationFailed => "无法分配剪贴板全局内存",
             Self::LockFailed => "无法锁定剪贴板全局内存",
-            Self::SetFailed => "无法写入 Unicode 文本格式",
+            Self::SetFailed => "无法写入系统剪贴板格式",
             Self::CloseFailed => "无法关闭系统剪贴板",
             Self::ExpectationLimitReached => "自身剪贴板写回过多，已拒绝本次复制",
         };
@@ -259,6 +282,31 @@ impl ClipboardWriter {
             write_result.close_succeeded,
         )
     }
+
+    /// 登记图片预期、写入 `CF_DIBV5` 并绑定成功后的精确序号。
+    pub fn write_dib_v5(
+        image: &PreparedImageClipboard,
+        expectations: &ClipboardWriteExpectationStore,
+    ) -> Result<u32, ClipboardWriteError> {
+        let _write_guard = expectations.lock_write();
+        let token = expectations
+            .arm(*image.content_hash(), ClipboardWriteFormat::DibV5)
+            .ok_or(ClipboardWriteError::ExpectationLimitReached)?;
+        let write_result = match write_clipboard_bytes_raw(image.dib_v5_bytes(), CF_DIBV5_FORMAT) {
+            Ok(result) => result,
+            Err(error) => {
+                expectations.cancel(token);
+                return Err(error);
+            }
+        };
+
+        finish_transferred_write(
+            expectations,
+            token,
+            write_result.sequence,
+            write_result.close_succeeded,
+        )
+    }
 }
 
 /// 将 Rust 字符串编码为以 NUL 结尾的 UTF-16 单元；该纯函数便于验证边界而不触碰系统剪贴板。
@@ -273,70 +321,130 @@ fn write_unicode_text_raw(text: &str) -> Result<RawWriteSuccess, ClipboardWriteE
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or(ClipboardWriteError::AllocationFailed)?;
-    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_count) };
-    if memory.is_null() {
-        return Err(ClipboardWriteError::AllocationFailed);
-    }
+    // Windows UTF-16 使用小端字节；切片只在 `utf16` 存活期间交给同步写入函数。
+    let bytes = unsafe { std::slice::from_raw_parts(utf16.as_ptr().cast::<u8>(), byte_count) };
+    write_clipboard_bytes_raw(bytes, CF_UNICODETEXT_FORMAT)
+}
 
-    let locked = unsafe { GlobalLock(memory) };
-    if locked.is_null() {
-        unsafe {
-            let _ = GlobalFree(memory);
-        }
-        return Err(ClipboardWriteError::LockFailed);
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(utf16.as_ptr().cast::<u8>(), locked.cast::<u8>(), byte_count);
-        let _ = GlobalUnlock(memory);
-    }
+/// 把拥有型调用方字节复制到可转移 HGLOBAL，并执行最小 Win32 剪贴板事务。
+fn write_clipboard_bytes_raw(
+    bytes: &[u8],
+    clipboard_format: u32,
+) -> Result<RawWriteSuccess, ClipboardWriteError> {
+    write_clipboard_bytes_with_backend(&mut Win32ClipboardBackend, bytes, clipboard_format)
+}
 
-    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
-        unsafe {
-            let _ = GlobalFree(memory);
-        }
+/// 把 Win32 剪贴板副作用压缩成可注入边界，便于证明 HGLOBAL 所有权转移。
+trait ClipboardWriteBackend {
+    /// 后端使用的可复制内存句柄。
+    type Memory: Copy;
+
+    /// 分配尚归应用所有的可移动内存。
+    fn allocate(&mut self, byte_count: usize) -> Option<Self::Memory>;
+    /// 锁定内存、复制全部字节并解锁。
+    fn copy_into(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), ClipboardWriteError>;
+    /// 释放尚未转移给系统的内存。
+    fn free(&mut self, memory: Self::Memory);
+    /// 打开当前线程的系统剪贴板事务。
+    fn open(&mut self) -> bool;
+    /// 清空旧内容。
+    fn empty(&mut self) -> bool;
+    /// 提交指定格式并在成功时转移内存所有权。
+    fn set(&mut self, format: u32, memory: Self::Memory) -> bool;
+    /// 在仍持有打开锁时取得剪贴板序号。
+    fn sequence(&mut self) -> u32;
+    /// 关闭系统剪贴板事务。
+    fn close(&mut self) -> bool;
+}
+
+/// 使用可注入后端执行所有权状态机；只有 `set` 成功后不再调用 `free`。
+fn write_clipboard_bytes_with_backend<B: ClipboardWriteBackend>(
+    backend: &mut B,
+    bytes: &[u8],
+    clipboard_format: u32,
+) -> Result<RawWriteSuccess, ClipboardWriteError> {
+    let memory = backend
+        .allocate(bytes.len())
+        .ok_or(ClipboardWriteError::AllocationFailed)?;
+    if let Err(error) = backend.copy_into(memory, bytes) {
+        backend.free(memory);
+        return Err(error);
+    }
+    if !backend.open() {
+        backend.free(memory);
         return Err(ClipboardWriteError::OpenFailed);
     }
 
-    let mut transferred = false;
-    let result = if unsafe { EmptyClipboard() } == 0 {
+    let result = if !backend.empty() {
         Err(ClipboardWriteError::EmptyFailed)
-    } else if unsafe { SetClipboardData(CF_UNICODETEXT_FORMAT, memory as HANDLE).is_null() } {
+    } else if !backend.set(clipboard_format, memory) {
         Err(ClipboardWriteError::SetFailed)
     } else {
-        transferred = true;
         // 仍持有 OpenClipboard 锁时读取序号；外部进程在 CloseClipboard 前无法替换内容。
-        Ok(unsafe { GetClipboardSequenceNumber() })
+        Ok(backend.sequence())
     };
-    let close_succeeded = unsafe { CloseClipboard() } != 0;
+    let close_succeeded = backend.close();
 
-    let sequence = match result {
-        Ok(sequence) => sequence,
+    match result {
+        Ok(sequence) => Ok(RawWriteSuccess {
+            sequence,
+            close_succeeded,
+        }),
         Err(error) => {
-            if !transferred {
-                unsafe {
-                    let _ = GlobalFree(memory);
-                }
-            }
-            return Err(error);
+            backend.free(memory);
+            Err(error)
         }
-    };
-    if !transferred {
+    }
+}
+
+/// 生产 Win32 后端；所有 unsafe 调用都限制在本实现内。
+struct Win32ClipboardBackend;
+
+impl ClipboardWriteBackend for Win32ClipboardBackend {
+    type Memory = HGLOBAL;
+
+    fn allocate(&mut self, byte_count: usize) -> Option<Self::Memory> {
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_count) };
+        (!memory.is_null()).then_some(memory)
+    }
+
+    fn copy_into(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), ClipboardWriteError> {
+        let locked = unsafe { GlobalLock(memory) };
+        if locked.is_null() {
+            return Err(ClipboardWriteError::LockFailed);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), locked.cast::<u8>(), bytes.len());
+            let _ = GlobalUnlock(memory);
+        }
+        Ok(())
+    }
+
+    fn free(&mut self, memory: Self::Memory) {
         unsafe {
             let _ = GlobalFree(memory);
         }
-        unreachable!("成功结果必须已经转移剪贴板内存所有权");
     }
-    if !close_succeeded {
-        // SetClipboardData 已成功转移内存，即使关闭失败也不能把这次写回当成未发生。
-        return Ok(RawWriteSuccess {
-            sequence,
-            close_succeeded: false,
-        });
+
+    fn open(&mut self) -> bool {
+        (unsafe { OpenClipboard(std::ptr::null_mut()) }) != 0
     }
-    Ok(RawWriteSuccess {
-        sequence,
-        close_succeeded: true,
-    })
+
+    fn empty(&mut self) -> bool {
+        (unsafe { EmptyClipboard() }) != 0
+    }
+
+    fn set(&mut self, format: u32, memory: Self::Memory) -> bool {
+        !unsafe { SetClipboardData(format, memory as HANDLE) }.is_null()
+    }
+
+    fn sequence(&mut self) -> u32 {
+        unsafe { GetClipboardSequenceNumber() }
+    }
+
+    fn close(&mut self) -> bool {
+        (unsafe { CloseClipboard() }) != 0
+    }
 }
 
 /// 绑定已发生写回的 sequence；Close 失败只影响返回值，不得撤销自身事件抑制预期。
@@ -359,11 +467,103 @@ mod tests {
     //! 此测试模块验证预期事务的一次性、序号绑定和 UTF-16 终止规则，不改写真实剪贴板。
 
     use super::{
-        finish_transferred_write, utf16_with_nul, ClipboardWriteError,
-        ClipboardWriteExpectationStore, ClipboardWriteFormat, MAX_PENDING_WRITE_EXPECTATIONS,
+        finish_transferred_write, utf16_with_nul, write_clipboard_bytes_with_backend,
+        ClipboardWriteBackend, ClipboardWriteError, ClipboardWriteExpectationStore,
+        ClipboardWriteFormat, RawWriteSuccess, MAX_PENDING_WRITE_EXPECTATIONS,
         WRITE_EXPECTATION_TTL,
     };
     use std::time::{Duration, Instant};
+
+    /// 可注入失败阶段，用于逐分支验证内存释放和所有权转移。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FailStage {
+        /// 分配全局内存失败。
+        Allocate,
+        /// 锁定或复制全局内存失败。
+        Copy,
+        /// 打开剪贴板失败。
+        Open,
+        /// 清空剪贴板失败。
+        Empty,
+        /// SetClipboardData 失败且所有权未转移。
+        Set,
+        /// Set 已转移所有权，但关闭剪贴板失败。
+        Close,
+    }
+
+    /// 记录所有权状态机副作用的纯测试后端，不调用真实 Win32。
+    #[derive(Default)]
+    struct FakeBackend {
+        /// 当前注入的失败阶段；空表示成功。
+        fail: Option<FailStage>,
+        /// 释放尚未转移内存的次数。
+        free_count: usize,
+        /// Set 调用次数。
+        set_count: usize,
+        /// Close 调用次数。
+        close_count: usize,
+        /// 实际提交的格式。
+        format: Option<u32>,
+        /// 实际复制的字节。
+        copied: Vec<u8>,
+    }
+
+    impl FakeBackend {
+        /// 创建注入指定失败阶段的后端。
+        fn failing(stage: FailStage) -> Self {
+            Self {
+                fail: Some(stage),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ClipboardWriteBackend for FakeBackend {
+        type Memory = usize;
+
+        fn allocate(&mut self, _byte_count: usize) -> Option<Self::Memory> {
+            (self.fail != Some(FailStage::Allocate)).then_some(1)
+        }
+
+        fn copy_into(
+            &mut self,
+            _memory: Self::Memory,
+            bytes: &[u8],
+        ) -> Result<(), ClipboardWriteError> {
+            if self.fail == Some(FailStage::Copy) {
+                return Err(ClipboardWriteError::LockFailed);
+            }
+            self.copied.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn free(&mut self, _memory: Self::Memory) {
+            self.free_count += 1;
+        }
+
+        fn open(&mut self) -> bool {
+            self.fail != Some(FailStage::Open)
+        }
+
+        fn empty(&mut self) -> bool {
+            self.fail != Some(FailStage::Empty)
+        }
+
+        fn set(&mut self, format: u32, _memory: Self::Memory) -> bool {
+            self.set_count += 1;
+            self.format = Some(format);
+            self.fail != Some(FailStage::Set)
+        }
+
+        fn sequence(&mut self) -> u32 {
+            91
+        }
+
+        fn close(&mut self) -> bool {
+            self.close_count += 1;
+            self.fail != Some(FailStage::Close)
+        }
+    }
 
     /// 写入成功后必须绑定序号，错误序号和错误哈希都不能消费预期。
     #[test]
@@ -377,6 +577,94 @@ mod tests {
         assert!(!store.consume_if_matches(8, [7; 32], ClipboardWriteFormat::UnicodeText));
         assert!(store.consume_if_matches(9, [7; 32], ClipboardWriteFormat::UnicodeText));
         assert!(!store.consume_if_matches(9, [7; 32], ClipboardWriteFormat::UnicodeText));
+    }
+
+    /// 图片候选查询必须精确匹配 sequence/format，且查询本身不消费预期。
+    #[test]
+    fn 图片候选查询不消费且格式精确() {
+        let store = ClipboardWriteExpectationStore::new();
+        let token = store
+            .arm([10; 32], ClipboardWriteFormat::DibV5)
+            .expect("图片预期应登记");
+        store.bind_sequence(token, 81);
+
+        assert!(!store.has_candidate(80, ClipboardWriteFormat::DibV5));
+        assert!(!store.has_candidate(81, ClipboardWriteFormat::UnicodeText));
+        assert!(store.has_candidate(81, ClipboardWriteFormat::DibV5));
+        assert!(store.has_candidate(81, ClipboardWriteFormat::DibV5));
+        assert!(store.consume_if_matches(81, [10; 32], ClipboardWriteFormat::DibV5));
+        assert!(!store.has_candidate(81, ClipboardWriteFormat::DibV5));
+    }
+
+    /// 相同 sequence 的不同格式和错误哈希都不能删除其他精确预期。
+    #[test]
+    fn 文本和图片预期按格式独立消费() {
+        let store = ClipboardWriteExpectationStore::new();
+        let text = store
+            .arm([11; 32], ClipboardWriteFormat::UnicodeText)
+            .expect("文本预期应登记");
+        let image = store
+            .arm([12; 32], ClipboardWriteFormat::DibV5)
+            .expect("图片预期应登记");
+        store.bind_sequence(text, 83);
+        store.bind_sequence(image, 83);
+
+        assert!(!store.consume_if_matches(83, [13; 32], ClipboardWriteFormat::DibV5));
+        assert!(store.has_candidate(83, ClipboardWriteFormat::DibV5));
+        assert!(store.consume_if_matches(83, [12; 32], ClipboardWriteFormat::DibV5));
+        assert!(store.consume_if_matches(83, [11; 32], ClipboardWriteFormat::UnicodeText));
+    }
+
+    /// Set 前所有失败必须释放一次；Set 成功后即使 Close 失败也不得释放。
+    #[test]
+    fn 所有权状态机按_set_结果决定释放() {
+        let bytes = [1, 2, 3, 4];
+
+        let mut allocation = FakeBackend::failing(FailStage::Allocate);
+        assert_eq!(
+            write_clipboard_bytes_with_backend(&mut allocation, &bytes, 17),
+            Err(ClipboardWriteError::AllocationFailed)
+        );
+        assert_eq!(allocation.free_count, 0);
+
+        for (stage, expected_error) in [
+            (FailStage::Copy, ClipboardWriteError::LockFailed),
+            (FailStage::Open, ClipboardWriteError::OpenFailed),
+            (FailStage::Empty, ClipboardWriteError::EmptyFailed),
+            (FailStage::Set, ClipboardWriteError::SetFailed),
+        ] {
+            let mut backend = FakeBackend::failing(stage);
+            assert_eq!(
+                write_clipboard_bytes_with_backend(&mut backend, &bytes, 17),
+                Err(expected_error)
+            );
+            assert_eq!(backend.free_count, 1, "失败阶段 {stage:?}");
+        }
+
+        let mut close = FakeBackend::failing(FailStage::Close);
+        assert_eq!(
+            write_clipboard_bytes_with_backend(&mut close, &bytes, 17),
+            Ok(RawWriteSuccess {
+                sequence: 91,
+                close_succeeded: false,
+            })
+        );
+        assert_eq!(close.free_count, 0);
+        assert_eq!(close.close_count, 1);
+
+        let mut success = FakeBackend::default();
+        assert_eq!(
+            write_clipboard_bytes_with_backend(&mut success, &bytes, 17),
+            Ok(RawWriteSuccess {
+                sequence: 91,
+                close_succeeded: true,
+            })
+        );
+        assert_eq!(success.free_count, 0);
+        assert_eq!(success.set_count, 1);
+        assert_eq!(success.close_count, 1);
+        assert_eq!(success.format, Some(17));
+        assert_eq!(success.copied, bytes);
     }
 
     /// 未绑定阶段不能消费任何事件，避免同哈希的真实用户复制被误吞；绑定后才按序号消费。

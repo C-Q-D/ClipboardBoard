@@ -163,6 +163,7 @@ mod tests {
             content_hash: [hash; 32],
             copy_count: 1,
             is_pinned: pinned,
+            kind: Default::default(),
         }
     }
 

@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    command::UiClipboardItem,
+    command::{UiClipboardItem, UiClipboardItemKind, UiImageSummary},
     storage::{HistoryCursor, HistoryPage, HistoryQuery, HistorySummary, StorageClient},
 };
 
@@ -544,9 +544,6 @@ fn convert_page(page: HistoryPage) -> Result<UiHistoryPage, HistoryQueryFailure>
     let items = page
         .items
         .iter()
-        // IMG-UI-01 前 UI DTO 没有条目类型和复制门禁；图片已可持久化，但必须在此
-        // 中间提交安全隐藏，避免被渲染成可点击复制的文本卡片。
-        .filter(|summary| summary.item_type == "text")
         .map(|summary| ui_item_from_summary(summary, now))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(UiHistoryPage {
@@ -560,9 +557,21 @@ fn ui_item_from_summary(
     summary: &HistorySummary,
     now: i64,
 ) -> Result<UiClipboardItem, HistoryQueryFailure> {
-    if summary.item_type != "text" {
-        return Err(HistoryQueryFailure::InvalidSummary);
-    }
+    let kind = match summary.item_type.as_str() {
+        "text" if summary.image.is_none() => UiClipboardItemKind::Text,
+        "image" => {
+            let image = summary
+                .image
+                .as_ref()
+                .ok_or(HistoryQueryFailure::InvalidSummary)?;
+            UiClipboardItemKind::Image(UiImageSummary {
+                thumbnail_path: image.thumbnail_absolute_path(),
+                width: image.metadata.width().get(),
+                height: image.metadata.height().get(),
+            })
+        }
+        _ => return Err(HistoryQueryFailure::InvalidSummary),
+    };
     let id = u64::try_from(summary.id).map_err(|_| HistoryQueryFailure::InvalidSummary)?;
     let copy_count =
         u64::try_from(summary.copy_count).map_err(|_| HistoryQueryFailure::InvalidSummary)?;
@@ -589,6 +598,7 @@ fn ui_item_from_summary(
         content_hash: summary.content_hash,
         copy_count,
         is_pinned: summary.is_pinned,
+        kind,
     })
 }
 
@@ -617,7 +627,11 @@ mod tests {
     //! 此测试模块验证三元身份、latest-wins 覆盖和结果唤醒边界。
 
     use super::*;
-    use crate::storage::{StorageExecutor, TextUpsertInput};
+    use crate::{
+        command::UiClipboardItemKind,
+        domain::{ImageAssetRootId, ImageMetadata},
+        storage::{HistoryImageSummary, StorageExecutor, TextUpsertInput},
+    };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::sync_channel,
@@ -918,11 +932,53 @@ mod tests {
             created_at: 1,
             copied_at: 1,
             last_used_at: None,
+            image: None,
         };
 
         assert_eq!(
             ui_item_from_summary(&summary, 1),
             Err(HistoryQueryFailure::InvalidSummary)
         );
+    }
+
+    /// 完整图片摘要必须转换为带尺寸和缩略图定位的不可复制卡片。
+    #[test]
+    fn 图片摘要转换为不可复制界面卡片() {
+        let hash_hex = "aa".repeat(32);
+        let metadata = ImageMetadata::new(
+            [0xaa; 32],
+            ImageAssetRootId::new([0xbb; 32]),
+            format!("aa/{hash_hex}.png"),
+            format!("aa/{hash_hex}.webp"),
+            320,
+            200,
+            512,
+        )
+        .expect("构造查询图片元数据失败");
+        let summary = crate::storage::HistorySummary {
+            id: 1,
+            item_type: "image".to_owned(),
+            preview_text: "图片 320 × 200".to_owned(),
+            content_hash: [0xaa; 32],
+            source_exe: None,
+            source_app: Some("截图工具".to_owned()),
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 1,
+            last_used_at: None,
+            image: Some(HistoryImageSummary {
+                metadata,
+                canonical_root: std::path::PathBuf::from(r"C:\images"),
+            }),
+        };
+
+        let item = ui_item_from_summary(&summary, 1).expect("转换图片摘要失败");
+        let UiClipboardItemKind::Image(image) = &item.kind else {
+            panic!("转换结果应为图片");
+        };
+        assert_eq!((image.width, image.height), (320, 200));
+        assert!(image.thumbnail_path.ends_with(format!("aa/{hash_hex}.webp")));
+        assert!(!item.copy_enabled());
     }
 }

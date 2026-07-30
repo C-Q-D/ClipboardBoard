@@ -74,18 +74,22 @@ WHERE content_hash = ?3 AND item_type = 'image'
 /// `?1` 和 `?2` 是已经转义并包裹 `%` 的 LIKE 模式；游标条件位于筛选条件之后，
 /// 因而下一页只会在同一筛选集合中继续，不会因为未匹配记录改变分页边界。
 const HISTORY_QUERY_SQL: &str = r#"
-SELECT id, item_type, preview_text, content_hash, source_exe, source_app,
-       copy_count, is_pinned, created_at, copied_at, last_used_at
-FROM clipboard_items
-WHERE (?1 IS NULL OR text_content LIKE ?1 ESCAPE '\'
-                    OR preview_text LIKE ?1 ESCAPE '\')
-  AND (?2 IS NULL OR source_app LIKE ?2 ESCAPE '\'
-                   OR source_exe LIKE ?2 ESCAPE '\')
-  AND (?3 IS NULL OR item_type = ?3)
-  AND (?4 IS NULL OR is_pinned = ?4)
-  AND (?5 IS NULL OR copied_at < ?5
-                  OR (copied_at = ?5 AND id < ?6))
-ORDER BY copied_at DESC, id DESC
+SELECT item.id, item.item_type, item.preview_text, item.content_hash,
+       item.source_exe, item.source_app, item.copy_count, item.is_pinned,
+       item.created_at, item.copied_at, item.last_used_at,
+       item.image_root_id, item.image_path, item.thumbnail_path,
+       item.image_width, item.image_height, item.content_size, root.root_path
+FROM clipboard_items AS item
+LEFT JOIN image_asset_roots AS root ON root.root_id = item.image_root_id
+WHERE (?1 IS NULL OR item.text_content LIKE ?1 ESCAPE '\'
+                    OR item.preview_text LIKE ?1 ESCAPE '\')
+  AND (?2 IS NULL OR item.source_app LIKE ?2 ESCAPE '\'
+                   OR item.source_exe LIKE ?2 ESCAPE '\')
+  AND (?3 IS NULL OR item.item_type = ?3)
+  AND (?4 IS NULL OR item.is_pinned = ?4)
+  AND (?5 IS NULL OR item.copied_at < ?5
+                  OR (item.copied_at = ?5 AND item.id < ?6))
+ORDER BY item.copied_at DESC, item.id DESC
 LIMIT ?7
 "#;
 
@@ -185,6 +189,8 @@ pub struct ImageUpsertResult {
     pub id: i64,
     /// 数据库最终采用的图片元数据，可能来自更早的同哈希记录。
     pub metadata: ImageMetadata,
+    /// 最终元数据 root_id 对应的当前注册根路径；重复捕获不得使用本次输入根替代。
+    pub canonical_root: PathBuf,
     /// 数据库最终保留的预览文案。
     pub preview_text: String,
     /// 数据库最终保留的源可执行文件名。
@@ -320,6 +326,26 @@ pub struct HistorySummary {
     pub copied_at: i64,
     /// 最近使用时间；从未使用时为空。
     pub last_used_at: Option<i64>,
+    /// 图片条目的完整受限资产摘要；文本和未知类型为空。
+    pub image: Option<HistoryImageSummary>,
+}
+
+/// 历史图片摘要的受限资产定位；不携带任何图片字节。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HistoryImageSummary {
+    /// 已通过领域校验的图片资产元数据。
+    pub metadata: ImageMetadata,
+    /// 根注册表返回的当前规范根路径。
+    pub canonical_root: PathBuf,
+}
+
+impl HistoryImageSummary {
+    /// 返回固定 thumbnail 子树中的缩略图绝对路径。
+    pub fn thumbnail_absolute_path(&self) -> PathBuf {
+        self.canonical_root
+            .join("thumbnail")
+            .join(self.metadata.thumbnail_path().as_path())
+    }
 }
 
 /// 一页历史摘要及其下一页游标。
@@ -1287,11 +1313,14 @@ ON CONFLICT(root_id) DO UPDATE SET
 
     let result = transaction.query_row(
         r#"
-SELECT id, preview_text, source_exe, source_app, copy_count, is_pinned,
-       created_at, copied_at, last_used_at, image_root_id, image_path,
-       thumbnail_path, image_width, image_height, content_size
-FROM clipboard_items
-WHERE content_hash = ?1 AND item_type = 'image'
+SELECT item.id, item.preview_text, item.source_exe, item.source_app,
+       item.copy_count, item.is_pinned, item.created_at, item.copied_at,
+       item.last_used_at, item.image_root_id, item.image_path,
+       item.thumbnail_path, item.image_width, item.image_height,
+       item.content_size, root.root_path
+FROM clipboard_items AS item
+JOIN image_asset_roots AS root ON root.root_id = item.image_root_id
+WHERE item.content_hash = ?1 AND item.item_type = 'image'
 "#,
         params![content_hash_blob.as_slice()],
         |row| {
@@ -1326,10 +1355,19 @@ WHERE content_hash = ?1 AND item_type = 'image'
             // 采用判定来自 INSERT 是否真正创建新行，不能用元数据相等替代；同根同路径的
             // 重复捕获也必须让协调器 rollback 本次发布句柄。
             let adopted_published_assets = inserted;
+            let canonical_root = PathBuf::from(row.get::<_, String>(15)?);
+            if !canonical_root.is_absolute() {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(StorageError::InvalidImageAssetMetadata),
+                ));
+            }
             Ok(ImageUpsertResult {
                 mutation_revision,
                 id: row.get(0)?,
                 metadata: stored_metadata,
+                canonical_root,
                 preview_text: row.get(1)?,
                 source_exe: row.get(2)?,
                 source_app: row.get(3)?,
@@ -1682,9 +1720,38 @@ fn history_summary_from_row(row: &Row<'_>) -> Result<HistorySummary, StorageErro
             length: content_hash_blob.len(),
         }
     })?;
+    let item_type: String = row.get(1)?;
+    let image = if item_type == "image" {
+        let root_id_blob: Vec<u8> = row.get(11)?;
+        let root_id: [u8; 32] = root_id_blob.as_slice().try_into().map_err(|_| {
+            StorageError::InvalidImageAssetMetadata
+        })?;
+        let content_size: i64 = row.get(16)?;
+        let content_size =
+            u64::try_from(content_size).map_err(|_| StorageError::InvalidImageAssetMetadata)?;
+        let canonical_root = PathBuf::from(row.get::<_, String>(17)?);
+        if !canonical_root.is_absolute() {
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+        Some(HistoryImageSummary {
+            metadata: ImageMetadata::new(
+                content_hash,
+                ImageAssetRootId::new(root_id),
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get(14)?,
+                row.get(15)?,
+                content_size,
+            )
+            .map_err(|_| StorageError::InvalidImageAssetMetadata)?,
+            canonical_root,
+        })
+    } else {
+        None
+    };
     Ok(HistorySummary {
         id,
-        item_type: row.get(1)?,
+        item_type,
         preview_text: row.get(2)?,
         content_hash,
         source_exe: row.get(4)?,
@@ -1694,6 +1761,7 @@ fn history_summary_from_row(row: &Row<'_>) -> Result<HistorySummary, StorageErro
         created_at: row.get(8)?,
         copied_at: row.get(9)?,
         last_used_at: row.get(10)?,
+        image,
     })
 }
 
@@ -1868,6 +1936,38 @@ mod tests {
         assert_eq!(image_count, 1);
 
         drop(connection);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 混合摘要查询必须返回图片尺寸和受限缩略图定位，不读取图片字节。
+    #[test]
+    fn mixed_history_query_returns_image_asset_summary() {
+        let directory = temporary_directory();
+        let root = directory.join("images-summary");
+        let executor = StorageExecutor::open_at(&directory).expect("启动混合摘要存储失败");
+        executor
+            .upsert_text(text_input(80, "文本摘要", "文本摘要", 100))
+            .expect("写入混合文本失败");
+        let inserted = executor
+            .upsert_image(image_input(81, 91, root.clone(), 200))
+            .expect("写入混合图片失败");
+
+        let page = executor
+            .query_history_summaries(HistoryQuery {
+                limit: 30,
+                ..HistoryQuery::default()
+            })
+            .expect("查询混合摘要失败");
+        assert_eq!(page.items.len(), 2);
+        let image = page.items[0].image.as_ref().expect("图片摘要缺少资产定位");
+        assert_eq!(image.metadata, inserted.metadata);
+        assert_eq!(
+            image.thumbnail_absolute_path(),
+            root.join("thumbnail")
+                .join(image.metadata.thumbnail_path().as_path())
+        );
+        assert!(page.items[1].image.is_none());
         drop(executor);
         remove_directory(&directory);
     }

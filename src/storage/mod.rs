@@ -10,9 +10,9 @@ mod worker;
 
 pub use worker::{
     ClearAllHistoryResult, ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult,
-    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, ImageUpsertInput,
-    ImageUpsertResult, SetPinnedInput, SetPinnedResult, StorageClient, StorageExecutor,
-    StorageStatus, TextUpsertInput, TextUpsertResult,
+    HistoryCursor, HistoryImageSummary, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary,
+    ImageUpsertInput, ImageUpsertResult, SetPinnedInput, SetPinnedResult, StorageClient,
+    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。

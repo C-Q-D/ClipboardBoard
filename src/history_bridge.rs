@@ -210,6 +210,7 @@ pub fn run_clipboard_pump<F>(
                                 capture.source,
                                 image,
                                 copied_at,
+                                |event| ui_open && emit(event),
                             )
                         } else {
                             Ok(CaptureProcessOutcome::Skipped)
@@ -236,13 +237,17 @@ pub fn run_clipboard_pump<F>(
 }
 
 /// 图片经过发布验证和数据库事务后，按最终资产采用结果消费一次 finalize。
-fn process_image_capture(
+fn process_image_capture<F>(
     storage: &StorageClient,
     context: &ImageCaptureContext,
     source: Option<crate::platform::windows::ProcessSource>,
     image: ClipboardImageBytes,
     copied_at: i64,
-) -> Result<CaptureProcessOutcome, CaptureProcessError> {
+    mut emit: F,
+) -> Result<CaptureProcessOutcome, CaptureProcessError>
+where
+    F: FnMut(UiEvent) -> bool,
+{
     let input = match image {
         ClipboardImageBytes::RegisteredPng(bytes) => ImageInput::registered_png(bytes),
         ClipboardImageBytes::DibV5(bytes) => ImageInput::dib_v5(bytes),
@@ -280,8 +285,16 @@ fn process_image_capture(
         // 重复图片继续引用旧资产，只回滚本次发布句柄实际拥有的新文件。
         finalize.rollback()?;
     }
-    // IMG-UI-01 前图片只进入数据库，不进入尚无类型门禁的文本 UI 模型。
-    Ok(CaptureProcessOutcome::Skipped)
+    let item = UiClipboardItem::from_persisted_image_result(&upsert)
+        .ok_or(CaptureProcessError::InvalidPersistedRecord)?;
+    if emit(UiEvent::ClipboardCaptured {
+        item,
+        mutation_revision: upsert.mutation_revision,
+    }) {
+        Ok(CaptureProcessOutcome::Posted)
+    } else {
+        Ok(CaptureProcessOutcome::UiClosed)
+    }
 }
 
 /// 先事务性 upsert，再通过可注入 sink 投递唯一 UI 事件。
@@ -413,7 +426,7 @@ mod tests {
             ClipboardCaptureInbox, ClipboardCapturePayload, ClipboardCaptureResult,
             ClipboardImageBytes, ClipboardWriteError, ClipboardWriteExpectationStore,
         },
-        command::UiEvent,
+        command::{UiClipboardItemKind, UiEvent},
         domain::{CanonicalImagePixels, ClipboardPayload},
         image_pipeline::{encode_original_png, ImageWorker},
         image_storage::{prepare_image_storage, ImageStoragePreference},
@@ -477,7 +490,7 @@ mod tests {
 
     /// 图片文件发布、数据库提交和 finalize 必须形成可重复去重的完整顺序。
     #[test]
-    fn image_capture_persists_then_finalizes_without_ui_event() {
+    fn image_capture_persists_then_posts_typed_ui_event() {
         let directory = test_directory("image-persist");
         let image_root = directory.join("images");
         let storage = StorageExecutor::open_at(&directory).expect("启动图片事务存储失败");
@@ -490,12 +503,17 @@ mod tests {
         let mut png = Vec::new();
         encode_original_png(&pixels, &mut png).expect("编码测试 PNG 失败");
 
+        let mut events = Vec::new();
         let first = process_image_capture(
             &storage.client(),
             &context,
             None,
             ClipboardImageBytes::RegisteredPng(png.clone()),
             100,
+            |event| {
+                events.push(event);
+                true
+            },
         )
         .expect("首次图片捕获失败");
         let duplicate = process_image_capture(
@@ -504,10 +522,22 @@ mod tests {
             None,
             ClipboardImageBytes::RegisteredPng(png),
             200,
+            |event| {
+                events.push(event);
+                true
+            },
         )
         .expect("重复图片捕获失败");
-        assert_eq!(first, CaptureProcessOutcome::Skipped);
-        assert_eq!(duplicate, CaptureProcessOutcome::Skipped);
+        assert_eq!(first, CaptureProcessOutcome::Posted);
+        assert_eq!(duplicate, CaptureProcessOutcome::Posted);
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let UiEvent::ClipboardCaptured { item, .. } = event else {
+                panic!("图片捕获只能投递 ClipboardCaptured");
+            };
+            assert!(matches!(item.kind, UiClipboardItemKind::Image(_)));
+            assert!(!item.copy_enabled());
+        }
 
         let connection =
             Connection::open(directory.join("clipboard.db")).expect("打开图片事务数据库失败");
@@ -526,6 +556,70 @@ mod tests {
         worker.stop().expect("停止图片 worker 失败");
         drop(storage);
         std::fs::remove_dir_all(directory).expect("清理图片事务目录失败");
+    }
+
+    /// 跨根重复图片必须继续定位 SQLite 最终保留的旧资产根，不能拼接当前 worker 根。
+    #[test]
+    fn duplicate_image_event_uses_persisted_asset_root() {
+        let directory = test_directory("image-cross-root");
+        let root_a = directory.join("images-a");
+        let root_b = directory.join("images-b");
+        let storage = StorageExecutor::open_at(&directory).expect("启动跨根图片存储失败");
+        let pixels =
+            CanonicalImagePixels::new(1, 1, vec![30, 40, 50, 255]).expect("构造跨根像素失败");
+        let mut png = Vec::new();
+        encode_original_png(&pixels, &mut png).expect("编码跨根 PNG 失败");
+
+        let worker_a = ImageWorker::start(
+            prepare_image_storage(ImageStoragePreference::Custom(root_a.clone()))
+                .expect("准备根 A 失败"),
+        )
+        .expect("启动根 A worker 失败");
+        let context_a =
+            ImageCaptureContext::new(worker_a.sender(), worker_a.root_snapshot().clone());
+        process_image_capture(
+            &storage.client(),
+            &context_a,
+            None,
+            ClipboardImageBytes::RegisteredPng(png.clone()),
+            100,
+            |_| true,
+        )
+        .expect("根 A 首次捕获失败");
+        worker_a.stop().expect("停止根 A worker 失败");
+
+        let worker_b = ImageWorker::start(
+            prepare_image_storage(ImageStoragePreference::Custom(root_b.clone()))
+                .expect("准备根 B 失败"),
+        )
+        .expect("启动根 B worker 失败");
+        let context_b =
+            ImageCaptureContext::new(worker_b.sender(), worker_b.root_snapshot().clone());
+        let mut event = None;
+        process_image_capture(
+            &storage.client(),
+            &context_b,
+            None,
+            ClipboardImageBytes::RegisteredPng(png),
+            200,
+            |posted| {
+                event = Some(posted);
+                true
+            },
+        )
+        .expect("根 B 重复捕获失败");
+        let Some(UiEvent::ClipboardCaptured { item, .. }) = event else {
+            panic!("跨根重复捕获缺少 UI 事件");
+        };
+        let UiClipboardItemKind::Image(image) = item.kind else {
+            panic!("跨根重复结果应为图片");
+        };
+        assert!(image.thumbnail_path.starts_with(root_a.join("thumbnail")));
+        assert!(!image.thumbnail_path.starts_with(root_b.join("thumbnail")));
+
+        worker_b.stop().expect("停止根 B worker 失败");
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理跨根测试目录失败");
     }
 
     /// SQLite 拒绝图片事务时必须 rollback 本次刚发布的两份资产。
@@ -557,6 +651,7 @@ mod tests {
             None,
             ClipboardImageBytes::RegisteredPng(png),
             100,
+            |_| true,
         )
         .expect_err("SQLite 故障应拒绝图片捕获");
         assert!(matches!(error, CaptureProcessError::Storage(_)));

@@ -9,7 +9,28 @@ use crate::history_mutation::{
     ClearHistoryMutationResult, DeleteMutationResult, PinMutationResult,
 };
 #[cfg(windows)]
-use crate::storage::TextUpsertResult;
+use crate::storage::{ImageUpsertResult, TextUpsertResult};
+
+/// 图片卡片在 UI 层使用的轻量定位和尺寸信息；不包含原图或缩略图像素。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiImageSummary {
+    /// 受管图片根内缩略图的绝对定位；只交给后续受限加载器，不进入日志。
+    pub thumbnail_path: std::path::PathBuf,
+    /// 原图宽度。
+    pub width: u32,
+    /// 原图高度。
+    pub height: u32,
+}
+
+/// UI 卡片的受限内容类型；图片在 ATOM-38 前不可执行复制。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UiClipboardItemKind {
+    /// 可通过按钮写回剪贴板的文本。
+    #[default]
+    Text,
+    /// 只展示摘要和缩略图的图片。
+    Image(UiImageSummary),
+}
 
 /// 单条剪贴板历史的最小 UI 展示数据。
 ///
@@ -30,6 +51,8 @@ pub struct UiClipboardItem {
     pub copy_count: u64,
     /// 用户是否收藏该记录；捕获路径必须采用 SQLite 返回的最终收藏状态。
     pub is_pinned: bool,
+    /// 条目类型及图片轻量定位；默认值保持既有文本测试兼容。
+    pub kind: UiClipboardItemKind,
 }
 
 impl UiClipboardItem {
@@ -59,6 +82,7 @@ impl UiClipboardItem {
             content_hash,
             copy_count: 1,
             is_pinned: false,
+            kind: UiClipboardItemKind::Text,
         }
     }
 
@@ -95,7 +119,49 @@ impl UiClipboardItem {
             content_hash: result.content_hash,
             copy_count,
             is_pinned: result.is_pinned,
+            kind: UiClipboardItemKind::Text,
         })
+    }
+
+    /// 将图片事务最终快照转换为不可复制的 UI 卡片摘要。
+    #[cfg(windows)]
+    pub fn from_persisted_image_result(result: &ImageUpsertResult) -> Option<Self> {
+        let id = u64::try_from(result.id).ok()?;
+        let copy_count = u64::try_from(result.copy_count).ok()?;
+        if id == 0 || copy_count == 0 {
+            return None;
+        }
+        let source = result
+            .source_app
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| result.source_exe.as_deref().filter(|value| !value.is_empty()))
+            .unwrap_or("未知来源")
+            .to_owned();
+        let metadata = &result.metadata;
+
+        Some(Self {
+            id,
+            preview: result.preview_text.clone(),
+            source,
+            relative_time: "刚刚".to_owned(),
+            content_hash: *metadata.content_hash(),
+            copy_count,
+            is_pinned: result.is_pinned,
+            kind: UiClipboardItemKind::Image(UiImageSummary {
+                thumbnail_path: result
+                    .canonical_root
+                    .join("thumbnail")
+                    .join(metadata.thumbnail_path().as_path()),
+                width: metadata.width().get(),
+                height: metadata.height().get(),
+            }),
+        })
+    }
+
+    /// 返回当前卡片是否允许触发系统剪贴板写回。
+    pub const fn copy_enabled(&self) -> bool {
+        matches!(self.kind, UiClipboardItemKind::Text)
     }
 }
 

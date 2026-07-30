@@ -18,6 +18,13 @@ export struct ClipboardCard {
     pin_pending: bool,
     // 当前卡片是否正在等待删除事务结果；pending 期间卡片仍然可见。
     delete_pending: bool,
+    // 图片卡片在缩略图接入前显示稳定占位；文本卡片保持原布局。
+    is_image: bool,
+    // ATOM-38 前图片禁止触发复制，文本仍允许显式复制。
+    copy_enabled: bool,
+    // 图片原始尺寸仅用于摘要文案，不参与卡片动态测量。
+    image_width: int,
+    image_height: int,
 }
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -455,7 +462,9 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
 
                                 Text {
-                                    text: card.preview;
+                                    text: card.is_image
+                                        ? "图片  " + card.image_width + " × " + card.image_height
+                                        : card.preview;
                                     // 46px 约容纳三行正文；来源信息始终保留在卡片底部。
                                     height: 46px;
                                     vertical-stretch: 0;
@@ -567,16 +576,21 @@ export component AppWindow inherits Window {
                                 border-color: #4a4a4a;
 
                                 Text {
-                                    text: "复制";
-                                    color: copy-touch.pressed ? #080808 : #f5f5f5;
-                                    font-size: 12px;
+                                    text: card.copy_enabled ? "复制" : "待支持";
+                                    color: card.copy_enabled
+                                        ? (copy-touch.pressed ? #080808 : #f5f5f5)
+                                        : #666666;
+                                    font-size: card.copy_enabled ? 12px : 10px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
 
                                 copy-touch := TouchArea {
+                                    enabled: card.copy_enabled;
                                     clicked => {
-                                        copy-item-requested(index);
+                                        if (card.copy_enabled) {
+                                            copy-item-requested(index);
+                                        }
                                     }
                                 }
                             }

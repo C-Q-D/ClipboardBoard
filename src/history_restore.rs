@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    command::{UiClipboardItem, UiSnapshot},
+    command::{UiClipboardItem, UiClipboardItemKind, UiImageSummary, UiSnapshot},
     storage::{HistoryPayload, HistorySummary, StorageError, StorageExecutor},
 };
 
@@ -85,7 +85,6 @@ pub fn load_startup_snapshot(
     storage: &mut StorageExecutor,
 ) -> Result<UiSnapshot, StartupRestoreError> {
     let page = storage.query_history_summaries(crate::storage::HistoryQuery {
-        item_type: Some("text".to_owned()),
         limit: STARTUP_HISTORY_LIMIT,
         ..crate::storage::HistoryQuery::default()
     })?;
@@ -118,16 +117,35 @@ fn build_ui_item(
             payload_id: payload.id,
         });
     }
-    if payload.item_type != "text" {
-        return Err(StartupRestoreError::UnsupportedItemType {
-            id: summary.id,
-            item_type: payload.item_type.clone(),
-        });
-    }
-    // 只检查正文存在性；函数返回后 payload 会被释放，正文不会复制到 UI DTO。
-    if payload.text_content.is_none() {
-        return Err(StartupRestoreError::MissingText { id: summary.id });
-    }
+    let kind = match payload.item_type.as_str() {
+        "text" if summary.item_type == "text" && summary.image.is_none() => {
+            // 只检查正文存在性；函数返回后 payload 会被释放，正文不会复制到 UI DTO。
+            if payload.text_content.is_none() {
+                return Err(StartupRestoreError::MissingText { id: summary.id });
+            }
+            UiClipboardItemKind::Text
+        }
+        "image" if summary.item_type == "image" && payload.text_content.is_none() => {
+            let image = summary
+                .image
+                .as_ref()
+                .ok_or_else(|| StartupRestoreError::UnsupportedItemType {
+                    id: summary.id,
+                    item_type: payload.item_type.clone(),
+                })?;
+            UiClipboardItemKind::Image(UiImageSummary {
+                thumbnail_path: image.thumbnail_absolute_path(),
+                width: image.metadata.width().get(),
+                height: image.metadata.height().get(),
+            })
+        }
+        _ => {
+            return Err(StartupRestoreError::UnsupportedItemType {
+                id: summary.id,
+                item_type: payload.item_type.clone(),
+            });
+        }
+    };
 
     let id =
         u64::try_from(summary.id).map_err(|_| StartupRestoreError::InvalidId { id: summary.id })?;
@@ -176,6 +194,7 @@ fn build_ui_item(
         content_hash: summary.content_hash,
         copy_count,
         is_pinned: summary.is_pinned,
+        kind,
     })
 }
 
@@ -208,8 +227,12 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{load_startup_snapshot, StartupRestoreError, STARTUP_HISTORY_LIMIT};
-    use crate::storage::{StorageExecutor, TextUpsertInput};
-    use crate::{domain::hash::hash_text, storage::HistoryPayload};
+    use crate::{
+        command::UiClipboardItemKind,
+        domain::{hash::hash_text, ImageAssetRootId, ImageMetadata},
+        image_storage::ImageStorageRootKind,
+        storage::{HistoryPayload, ImageUpsertInput, StorageExecutor, TextUpsertInput},
+    };
 
     /// 创建隔离恢复测试目录，避免并行测试读取同一个 SQLite 文件。
     fn test_directory(label: &str) -> std::path::PathBuf {
@@ -236,6 +259,40 @@ mod tests {
             .expect("预置文本失败");
     }
 
+    /// 写入一条字段完整的图片历史，返回预期缩略图绝对路径。
+    fn insert_image(
+        storage: &mut StorageExecutor,
+        root: &std::path::Path,
+        copied_at: i64,
+    ) -> std::path::PathBuf {
+        let content_hash = [0xab; 32];
+        let hash_hex = "ab".repeat(32);
+        let metadata = ImageMetadata::new(
+            content_hash,
+            ImageAssetRootId::new([0xcd; 32]),
+            format!("ab/{hash_hex}.png"),
+            format!("ab/{hash_hex}.webp"),
+            640,
+            480,
+            1024,
+        )
+        .expect("构造恢复图片元数据失败");
+        let expected = root
+            .join("thumbnail")
+            .join(metadata.thumbnail_path().as_path());
+        storage
+            .upsert_image(ImageUpsertInput {
+                metadata,
+                canonical_root: root.to_path_buf(),
+                root_kind: ImageStorageRootKind::Custom,
+                source_exe: Some("screen.exe".to_owned()),
+                source_app: Some("截图工具".to_owned()),
+                copied_at,
+            })
+            .expect("预置恢复图片失败");
+        expected
+    }
+
     /// 恢复摘要必须按时间倒序生成 UI 卡片，且不携带完整正文字段。
     #[test]
     fn 恢复文本摘要并丢弃正文() {
@@ -253,6 +310,24 @@ mod tests {
         assert_eq!(snapshot.items[0].content_hash, hash_text("较新"));
     }
 
+    /// 启动恢复必须保留图片类型、尺寸和缩略图定位，同时保持复制门禁关闭。
+    #[test]
+    fn 启动恢复图片摘要与复制门禁() {
+        let directory = test_directory("image");
+        let root = directory.join("images");
+        let mut storage = StorageExecutor::open_at(&directory).expect("启动图片恢复存储失败");
+        let expected_thumbnail = insert_image(&mut storage, &root, 20);
+
+        let snapshot = load_startup_snapshot(&mut storage).expect("恢复图片快照失败");
+        let image = &snapshot.items[0];
+        let UiClipboardItemKind::Image(summary) = &image.kind else {
+            panic!("恢复结果应为图片卡片");
+        };
+        assert_eq!(summary.thumbnail_path, expected_thumbnail);
+        assert_eq!((summary.width, summary.height), (640, 480));
+        assert!(!image.copy_enabled());
+    }
+
     /// 首页读取必须有界；超过 100 条时不得把后续记录带进启动快照。
     #[test]
     fn 恢复快照最多一百条() {
@@ -267,9 +342,9 @@ mod tests {
         assert_eq!(snapshot.items[0].preview, "文本-119");
     }
 
-    /// 混合数据库中的图片不能进入文本 UI，但也不能阻止文本启动恢复。
+    /// 未知类型不具备受限 UI 身份，必须阻止启动恢复而不是伪装成文本或图片。
     #[test]
-    fn 启动恢复在查询边界忽略非文本记录() {
+    fn 启动恢复拒绝未知类型记录() {
         let directory = test_directory("unsupported");
         let mut storage = StorageExecutor::open_at(&directory).expect("启动恢复存储失败");
         insert_text(&mut storage, "可恢复文本", 2);
@@ -282,9 +357,11 @@ mod tests {
             .expect("预置不兼容记录失败");
         drop(connection);
 
-        let snapshot = load_startup_snapshot(&mut storage).expect("混合类型不应阻止文本恢复");
-        assert_eq!(snapshot.items.len(), 1);
-        assert_eq!(snapshot.items[0].preview, "可恢复文本");
+        assert!(matches!(
+            load_startup_snapshot(&mut storage),
+            Err(StartupRestoreError::UnsupportedItemType { item_type, .. })
+                if item_type == "binary"
+        ));
         let connection = Connection::open(storage.database_path()).expect("重新打开混合数据库失败");
         let non_text_count: i64 = connection
             .query_row(
@@ -311,6 +388,7 @@ mod tests {
             created_at: 1,
             copied_at: 1,
             last_used_at: None,
+            image: None,
         };
         let payload = HistoryPayload {
             id: 1,
@@ -348,6 +426,7 @@ mod tests {
             created_at: 1,
             copied_at: 1,
             last_used_at: None,
+            image: None,
         };
         let payload = HistoryPayload {
             id: 1,

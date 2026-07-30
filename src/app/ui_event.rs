@@ -418,6 +418,9 @@ impl UiState {
                 else {
                     return UiAction::None;
                 };
+                if !self.snapshot.items[index].copy_enabled() {
+                    return UiAction::None;
+                }
                 self.snapshot.selected_index = Some(index);
                 UiAction::QueueCopy { id, content_hash }
             }
@@ -1089,8 +1092,8 @@ impl UiState {
         let keyword = self.search_text.trim();
         HistoryQuery {
             keyword: (!keyword.is_empty()).then(|| keyword.to_owned()),
-            // 当前窗口只渲染文本卡片；全部和收藏也必须在 SQL 边界排除非文本行。
-            item_type: Some("text".to_owned()),
+            // “全部”和“收藏”允许文本/图片混合；“文本”标签保持精确类型筛选。
+            item_type: (self.search_filter == SearchFilter::Text).then(|| "text".to_owned()),
             is_pinned: match self.search_filter {
                 SearchFilter::Pinned => Some(true),
                 SearchFilter::All | SearchFilter::Text => None,
@@ -1935,6 +1938,9 @@ fn resolve_copy_item(index: i32) -> Option<UiEvent> {
             return None;
         }
         let item = state.snapshot.items.get(index)?;
+        if !item.copy_enabled() {
+            return None;
+        }
         Some(UiEvent::CopyItem {
             panel_generation: state.panel_generation,
             id: item.id,
@@ -2007,6 +2013,23 @@ fn set_window_snapshot(
             delete_pending: pending_delete.is_some_and(|pending| {
                 pending.id == item.id && pending.content_hash == item.content_hash
             }),
+            is_image: matches!(
+                item.kind,
+                crate::command::UiClipboardItemKind::Image(_)
+            ),
+            copy_enabled: item.copy_enabled(),
+            image_width: match &item.kind {
+                crate::command::UiClipboardItemKind::Image(image) => {
+                    i32::try_from(image.width).unwrap_or(i32::MAX)
+                }
+                crate::command::UiClipboardItemKind::Text => 0,
+            },
+            image_height: match &item.kind {
+                crate::command::UiClipboardItemKind::Image(image) => {
+                    i32::try_from(image.height).unwrap_or(i32::MAX)
+                }
+                crate::command::UiClipboardItemKind::Text => 0,
+            },
         })
         .collect::<Vec<_>>();
     window.set_cards(ModelRc::new(VecModel::from(cards)));
@@ -2176,7 +2199,10 @@ mod tests {
         UiAction, UiState, CLEAR_ALL_CONFIRMATION_PHRASE, UI_FIRST_BATCH_SIZE,
         UI_HISTORY_MEMORY_CAPACITY,
     };
-    use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
+    use crate::command::{
+        SearchFilter, SearchStatus, UiClipboardItem, UiClipboardItemKind, UiEvent,
+        UiImageSummary, UiSnapshot,
+    };
     use crate::history_mutation::{
         clear_history_mutation_channel, ClearHistoryMutationFailure, ClearHistoryMutationRequest,
         ClearHistoryMutationResult, ClearHistoryMutationSubmitError, ClearHistoryMutationSuccess,
@@ -2196,6 +2222,7 @@ mod tests {
             content_hash: [index as u8; 32],
             copy_count: 1,
             is_pinned: false,
+            kind: Default::default(),
         }
     }
 
@@ -3266,6 +3293,7 @@ mod tests {
                 content_hash: [1; 32],
                 copy_count: 1,
                 is_pinned: false,
+                kind: Default::default(),
             }],
             selected_index: Some(0),
         }));
@@ -3280,6 +3308,7 @@ mod tests {
                     content_hash: [2; 32],
                     copy_count: 1,
                     is_pinned: false,
+                    kind: Default::default(),
                 },
                 1,
             )),
@@ -3304,6 +3333,7 @@ mod tests {
                 content_hash: [9; 32],
                 copy_count: 1,
                 is_pinned: true,
+                kind: Default::default(),
             },
             1,
         ));
@@ -3316,6 +3346,7 @@ mod tests {
                 content_hash: [9; 32],
                 copy_count: u64::MAX,
                 is_pinned: true,
+                kind: Default::default(),
             },
             2,
         ));
@@ -3343,6 +3374,7 @@ mod tests {
                     content_hash: [1; 32],
                     copy_count: 1,
                     is_pinned: false,
+                    kind: Default::default(),
                 },
                 UiClipboardItem {
                     id: 2,
@@ -3352,6 +3384,7 @@ mod tests {
                     content_hash: [1; 32],
                     copy_count: 1,
                     is_pinned: false,
+                    kind: Default::default(),
                 },
                 UiClipboardItem {
                     id: 3,
@@ -3361,6 +3394,7 @@ mod tests {
                     content_hash: [3; 32],
                     copy_count: 1,
                     is_pinned: false,
+                    kind: Default::default(),
                 },
             ],
             selected_index: Some(1),
@@ -3387,6 +3421,7 @@ mod tests {
                     content_hash,
                     copy_count: 1,
                     is_pinned: false,
+                    kind: Default::default(),
                 },
                 index as u64 + 1,
             ));
@@ -3678,14 +3713,17 @@ mod tests {
         assert_eq!(state.history.items().len(), 1);
     }
 
-    /// 全部、文本和收藏标签都必须在 SQLite 输入边界显式限制为 text。
+    /// 全部和收藏允许混合类型，只有文本标签在 SQLite 输入边界限制为 text。
     #[test]
-    fn 所有当前筛选都只查询文本记录() {
+    fn 全部与收藏查询混合类型而文本标签精确筛选() {
         let mut state = UiState::default();
         for filter in [SearchFilter::All, SearchFilter::Text, SearchFilter::Pinned] {
             state.search_filter = filter;
             let query = state.build_search_query();
-            assert_eq!(query.item_type.as_deref(), Some("text"));
+            assert_eq!(
+                query.item_type.as_deref(),
+                (filter == SearchFilter::Text).then_some("text")
+            );
             assert_eq!(
                 query.is_pinned,
                 (filter == SearchFilter::Pinned).then_some(true)
@@ -3739,6 +3777,43 @@ mod tests {
         );
         assert_eq!(state.snapshot.selected_index, Some(1));
         assert!(state.panel_visible);
+    }
+
+    /// 图片复制在 ATOM-38 前必须同时被 resolver 和 reducer 拒绝。
+    #[test]
+    fn 图片卡片禁止进入复制队列() {
+        let mut image = test_item(0);
+        image.kind = UiClipboardItemKind::Image(UiImageSummary {
+            thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
+            width: 100,
+            height: 80,
+        });
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![image.clone()],
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation();
+        assert_eq!(
+            state.apply(UiEvent::CopyItem {
+                panel_generation: generation,
+                id: image.id,
+                content_hash: image.content_hash,
+            }),
+            UiAction::None
+        );
+
+        super::UI_STATE.with(|slot| {
+            let mut global = slot.borrow_mut();
+            *global = UiState::default();
+            global.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![image],
+                selected_index: None,
+            }));
+            global.apply(UiEvent::OpenPanel);
+        });
+        assert_eq!(super::resolve_copy_item(0), None);
     }
 
     /// 没有可见面板时的迟到复制按钮事件必须被 reducer 丢弃。

@@ -808,6 +808,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "i-slint-backend-testing",
+ "image",
  "rusqlite",
  "slint",
  "slint-build",

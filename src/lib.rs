@@ -12,6 +12,8 @@ pub mod command;
 pub mod diagnostics;
 pub mod domain;
 pub mod history;
+// 图片解码模块只接收拥有型或借用编码字节，不访问剪贴板句柄和 UI。
+pub mod image_decode;
 // 图片存储模块先公开纯路径布局；目录 IO 与 Windows 安全守卫由同模块后续原子补齐。
 pub mod image_storage;
 // 收藏 mutation 使用独立有界桥，避免 UI 线程阻塞或把 SQLite 连接泄漏到界面层。

@@ -4,7 +4,7 @@
 
 - 计划 ID：ATOMIC-REGISTERED-PNG-001
 - 类型：atomic-development
-- 修订版本：1
+- 修订版本：2
 - 状态：active
 - 父级 ID：ATOM-32
 - 创建基线：cebaf23
@@ -72,7 +72,7 @@
 
 ## PNG-01 有界解码注册 PNG
 
-- 状态：in_progress
+- 状态：done
 - 支持的验收场景：场景 1、2。
 - 唯一目标：把有界 PNG 编码字节解码为规范 RGBA8 像素。
 - 当前行为与目标行为：当前没有图片解码依赖；完成后纯函数可安全解码 PNG。
@@ -99,9 +99,18 @@
 - DDD 门禁：提交前复核资源上限和错误分类。
 - 计划提交信息：`feat(image): [PNG-01] 有界解码注册 PNG`
 
+### PNG-01 执行记录
+
+- 已增加仅启用 PNG feature 的 `image 0.25.10`，并建立纯解码模块。
+- 编码长度、IHDR 单维、RGBA8 结果和原生解码缓冲均在完整像素解码前受限。
+- DDD 复核发现后设 limits 无法约束压缩头部元数据，已改为构造解码器时通过
+  `PngDecoder::with_limits` 注入限制。
+- PNG 定向测试 5 项、库 check、库 Clippy、中文注释门禁和 diff-check 均通过。
+- 最终 DDD 结论：`PASS`。
+
 ## PNG-02 从剪贴板复制注册 PNG 字节
 
-- 状态：pending
+- 状态：in_progress
 - 支持的验收场景：场景 3、4。
 - 唯一目标：在 ClipboardIO 协议内复制注册 PNG 的有界拥有型编码字节。
 - 当前行为与目标行为：当前 backend 只读取 Unicode 文本；完成后可单独读取注册 PNG。

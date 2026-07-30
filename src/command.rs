@@ -294,6 +294,28 @@ pub enum UiEvent {
         /// 全部已加载卡片对应的内容高度。
         content_height: i32,
     },
+    /// Append 绑定等待期间捕获的旧几何通知；只更新缩略图视口，不参与分页边沿。
+    HistoryViewportChangedDuringAppend {
+        /// 有可投递探针时携带修订；`None` 表示修订耗尽但绑定门禁仍有效。
+        append_revision: Option<u64>,
+        /// Flickable 的负向纵向视口坐标。
+        viewport_y: i32,
+        /// 当前可见区域高度。
+        visible_height: i32,
+        /// 事件产生时的内容高度；绑定后探针会读取最终值。
+        content_height: i32,
+    },
+    /// 续页模型完成绑定和视口恢复后的单次几何探针；只接受当前待处理追加修订。
+    HistoryPostAppendProbe {
+        /// Append 接受时分配的单调修订号，用于拒绝迟到或重复探针。
+        append_revision: u64,
+        /// 模型绑定并恢复后的 Flickable 负向纵向视口坐标。
+        viewport_y: i32,
+        /// 状态区稳定后的当前可见区域高度。
+        visible_height: i32,
+        /// 新模型全部混合卡片对应的真实内容高度。
+        content_height: i32,
+    },
     /// 用户点击固定失败提示后显式重试当前游标。
     RetryHistoryPage,
     /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。

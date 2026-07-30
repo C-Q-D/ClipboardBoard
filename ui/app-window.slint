@@ -92,6 +92,8 @@ export component AppWindow inherits Window {
     in-out property <string> search-text: "";
     in-out property <int> search-filter: 0;
     in property <string> search-status: "idle";
+    // 续页加载独立于首页搜索状态，避免旧结果保留期间显示错误文案。
+    in property <bool> history-next-page-loading: false;
     in property <bool> history-retry-required: false;
     // 收藏失败只展示固定文案，不接收 SQLite 或正文错误详情。
     in property <bool> pin-error-visible: false;
@@ -447,7 +449,7 @@ export component AppWindow inherits Window {
                 }
 
                 // ListView 由 Slint 负责滚动和窗口化，Rust 侧只提供 ModelRc 数据。
-                // 固定卡片高度让大列表无需测量每个正文的真实高度。
+                // 文本与图片各使用固定高度，混合列表的总高度由 ListView 真实累加。
                 history-list := ListView {
                     vertical-stretch: 1;
                     changed viewport-y => {
@@ -679,21 +681,31 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if history-retry-required: Rectangle {
+                // 分页状态区始终占据固定高度，加载/失败切换不能改变列表可见高度。
+                Rectangle {
                     height: 32px;
                     border-radius: 6px;
-                    background: retry-touch.has-hover ? #242424 : #141414;
+                    background: history-retry-required
+                        ? retry-touch.has-hover ? #242424 : #141414
+                        : transparent;
 
                     Text {
-                        text: "加载失败，点击重试";
-                        color: #d99b6c;
+                        text: history-retry-required
+                            ? "加载失败，点击重试"
+                            : history-next-page-loading ? "正在加载更多…" : "";
+                        color: history-retry-required ? #d99b6c : #8c8c8c;
                         font-size: 13px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
 
                     retry-touch := TouchArea {
-                        clicked => { retry-history-page-requested(); }
+                        enabled: history-retry-required;
+                        clicked => {
+                            if (history-retry-required) {
+                                retry-history-page-requested();
+                            }
+                        }
                     }
                 }
 

@@ -45,12 +45,14 @@ use slint::PhysicalPosition;
 pub const UI_HISTORY_MEMORY_CAPACITY: usize = MAX_LOADED_ITEMS;
 /// SQLite 首页固定批量。
 pub const UI_FIRST_BATCH_SIZE: usize = 30;
-/// 固定卡片高度；底部阈值使用两行，避免要求滚轮精确触底。
+/// 文本卡片固定高度；选择和缩略图视口计算与 Slint 代理保持一致。
 const HISTORY_CARD_HEIGHT: i32 = 106;
-/// 距离列表底部两行以内视为进入续页区域。
-const HISTORY_BOTTOM_THRESHOLD: i32 = HISTORY_CARD_HEIGHT * 2;
 /// 图片卡片固定高度；视口调度无需解码正文或测量图片。
 const IMAGE_CARD_HEIGHT: i32 = 186;
+/// 距离底部两张最高图片卡片以内进入续页区，兼容文本与图片混合列表。
+const HISTORY_BOTTOM_ENTER_THRESHOLD: i32 = IMAGE_CARD_HEIGHT * 2;
+/// 离开阈值比进入阈值多一张图片卡片，吸收 Slint 多属性布局回调抖动。
+const HISTORY_BOTTOM_EXIT_THRESHOLD: i32 = IMAGE_CARD_HEIGHT * 3;
 /// 视口上下各多加载两张图片卡片，减少快速滚动时的空白闪烁。
 const THUMBNAIL_VIEWPORT_BUFFER: i32 = IMAGE_CARD_HEIGHT * 2;
 /// UI 纹理缓存上限；超过时整体回收，避免长时间滚动持续增长。
@@ -85,6 +87,28 @@ enum UiAction {
     None,
     /// 退出 Slint 事件循环；只允许第一次 Quit 事件触发。
     Quit,
+}
+
+/// 单次历史结果对窗口模型的最小刷新语义。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryModelRefresh {
+    /// 结果被拒绝或失败，窗口模型保持原样。
+    None,
+    /// 首页替换为新数据集，允许既有选择滚入逻辑定位首项。
+    Replace,
+    /// 续页追加保留旧视口；修订耗尽时没有绑定后探针。
+    AppendPreservingViewport { append_revision: Option<u64> },
+}
+
+/// Append 模型绑定期间的独立门禁；修订耗尽仍必须冻结旧布局回调。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppendBindingGate {
+    /// 当前没有 Append 模型等待绑定。
+    Idle,
+    /// 绑定完成后允许投递一次携带修订的真实几何探针。
+    ProbePending(u64),
+    /// 修订号已经耗尽；只冻结绑定期间回调，绑定完成后不自动探测。
+    RevisionExhausted,
 }
 
 /// 单次原生定位与激活尝试的有限结果；调用方据此决定重试或只记录固定诊断。
@@ -156,6 +180,12 @@ struct UiState {
     pending_history_request: Option<HistoryPageRequest>,
     /// 上一次几何通知是否位于底部阈值内，用于检测 outside→inside 边沿。
     history_was_near_bottom: bool,
+    /// 续页已经签发且尚未收口；首页加载不使用该状态。
+    history_next_page_loading: bool,
+    /// 最近分配的追加修订号；仅通过检查加法推进，耗尽后禁止回绕。
+    next_append_revision: u64,
+    /// Append 绑定门禁独立于可投递修订；耗尽状态也必须隔离旧布局回调。
+    append_binding_gate: AppendBindingGate,
     /// 当前唯一在途收藏请求；隐藏面板不会取消已经接受的持久化事务。
     pending_pin_mutation: Option<PinMutationRequest>,
     /// 下一次收藏请求使用的单调令牌；耗尽时拒绝新请求而不回绕。
@@ -211,6 +241,9 @@ impl Default for UiState {
             history_pages: HistoryPageCoordinator::default(),
             pending_history_request: None,
             history_was_near_bottom: false,
+            history_next_page_loading: false,
+            next_append_revision: 0,
+            append_binding_gate: AppendBindingGate::Idle,
             pending_pin_mutation: None,
             next_pin_mutation_token: 1,
             pin_error_visible: false,
@@ -286,7 +319,7 @@ impl UiState {
                 self.search.cancel();
                 self.history_pages.invalidate();
                 self.pending_history_request = None;
-                self.history_was_near_bottom = false;
+                self.reset_history_scroll_dataset();
                 UiAction::Quit
             }
             UiEvent::HidePanel { generation } => {
@@ -365,6 +398,24 @@ impl UiState {
                 content_height,
             } => {
                 self.handle_history_viewport(viewport_y, visible_height, content_height);
+                UiAction::None
+            }
+            UiEvent::HistoryViewportChangedDuringAppend { .. } => {
+                // 事件在 pending 存在时已经冻结为旧布局通知，即使迟到也不能参与分页。
+                UiAction::None
+            }
+            UiEvent::HistoryPostAppendProbe {
+                append_revision,
+                viewport_y,
+                visible_height,
+                content_height,
+            } => {
+                self.handle_post_append_probe(
+                    append_revision,
+                    viewport_y,
+                    visible_height,
+                    content_height,
+                );
                 UiAction::None
             }
             UiEvent::RetryHistoryPage => {
@@ -482,7 +533,7 @@ impl UiState {
         self.search.cancel();
         self.history_pages.invalidate();
         self.pending_history_request = None;
-        self.history_was_near_bottom = false;
+        self.reset_history_scroll_dataset();
     }
 
     /// 首次显示副作用失败时回滚匹配代次，避免下一次热键把实际隐藏窗口误判为可见。
@@ -932,7 +983,7 @@ impl UiState {
         self.search_status = SearchStatus::Idle;
         self.search_generation = None;
         self.pending_history_request = None;
-        self.history_was_near_bottom = false;
+        self.reset_history_scroll_dataset();
         self.snapshot.selected_index = None;
         self.pin_error_visible = false;
         self.delete_error_visible = false;
@@ -946,7 +997,7 @@ impl UiState {
 
     /// 推进 SQLite 数据集；可见时立即生成当前筛选的首页请求。
     fn begin_history_dataset(&mut self, request_now: bool) {
-        self.history_was_near_bottom = false;
+        self.reset_history_scroll_dataset();
         match self.history_pages.begin_dataset() {
             Ok(_) if request_now => {
                 self.search_status = SearchStatus::Loading;
@@ -977,25 +1028,62 @@ impl UiState {
     /// 身份耗尽只显示固定错误并保留当前卡片。
     fn mark_history_identity_error(&mut self) {
         self.pending_history_request = None;
+        self.reset_history_scroll_dataset();
         self.search_status = SearchStatus::Error;
     }
 
-    /// 根据真实 Flickable 几何检测底部边沿；同区重绘只更新状态，不重复派发。
+    /// 清除当前数据集的滚动续页门禁；新数据集总是从 outside 初态开始。
+    fn reset_history_scroll_dataset(&mut self) {
+        self.history_was_near_bottom = false;
+        self.history_next_page_loading = false;
+        self.append_binding_gate = AppendBindingGate::Idle;
+    }
+
+    /// 根据滞回阈值更新底部状态；中间区保持调用前状态。
+    fn near_bottom_after_distance(previous: bool, distance: i32) -> bool {
+        if distance <= HISTORY_BOTTOM_ENTER_THRESHOLD {
+            true
+        } else if distance > HISTORY_BOTTOM_EXIT_THRESHOLD {
+            false
+        } else {
+            previous
+        }
+    }
+
+    /// 计算真实 Flickable 底部距离；未完成布局的几何不参与分页。
+    fn history_bottom_distance(
+        viewport_y: i32,
+        visible_height: i32,
+        content_height: i32,
+    ) -> Option<i32> {
+        if visible_height <= 0 || content_height <= 0 {
+            return None;
+        }
+        let offset = viewport_y.saturating_neg().max(0);
+        Some(
+            content_height
+                .saturating_sub(visible_height)
+                .saturating_sub(offset)
+                .max(0),
+        )
+    }
+
+    /// 根据真实 Flickable 几何检测底部边沿；绑定后探针等待期间旧回调不得触发分页。
     fn handle_history_viewport(
         &mut self,
         viewport_y: i32,
         visible_height: i32,
         content_height: i32,
     ) {
-        if !self.panel_visible || visible_height <= 0 || content_height <= 0 {
+        if !self.panel_visible || self.append_binding_gate != AppendBindingGate::Idle {
             return;
         }
-        let offset = viewport_y.saturating_neg().max(0);
-        let distance = content_height
-            .saturating_sub(visible_height)
-            .saturating_sub(offset)
-            .max(0);
-        let near_bottom = distance <= HISTORY_BOTTOM_THRESHOLD;
+        let Some(distance) =
+            Self::history_bottom_distance(viewport_y, visible_height, content_height)
+        else {
+            return;
+        };
+        let near_bottom = Self::near_bottom_after_distance(self.history_was_near_bottom, distance);
         let entered_bottom = near_bottom && !self.history_was_near_bottom;
         self.history_was_near_bottom = near_bottom;
         if !entered_bottom {
@@ -1008,6 +1096,59 @@ impl UiState {
         self.request_next_history_page();
     }
 
+    /// 消费模型绑定后的唯一追加探针；匹配失败的旧事件不能解除当前门禁。
+    fn handle_post_append_probe(
+        &mut self,
+        append_revision: u64,
+        viewport_y: i32,
+        visible_height: i32,
+        content_height: i32,
+    ) {
+        if self.append_binding_gate != AppendBindingGate::ProbePending(append_revision) {
+            return;
+        }
+        // 先消费再判断，确保重复探针即使在 inside 也不能生成第二个请求。
+        self.append_binding_gate = AppendBindingGate::Idle;
+        if !self.panel_visible {
+            return;
+        }
+        let Some(distance) =
+            Self::history_bottom_distance(viewport_y, visible_height, content_height)
+        else {
+            return;
+        };
+        let near_bottom = Self::near_bottom_after_distance(self.history_was_near_bottom, distance);
+        self.history_was_near_bottom = near_bottom;
+        if near_bottom {
+            self.request_next_history_page();
+        }
+    }
+
+    /// 精确取消尚未调度成功的追加探针；旧失败不得清除后来一页的 pending。
+    fn cancel_post_append_probe(&mut self, append_revision: u64) {
+        if self.append_binding_gate == AppendBindingGate::ProbePending(append_revision) {
+            self.append_binding_gate = AppendBindingGate::Idle;
+        }
+    }
+
+    /// 为一次成功 Append 分配不回绕的 UI 绑定修订；耗尽时关闭本次自动探针。
+    fn reserve_append_revision(&mut self) -> Option<u64> {
+        let Some(revision) = self.next_append_revision.checked_add(1) else {
+            self.append_binding_gate = AppendBindingGate::RevisionExhausted;
+            return None;
+        };
+        self.next_append_revision = revision;
+        self.append_binding_gate = AppendBindingGate::ProbePending(revision);
+        Some(revision)
+    }
+
+    /// 修订耗尽的 Append 完成模型绑定后只解除门禁，不自动探测或请求续页。
+    fn finish_exhausted_append_binding(&mut self) {
+        if self.append_binding_gate == AppendBindingGate::RevisionExhausted {
+            self.append_binding_gate = AppendBindingGate::Idle;
+        }
+    }
+
     /// 按当前筛选、数据库游标和剩余容量生成唯一续页请求。
     fn request_next_history_page(&mut self) {
         if self.history_pages.has_active_request() || self.snapshot.items.len() >= MAX_LOADED_ITEMS
@@ -1018,7 +1159,10 @@ impl UiState {
             .history_pages
             .request_next_page(self.build_search_query())
         {
-            Ok(request) => self.pending_history_request = Some(request),
+            Ok(request) => {
+                self.pending_history_request = Some(request);
+                self.history_next_page_loading = true;
+            }
             Err(HistoryPageCoordinatorError::RequestAlreadyActive)
             | Err(HistoryPageCoordinatorError::DatasetExhausted)
             | Err(HistoryPageCoordinatorError::RetryRequired) => {}
@@ -1043,7 +1187,7 @@ impl UiState {
             self.mark_history_identity_error();
             return UiAction::None;
         }
-        self.history_was_near_bottom = false;
+        self.reset_history_scroll_dataset();
 
         match self.search.submit(self.build_search_query(), now) {
             Ok(generation) => {
@@ -1103,7 +1247,7 @@ impl UiState {
     }
 
     /// 应用从 latest 结果槽提取的首页或续页；只接受精确三元身份。
-    fn apply_history_page_result(&mut self, result: HistoryPageResult) {
+    fn apply_history_page_result(&mut self, result: HistoryPageResult) -> HistoryModelRefresh {
         let selected_identity = self
             .snapshot
             .selected_index
@@ -1113,10 +1257,13 @@ impl UiState {
             self.history_pages
                 .accept_page(self.panel_visible, result, &self.snapshot.items)
         else {
-            return;
+            return HistoryModelRefresh::None;
         };
+        self.history_next_page_loading = false;
         match application {
             HistoryPageApplication::Replace(items) => {
+                self.append_binding_gate = AppendBindingGate::Idle;
+                self.history_was_near_bottom = false;
                 self.history.replace(items.clone());
                 self.snapshot.items = items;
                 self.snapshot.selected_index = selected_identity.and_then(|(id, hash)| {
@@ -1132,6 +1279,7 @@ impl UiState {
                 } else {
                     SearchStatus::Results
                 };
+                HistoryModelRefresh::Replace
             }
             HistoryPageApplication::Append(items) => {
                 self.snapshot.items.extend(items);
@@ -1142,9 +1290,15 @@ impl UiState {
                 } else {
                     SearchStatus::Results
                 };
+                HistoryModelRefresh::AppendPreservingViewport {
+                    append_revision: self.reserve_append_revision(),
+                }
             }
-            HistoryPageApplication::FirstPageFailed => self.search_status = SearchStatus::Error,
-            HistoryPageApplication::NextPageFailed => {}
+            HistoryPageApplication::FirstPageFailed => {
+                self.search_status = SearchStatus::Error;
+                HistoryModelRefresh::None
+            }
+            HistoryPageApplication::NextPageFailed => HistoryModelRefresh::None,
         }
     }
 
@@ -1157,8 +1311,10 @@ impl UiState {
             Some(HistoryPageApplication::FirstPageFailed) => {
                 self.search_status = SearchStatus::Error
             }
-            Some(HistoryPageApplication::NextPageFailed)
-            | Some(HistoryPageApplication::Replace(_))
+            Some(HistoryPageApplication::NextPageFailed) => {
+                self.history_next_page_loading = false;
+            }
+            Some(HistoryPageApplication::Replace(_))
             | Some(HistoryPageApplication::Append(_))
             | None => {}
         }
@@ -1475,11 +1631,26 @@ pub fn bind_app_window(window: &AppWindow) {
     });
 
     window.on_history_viewport_changed(|viewport_y, visible_height, content_height| {
-        if let Err(error) = post_ui_event(UiEvent::HistoryViewportChanged {
-            viewport_y: viewport_y.round() as i32,
-            visible_height: visible_height.round() as i32,
-            content_height: content_height.round() as i32,
-        }) {
+        let append_binding_gate = UI_STATE.with(|state| state.borrow().append_binding_gate);
+        let event = if append_binding_gate != AppendBindingGate::Idle {
+            UiEvent::HistoryViewportChangedDuringAppend {
+                append_revision: match append_binding_gate {
+                    AppendBindingGate::ProbePending(revision) => Some(revision),
+                    AppendBindingGate::RevisionExhausted => None,
+                    AppendBindingGate::Idle => unreachable!("空闲状态已由外层分支排除"),
+                },
+                viewport_y: viewport_y.round() as i32,
+                visible_height: visible_height.round() as i32,
+                content_height: content_height.round() as i32,
+            }
+        } else {
+            UiEvent::HistoryViewportChanged {
+                viewport_y: viewport_y.round() as i32,
+                visible_height: visible_height.round() as i32,
+                content_height: content_height.round() as i32,
+            }
+        };
+        if let Err(error) = post_ui_event(event) {
             eprintln!("历史视口事件无法进入 UI 事件队列：{error}");
         }
     });
@@ -1593,6 +1764,11 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 viewport_y,
                 visible_height,
                 ..
+            }
+            | UiEvent::HistoryViewportChangedDuringAppend {
+                viewport_y,
+                visible_height,
+                ..
             } => Some((*viewport_y, *visible_height)),
             _ => None,
         };
@@ -1613,12 +1789,14 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
         // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = event_may_refresh_model(&event);
+        let history_result_event = matches!(&event, UiEvent::HistoryQueryWake);
         let (
             action,
             mut snapshot,
             search_text,
             search_filter,
             mut search_status,
+            mut history_next_page_loading,
             mut history_retry_required,
             mut pending_pin_mutation,
             mut pin_error_visible,
@@ -1631,18 +1809,20 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             clear_all_confirmation_text,
             mut clear_all_error_visible,
             request,
+            history_model_refresh,
         ) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
             let action = state.apply(event);
-            if let Some(result) = history_result {
-                state.apply_history_page_result(result);
-            }
+            let history_model_refresh = history_result
+                .map(|result| state.apply_history_page_result(result))
+                .unwrap_or(HistoryModelRefresh::None);
             (
                 action,
                 state.snapshot.clone(),
                 state.search_text.clone(),
                 state.search_filter,
                 state.search_status,
+                state.history_next_page_loading,
                 state.history_pages.retry_required(),
                 state.pending_pin_mutation,
                 state.pin_error_visible,
@@ -1655,6 +1835,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.clear_all_confirmation_text.clone(),
                 state.clear_all_error_visible,
                 state.take_pending_history_request(),
+                history_model_refresh,
             )
         });
         if let Some(request) = request {
@@ -1670,6 +1851,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     state.mark_history_submission_failed(&failed_request);
                     snapshot = state.snapshot.clone();
                     search_status = state.search_status;
+                    history_next_page_loading = state.history_next_page_loading;
                     history_retry_required = state.history_pages.retry_required();
                 });
             }
@@ -1727,8 +1909,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             .as_ref()
             .is_some_and(|result| apply_thumbnail_result(result, &snapshot));
         // Reassert 只重新显示和激活原窗口，不能重建 ListView 模型或扰动滚动状态。
-        let refresh_model =
-            (may_refresh_model || thumbnail_applied) && action != UiAction::Reassert;
+        let refresh_model = ((may_refresh_model && !history_result_event)
+            || history_model_refresh != HistoryModelRefresh::None
+            || thumbnail_applied)
+            && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
             #[cfg(windows)]
@@ -1751,13 +1935,29 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             schedule_search_debounce(generation);
         }
 
+        let append_revision = match history_model_refresh {
+            HistoryModelRefresh::AppendPreservingViewport { append_revision } => append_revision,
+            HistoryModelRefresh::None | HistoryModelRefresh::Replace => None,
+        };
+        let preserve_append_viewport = matches!(
+            history_model_refresh,
+            HistoryModelRefresh::AppendPreservingViewport { .. }
+        );
+        let mut append_probe_window = None;
+        let mut exhausted_append_window = None;
         UI_WINDOW.with(|target| {
             let weak_window = target.borrow().clone();
             let Some(window) = weak_window.and_then(|weak| weak.upgrade()) else {
+                if let Some(revision) = append_revision {
+                    cancel_pending_post_append_probe(revision);
+                } else if preserve_append_viewport {
+                    finish_exhausted_append_binding();
+                }
                 return;
             };
 
             set_window_search_state(&window, &search_text, search_filter, search_status);
+            window.set_history_next_page_loading(history_next_page_loading);
             window.set_history_retry_required(history_retry_required);
             window.set_pin_error_visible(pin_error_visible);
             window.set_delete_error_visible(delete_error_visible);
@@ -1784,8 +1984,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
 
             // 只有快照、捕获或显示事件才刷新轻量卡片模型；选择事件复用现有模型。
             if refresh_model {
-                let retained_viewport_y =
-                    thumbnail_applied.then(|| window.get_history_viewport_y());
+                let retained_viewport_y = (thumbnail_applied || preserve_append_viewport)
+                    .then(|| window.get_history_viewport_y());
                 set_window_snapshot(
                     &window,
                     &snapshot,
@@ -1795,6 +1995,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 if let Some(viewport_y) = retained_viewport_y {
                     window.set_history_viewport_y(viewport_y);
                 }
+                if preserve_append_viewport && append_revision.is_none() {
+                    // Setter 返回不代表延迟布局回调结束；门禁必须保留到下一 UI 闭包。
+                    exhausted_append_window = Some(window.as_weak());
+                }
             }
             // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
             window.set_selected_index(
@@ -1803,8 +2007,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     .and_then(|index| i32::try_from(index).ok())
                     .unwrap_or(-1),
             );
-            if (refresh_model && !thumbnail_applied) || action == UiAction::ScrollSelection {
+            if (refresh_model && !thumbnail_applied && !preserve_append_viewport)
+                || action == UiAction::ScrollSelection
+            {
                 ensure_selection_visible(&window, &snapshot);
+            }
+            if append_revision.is_some() {
+                append_probe_window = Some(window.as_weak());
             }
 
             if let UiAction::QueueCopy { id, content_hash } = action {
@@ -1884,6 +2093,12 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             }
         });
 
+        if let (Some(revision), Some(weak_window)) = (append_revision, append_probe_window) {
+            schedule_post_append_probe(weak_window, revision);
+        } else if let Some(weak_window) = exhausted_append_window {
+            schedule_exhausted_append_binding_completion(weak_window);
+        }
+
         // 首次显示/模型变化加载顶部可见区域；真实滚动事件按当前视口重新计算。
         let panel_visible = UI_STATE.with(|state| state.borrow().panel_visible);
         if panel_visible && action != UiAction::Quit {
@@ -1904,6 +2119,80 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
     })
 }
 
+/// 按修订收口一次 probe 调度结果；失败只解除门禁，不回滚已接受的历史页。
+fn settle_post_append_probe_dispatch<E, C>(
+    append_revision: u64,
+    result: Result<(), E>,
+    cancel: C,
+) -> Result<(), E>
+where
+    C: FnOnce(u64),
+{
+    if result.is_err() {
+        cancel(append_revision);
+    }
+    result
+}
+
+/// 在全局 UI 状态中精确取消一个尚未送达的绑定后探针。
+fn cancel_pending_post_append_probe(append_revision: u64) {
+    UI_STATE.with(|state| {
+        state.borrow_mut().cancel_post_append_probe(append_revision);
+    });
+}
+
+/// 在全局 UI 状态中完成一次没有可投递修订的 Append 绑定。
+fn finish_exhausted_append_binding() {
+    UI_STATE.with(|state| {
+        state.borrow_mut().finish_exhausted_append_binding();
+    });
+}
+
+/// 在下一 UI 闭包只解除修订耗尽门禁；不得读取几何或自动签发续页。
+fn schedule_exhausted_append_binding_completion(window: slint::Weak<AppWindow>) {
+    let scheduled = slint::invoke_from_event_loop(move || {
+        // 窗口在等待期间消失也必须解除门禁；弱引用只证明该任务来自真实绑定路径。
+        let _window_still_exists = window.upgrade().is_some();
+        finish_exhausted_append_binding();
+    });
+    if let Err(error) = scheduled {
+        // 调度失败不能留下永久门禁；此时没有下一闭包可等待，只能立即安全收口。
+        finish_exhausted_append_binding();
+        eprintln!("历史追加耗尽门禁无法安排到 UI 事件循环：{error}");
+    }
+}
+
+/// 把绑定完成后的几何读取安排到下一 UI 闭包，再投递唯一带修订探针。
+fn schedule_post_append_probe(window: slint::Weak<AppWindow>, append_revision: u64) {
+    let scheduled = slint::invoke_from_event_loop(move || {
+        let Some(window) = window.upgrade() else {
+            cancel_pending_post_append_probe(append_revision);
+            return;
+        };
+        let probe = UiEvent::HistoryPostAppendProbe {
+            append_revision,
+            viewport_y: window.get_history_viewport_y().round() as i32,
+            visible_height: window.get_history_visible_height().round() as i32,
+            content_height: window.get_history_viewport_height().round() as i32,
+        };
+        let delivered = post_ui_event(probe);
+        if let Err(error) = settle_post_append_probe_dispatch(
+            append_revision,
+            delivered,
+            cancel_pending_post_append_probe,
+        ) {
+            eprintln!("历史追加探针无法进入 UI 事件队列：{error}");
+        }
+    });
+    if let Err(error) = settle_post_append_probe_dispatch(
+        append_revision,
+        scheduled,
+        cancel_pending_post_append_probe,
+    ) {
+        eprintln!("历史追加探针无法安排到 UI 事件循环：{error}");
+    }
+}
+
 /// 判断事件是否可能改变卡片模型；纯确认状态变化复用现有列表模型。
 fn event_may_refresh_model(event: &UiEvent) -> bool {
     !matches!(
@@ -1913,6 +2202,8 @@ fn event_may_refresh_model(event: &UiEvent) -> bool {
             | UiEvent::SelectItem { .. }
             | UiEvent::CopyItem { .. }
             | UiEvent::HistoryViewportChanged { .. }
+            | UiEvent::HistoryViewportChangedDuringAppend { .. }
+            | UiEvent::HistoryPostAppendProbe { .. }
             | UiEvent::RetryHistoryPage
             | UiEvent::ClearUnpinnedRequested
             | UiEvent::ClearUnpinnedCancelled
@@ -2429,8 +2720,10 @@ mod tests {
         apply_thumbnail_result, bind_clear_history_mutation_sender,
         close_clear_history_mutation_bridge, event_may_refresh_model, perform_show_action,
         reserve_thumbnail_cache_slot, schedule_thumbnail_requests, selection_item_bounds,
-        selection_viewport_y, visible_snapshot_items, UiAction, UiState,
-        CLEAR_ALL_CONFIRMATION_PHRASE, UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
+        selection_viewport_y, settle_post_append_probe_dispatch, visible_snapshot_items,
+        AppendBindingGate, HistoryModelRefresh, UiAction, UiState, CLEAR_ALL_CONFIRMATION_PHRASE,
+        HISTORY_BOTTOM_ENTER_THRESHOLD, HISTORY_BOTTOM_EXIT_THRESHOLD, UI_FIRST_BATCH_SIZE,
+        UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{
         SearchFilter, SearchStatus, UiClipboardItem, UiClipboardItemKind, UiEvent, UiImageSummary,
@@ -2494,6 +2787,55 @@ mod tests {
             token: request.token,
             requested_cursor: request.query.cursor,
             outcome,
+        }
+    }
+
+    /// 构造已经成功追加且等待绑定后探针的状态，返回唯一追加修订。
+    fn state_with_pending_append_probe() -> (UiState, u64) {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let first = state.take_pending_history_request().unwrap();
+        state.apply_history_page_result(page_result(
+            &first,
+            Ok(UiHistoryPage {
+                items: (0..30).map(test_item).collect(),
+                next_cursor: Some(crate::storage::HistoryCursor {
+                    copied_at: 70,
+                    id: 30,
+                }),
+            }),
+        ));
+        state.apply(UiEvent::HistoryViewportChanged {
+            viewport_y: -2_800,
+            visible_height: 212,
+            content_height: 3_180,
+        });
+        let next = state.take_pending_history_request().unwrap();
+        let refresh = state.apply_history_page_result(page_result(
+            &next,
+            Ok(UiHistoryPage {
+                items: vec![test_item(30)],
+                next_cursor: Some(crate::storage::HistoryCursor {
+                    copied_at: 60,
+                    id: 31,
+                }),
+            }),
+        ));
+        let HistoryModelRefresh::AppendPreservingViewport {
+            append_revision: Some(revision),
+        } = refresh
+        else {
+            panic!("成功续页必须登记绑定后探针");
+        };
+        (state, revision)
+    }
+
+    /// 用固定内容与可见高度构造指定底部距离的真实几何。
+    fn viewport_for_distance(distance: i32) -> UiEvent {
+        UiEvent::HistoryViewportChanged {
+            viewport_y: -(900 - distance),
+            visible_height: 100,
+            content_height: 1_000,
         }
     }
 
@@ -3084,6 +3426,311 @@ mod tests {
         assert!(state.take_pending_history_request().is_none());
     }
 
+    /// 混合列表进入与离开阈值必须精确覆盖 371/372/373/558/559 五个边界。
+    #[test]
+    fn 混合卡片底部阈值提前加载() {
+        assert_eq!(HISTORY_BOTTOM_ENTER_THRESHOLD, 372);
+        assert_eq!(HISTORY_BOTTOM_EXIT_THRESHOLD, 558);
+        assert!(UiState::near_bottom_after_distance(false, 371));
+        assert!(UiState::near_bottom_after_distance(false, 372));
+        assert!(!UiState::near_bottom_after_distance(false, 373));
+        assert!(UiState::near_bottom_after_distance(true, 373));
+        assert!(UiState::near_bottom_after_distance(true, 558));
+        assert!(!UiState::near_bottom_after_distance(true, 559));
+    }
+
+    /// 三个布局属性乱序通知和滞回区抖动只能生成一个活动续页请求。
+    #[test]
+    fn 几何抖动只签发一次续页() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let first = state.take_pending_history_request().unwrap();
+        state.apply_history_page_result(page_result(
+            &first,
+            Ok(UiHistoryPage {
+                items: (0..30).map(test_item).collect(),
+                next_cursor: Some(crate::storage::HistoryCursor {
+                    copied_at: 70,
+                    id: 30,
+                }),
+            }),
+        ));
+
+        state.apply(viewport_for_distance(559));
+        state.apply(viewport_for_distance(372));
+        let request = state.take_pending_history_request().unwrap();
+        for distance in [371, 373, 558, 372, 559, 558, 373] {
+            state.apply(viewport_for_distance(distance));
+            assert!(state.take_pending_history_request().is_none());
+        }
+        assert!(state.history_pages.has_active_request());
+        assert_eq!(request.query.limit, 50);
+    }
+
+    /// Append 等待期间旧普通回调无效，匹配探针只消费一次并最多继续一页。
+    #[test]
+    fn 追加后绑定探针按新几何继续补页() {
+        let (mut state, revision) = state_with_pending_append_probe();
+        let selected_identity = state
+            .snapshot
+            .selected_index
+            .and_then(|index| state.snapshot.items.get(index))
+            .map(|item| (item.id, item.content_hash));
+        assert_eq!(selected_identity, Some((1, [0; 32])));
+        assert_eq!(
+            state.append_binding_gate,
+            AppendBindingGate::ProbePending(revision)
+        );
+        state.apply(viewport_for_distance(559));
+        state.apply(viewport_for_distance(371));
+        assert!(state.take_pending_history_request().is_none());
+
+        let probe = UiEvent::HistoryPostAppendProbe {
+            append_revision: revision,
+            viewport_y: -(900 - 372),
+            visible_height: 100,
+            content_height: 1_000,
+        };
+        state.apply(probe.clone());
+        assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
+        let request = state.take_pending_history_request().unwrap();
+        state.apply(probe);
+        assert!(state.take_pending_history_request().is_none());
+        assert_eq!(request.query.limit, 50);
+        assert_eq!(
+            state.apply(UiEvent::CopyItem {
+                panel_generation: state.panel_generation,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::QueueCopy {
+                id: 1,
+                content_hash: [0; 32],
+            }
+        );
+    }
+
+    /// pending 期间冻结的普通回调即使晚于 outside 探针送达也不能重新进入底部。
+    #[test]
+    fn 旧普通回调和重复探针不得误触发() {
+        let (mut state, revision) = state_with_pending_append_probe();
+        let stale = UiEvent::HistoryViewportChangedDuringAppend {
+            append_revision: Some(revision),
+            viewport_y: -528,
+            visible_height: 100,
+            content_height: 1_000,
+        };
+        state.apply(UiEvent::HistoryPostAppendProbe {
+            append_revision: revision,
+            viewport_y: -(900 - 559),
+            visible_height: 100,
+            content_height: 1_000,
+        });
+        assert!(!state.history_was_near_bottom);
+        assert!(state.take_pending_history_request().is_none());
+
+        state.apply(stale);
+        state.apply(UiEvent::HistoryPostAppendProbe {
+            append_revision: revision,
+            viewport_y: -528,
+            visible_height: 100,
+            content_height: 1_000,
+        });
+        assert!(!state.history_was_near_bottom);
+        assert!(state.take_pending_history_request().is_none());
+    }
+
+    /// 搜索等数据集失效路径必须拒绝旧追加探针并恢复 outside 初态。
+    #[test]
+    fn 数据集失效清除旧追加探针() {
+        let invalidators: Vec<Box<dyn Fn(&mut UiState)>> = vec![
+            Box::new(|state| {
+                state.apply_at(
+                    UiEvent::SearchTextChanged("新查询".to_owned()),
+                    Instant::now(),
+                );
+            }),
+            Box::new(|state| {
+                state.apply_at(
+                    UiEvent::SearchFilterChanged(SearchFilter::Image),
+                    Instant::now(),
+                );
+            }),
+            Box::new(|state| {
+                state.apply(captured(test_item(99), 1));
+            }),
+            Box::new(|state| {
+                let generation = state.panel_generation;
+                state.apply(UiEvent::HidePanel { generation });
+                state.apply(UiEvent::ShowPanel);
+            }),
+        ];
+
+        for invalidate in invalidators {
+            let (mut state, revision) = state_with_pending_append_probe();
+            invalidate(&mut state);
+            assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
+            assert!(!state.history_was_near_bottom);
+            state.pending_history_request = None;
+            state.apply(UiEvent::HistoryPostAppendProbe {
+                append_revision: revision,
+                viewport_y: -528,
+                visible_height: 100,
+                content_height: 1_000,
+            });
+            assert!(state.take_pending_history_request().is_none());
+        }
+
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let first = state.take_pending_history_request().unwrap();
+        let old_revision = 77;
+        state.append_binding_gate = AppendBindingGate::ProbePending(old_revision);
+        state.history_was_near_bottom = true;
+        state.apply_history_page_result(page_result(
+            &first,
+            Ok(UiHistoryPage {
+                items: vec![test_item(100)],
+                next_cursor: None,
+            }),
+        ));
+        state.apply(UiEvent::HistoryPostAppendProbe {
+            append_revision: old_revision,
+            viewport_y: 0,
+            visible_height: 100,
+            content_height: 100,
+        });
+        assert!(state.take_pending_history_request().is_none());
+        assert!(!state.history_was_near_bottom);
+    }
+
+    /// 调度失败只取消匹配 pending，随后真实 outside→inside 仍可恢复普通续页。
+    #[test]
+    fn 探针投递失败解除门禁并可恢复() {
+        let (mut state, revision) = state_with_pending_append_probe();
+        let result: Result<(), &'static str> = settle_post_append_probe_dispatch(
+            revision,
+            Err("注入调度失败"),
+            |failed_revision| state.cancel_post_append_probe(failed_revision),
+        );
+        assert!(result.is_err());
+        assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
+        assert_eq!(state.snapshot.items.len(), 31);
+
+        state.apply(viewport_for_distance(559));
+        state.apply(viewport_for_distance(372));
+        assert!(state.take_pending_history_request().is_some());
+    }
+
+    /// 窗口弱引用缺失与调度失败共用精确取消语义，不能永久封锁普通边沿。
+    #[test]
+    fn 窗口缺失取消探针后可恢复() {
+        let (mut state, revision) = state_with_pending_append_probe();
+        // 生产窗口 weak upgrade 失败时调用同一取消接缝；这里不创建或显示真实窗口。
+        state.cancel_post_append_probe(revision);
+        assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
+        assert_eq!(state.snapshot.items.len(), 31);
+        state.apply(viewport_for_distance(559));
+        state.apply(viewport_for_distance(372));
+        assert!(state.take_pending_history_request().is_some());
+    }
+
+    /// 修订耗尽的成功 Append 仍冻结绑定回调，完成后由真实 outside→inside 恢复。
+    #[test]
+    fn 追加修订耗尽不回绕() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::OpenPanel);
+        let first = state.take_pending_history_request().unwrap();
+        state.apply_history_page_result(page_result(
+            &first,
+            Ok(UiHistoryPage {
+                items: (0..30).map(test_item).collect(),
+                next_cursor: Some(crate::storage::HistoryCursor {
+                    copied_at: 70,
+                    id: 30,
+                }),
+            }),
+        ));
+        state.next_append_revision = u64::MAX;
+        state.apply(viewport_for_distance(372));
+        let next = state.take_pending_history_request().unwrap();
+        let refresh = state.apply_history_page_result(page_result(
+            &next,
+            Ok(UiHistoryPage {
+                items: vec![test_item(30)],
+                next_cursor: Some(crate::storage::HistoryCursor {
+                    copied_at: 60,
+                    id: 31,
+                }),
+            }),
+        ));
+        assert_eq!(
+            refresh,
+            HistoryModelRefresh::AppendPreservingViewport {
+                append_revision: None
+            }
+        );
+        assert_eq!(state.next_append_revision, u64::MAX);
+        assert_eq!(
+            state.append_binding_gate,
+            AppendBindingGate::RevisionExhausted
+        );
+        assert_eq!(state.snapshot.items.len(), 31);
+
+        // 模拟模型与视口 setter 同步及延迟产生的乱序回调；下一 UI 闭包前门禁仍有效。
+        for distance in [559, 371, 558, 372] {
+            state.apply(UiEvent::HistoryViewportChangedDuringAppend {
+                append_revision: None,
+                viewport_y: -(900 - distance),
+                visible_height: 100,
+                content_height: 1_000,
+            });
+            assert!(state.take_pending_history_request().is_none());
+        }
+        // 生产路径由下一 UI 闭包执行同一收口方法，且不读取几何、不发送 probe。
+        state.finish_exhausted_append_binding();
+        assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
+
+        // 绑定前冻结的迟到事件仍无效；同区 inside 也不会自动重武装本次 Append。
+        state.apply(UiEvent::HistoryViewportChangedDuringAppend {
+            append_revision: None,
+            viewport_y: -528,
+            visible_height: 100,
+            content_height: 1_000,
+        });
+        state.apply(viewport_for_distance(372));
+        assert!(state.take_pending_history_request().is_none());
+
+        state.apply(viewport_for_distance(559));
+        state.apply(viewport_for_distance(372));
+        assert!(state.take_pending_history_request().is_some());
+    }
+
+    /// 续页加载态只覆盖续页在途时间，成功、失败和数据集切换都会收口。
+    #[test]
+    fn 续页加载态在全部收口路径关闭() {
+        let (mut state, revision) = state_with_pending_append_probe();
+        assert!(!state.history_next_page_loading);
+        state.apply(UiEvent::HistoryPostAppendProbe {
+            append_revision: revision,
+            viewport_y: -528,
+            visible_height: 100,
+            content_height: 1_000,
+        });
+        assert!(state.history_next_page_loading);
+        let request = state.take_pending_history_request().unwrap();
+        state.apply_history_page_result(page_result(
+            &request,
+            Err(HistoryQueryFailure::StorageUnavailable),
+        ));
+        assert!(!state.history_next_page_loading);
+
+        state.begin_history_dataset(true);
+        assert!(!state.history_next_page_loading);
+        state.hide_current_panel();
+        assert!(!state.history_next_page_loading);
+    }
+
     /// 85 条数据必须严格按 30、50、5 三批追加，保持数据库顺序且不重复。
     #[test]
     fn 滚动续页按三十加五十加五加载八十五条() {
@@ -3113,7 +3760,7 @@ mod tests {
         });
         let second = state.take_pending_history_request().unwrap();
         assert_eq!(second.query.limit, 50);
-        state.apply_history_page_result(page_result(
+        let refresh = state.apply_history_page_result(page_result(
             &second,
             Ok(UiHistoryPage {
                 items: (30..80).map(test_item).collect(),
@@ -3123,13 +3770,14 @@ mod tests {
                 }),
             }),
         ));
-
-        state.apply(UiEvent::HistoryViewportChanged {
-            viewport_y: 0,
-            visible_height: 212,
-            content_height: 8_480,
-        });
-        state.apply(UiEvent::HistoryViewportChanged {
+        let HistoryModelRefresh::AppendPreservingViewport {
+            append_revision: Some(revision),
+        } = refresh
+        else {
+            panic!("第二页成功后必须登记绑定探针");
+        };
+        state.apply(UiEvent::HistoryPostAppendProbe {
+            append_revision: revision,
             viewport_y: -8_200,
             visible_height: 212,
             content_height: 8_480,

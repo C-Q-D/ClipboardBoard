@@ -10,9 +10,9 @@ mod worker;
 
 pub use worker::{
     ClearAllHistoryResult, ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult,
-    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, SetPinnedInput,
-    SetPinnedResult, StorageClient, StorageExecutor, StorageStatus, TextUpsertInput,
-    TextUpsertResult,
+    HistoryCursor, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary, ImageUpsertInput,
+    ImageUpsertResult, SetPinnedInput, SetPinnedResult, StorageClient, StorageExecutor,
+    StorageStatus, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -26,6 +26,10 @@ pub enum StorageError {
     MissingLocalAppData,
     /// 数据库声明了当前程序尚未支持的 schema 版本。
     UnsupportedSchemaVersion(i64),
+    /// 当前图片资产根无法无损写入 SQLite TEXT。
+    InvalidImageRootPath,
+    /// 数据库返回的图片根、相对路径或尺寸无法重建领域元数据。
+    InvalidImageAssetMetadata,
     /// 已有表、字段、索引、外键或数据与当前 schema 契约不兼容。
     IncompatibleSchema(String),
     /// 存储线程在初始化阶段提前退出，调用方无法取得就绪结果。
@@ -85,6 +89,8 @@ impl fmt::Display for StorageError {
             Self::UnsupportedSchemaVersion(version) => {
                 write!(formatter, "不支持的 SQLite schema 版本：{version}")
             }
+            Self::InvalidImageRootPath => write!(formatter, "图片资产根路径无法持久化"),
+            Self::InvalidImageAssetMetadata => write!(formatter, "图片资产元数据无效"),
             Self::IncompatibleSchema(detail) => {
                 write!(formatter, "SQLite schema 不兼容：{detail}")
             }

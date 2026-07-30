@@ -17,6 +17,10 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use super::{migration, StorageError};
+use crate::{
+    domain::{ImageAssetRootId, ImageMetadata},
+    image_storage::ImageStorageRootKind,
+};
 
 /// 存储线程命令队列的容量；探针、写入、删除、查询和关闭命令共用有界队列，避免无限堆积。
 const COMMAND_QUEUE_CAPACITY: usize = 4;
@@ -37,6 +41,32 @@ ON CONFLICT(content_hash) DO UPDATE SET
         WHEN copy_count <= 0 THEN 2
         ELSE copy_count + 1
     END
+"#;
+
+/// 图片历史插入 SQL；冲突不改行，由调用方根据影响行数进入明确的重复更新分支。
+const UPSERT_IMAGE_SQL: &str = r#"
+INSERT INTO clipboard_items
+    (item_type, text_content, preview_text, content_hash, source_exe, source_app,
+     copy_count, is_pinned, created_at, copied_at, last_used_at,
+     image_root_id, image_path, thumbnail_path, image_width, image_height,
+     image_format, content_size)
+VALUES ('image', NULL, ?1, ?2, ?3, ?4, 1, 0, ?5, ?5, NULL,
+        ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+ON CONFLICT(content_hash) DO NOTHING
+"#;
+
+/// 重复图片只刷新来源、最近复制时间和饱和计数，禁止替换既有资产身份。
+const UPDATE_DUPLICATE_IMAGE_SQL: &str = r#"
+UPDATE clipboard_items
+SET source_exe = ?1,
+    source_app = ?2,
+    copied_at = ?4,
+    copy_count = CASE
+        WHEN copy_count >= 9223372036854775807 THEN 9223372036854775807
+        WHEN copy_count <= 0 THEN 2
+        ELSE copy_count + 1
+    END
+WHERE content_hash = ?3 AND item_type = 'image'
 "#;
 
 /// 带关键词、来源、类型和收藏筛选的摘要查询；所有筛选参数都通过绑定值传入。
@@ -127,6 +157,52 @@ pub struct TextUpsertResult {
     pub copied_at: i64,
     /// 最近一次被用户使用的时间；写入操作不得覆盖它。
     pub last_used_at: Option<i64>,
+}
+
+/// 图片历史写入的拥有型输入；元数据已经通过领域对象建立哈希、路径和尺寸不变量。
+#[derive(Debug, Eq, PartialEq)]
+pub struct ImageUpsertInput {
+    /// 已发布并回读验证的图片元数据。
+    pub metadata: ImageMetadata,
+    /// 当前资产根的规范绝对路径；只用于根注册，不进入历史卡片。
+    pub canonical_root: PathBuf,
+    /// 当前根是默认目录还是用户自定义目录。
+    pub root_kind: ImageStorageRootKind,
+    /// 复制发生时的源可执行文件名；未知时为空。
+    pub source_exe: Option<String>,
+    /// 复制发生时的源应用显示名；未知时为空。
+    pub source_app: Option<String>,
+    /// 复制事件发生的 Unix 毫秒时间戳。
+    pub copied_at: i64,
+}
+
+/// 图片事务提交后的最终数据库快照；协调器据此决定本次文件应 commit 还是 rollback。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ImageUpsertResult {
+    /// 唯一存储线程为成功事务分配的单调修订号。
+    pub mutation_revision: u64,
+    /// 历史记录数据库主键。
+    pub id: i64,
+    /// 数据库最终采用的图片元数据，可能来自更早的同哈希记录。
+    pub metadata: ImageMetadata,
+    /// 数据库最终保留的预览文案。
+    pub preview_text: String,
+    /// 数据库最终保留的源可执行文件名。
+    pub source_exe: Option<String>,
+    /// 数据库最终保留的源应用显示名。
+    pub source_app: Option<String>,
+    /// 饱和后的复制次数。
+    pub copy_count: i64,
+    /// 数据库最终收藏状态。
+    pub is_pinned: bool,
+    /// 首次创建时间。
+    pub created_at: i64,
+    /// 最近复制时间。
+    pub copied_at: i64,
+    /// 最近使用时间。
+    pub last_used_at: Option<i64>,
+    /// 最终行是否采用了当前输入的根和资产路径。
+    pub adopted_published_assets: bool,
 }
 
 /// 收藏状态写入的最小拥有型输入；明确期望状态使重试保持幂等。
@@ -293,6 +369,13 @@ enum StorageCommand {
         input: TextUpsertInput,
         /// 返回同一事务中读取的最终稳定快照。
         reply: SyncSender<Result<TextUpsertResult, StorageError>>,
+    },
+    /// 在 worker 的唯一连接上注册根并原子插入或更新一条图片历史。
+    UpsertImage {
+        /// 已验证图片元数据、当前根注册信息和来源快照。
+        input: ImageUpsertInput,
+        /// 返回最终数据库快照及本次资产是否被采用。
+        reply: SyncSender<Result<ImageUpsertResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上按稳定身份设置明确收藏状态。
     SetPinned {
@@ -480,6 +563,11 @@ impl StorageExecutor {
     /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
     pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
         self.client().upsert_text(input)
+    }
+
+    /// 在实际存储线程中注册当前根并事务性写入图片历史。
+    pub fn upsert_image(&self, input: ImageUpsertInput) -> Result<ImageUpsertResult, StorageError> {
+        self.client().upsert_image(input)
     }
 
     /// 按 ID 和内容哈希事务性设置明确收藏状态。
@@ -695,6 +783,18 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 在共享 worker 上注册当前根并事务性插入或更新图片历史。
+    pub fn upsert_image(&self, input: ImageUpsertInput) -> Result<ImageUpsertResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::UpsertImage {
+            input,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 在共享 worker 上按稳定身份事务性设置明确收藏状态。
     pub fn set_history_pinned(
         &self,
@@ -885,6 +985,15 @@ fn storage_thread(
                 });
                 let _ = reply.send(result);
             }
+            StorageCommand::UpsertImage { input, reply } => {
+                let result = reserve_mutation_revision(&state).and_then(|revision| {
+                    upsert_image(&mut state.connection, input, revision).inspect(|_| {
+                        // 图片根注册和历史行在同一事务提交后，才安装可观察修订号。
+                        state.storage_mutation_revision = revision;
+                    })
+                });
+                let _ = reply.send(result);
+            }
             StorageCommand::SetPinned { input, reply } => {
                 let _ = reply.send(set_history_pinned(&mut state.connection, input));
             }
@@ -1046,6 +1155,153 @@ WHERE content_hash = ?1
                 created_at: row.get(6)?,
                 copied_at: row.get(7)?,
                 last_used_at: row.get(8)?,
+            })
+        },
+    )?;
+
+    transaction.commit()?;
+    Ok(result)
+}
+
+/// 在同一 SQLite 事务内更新根注册、图片历史和最终资产采用判定。
+fn upsert_image(
+    connection: &mut Connection,
+    input: ImageUpsertInput,
+    mutation_revision: u64,
+) -> Result<ImageUpsertResult, StorageError> {
+    let ImageUpsertInput {
+        metadata,
+        canonical_root,
+        root_kind,
+        source_exe,
+        source_app,
+        copied_at,
+    } = input;
+    let canonical_root = canonical_root
+        .to_str()
+        .ok_or(StorageError::InvalidImageRootPath)?;
+    let content_hash = *metadata.content_hash();
+    let content_hash_blob = content_hash.to_vec();
+    let root_id = metadata.root_id();
+    let root_id_blob = root_id.as_bytes().to_vec();
+    let image_path = metadata
+        .image_path()
+        .as_path()
+        .to_str()
+        .ok_or(StorageError::InvalidImageAssetMetadata)?;
+    let thumbnail_path = metadata
+        .thumbnail_path()
+        .as_path()
+        .to_str()
+        .ok_or(StorageError::InvalidImageAssetMetadata)?;
+    let preview_text = format!("图片 {} × {}", metadata.width(), metadata.height());
+    let transaction = connection.transaction()?;
+
+    // 同一稳定 root_id 可以随已验证目录移动更新路径；UNIQUE(root_path) 会拒绝另一
+    // root_id 冒用当前路径，整个图片事务随冲突一起回滚。
+    transaction.execute(
+        r#"
+INSERT INTO image_asset_roots (root_id, root_path, root_kind, created_at)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(root_id) DO UPDATE SET
+    root_path = excluded.root_path,
+    root_kind = excluded.root_kind
+"#,
+        params![
+            root_id_blob.as_slice(),
+            canonical_root,
+            root_kind.as_str(),
+            copied_at
+        ],
+    )?;
+
+    let inserted = transaction.execute(
+        UPSERT_IMAGE_SQL,
+        params![
+            &preview_text,
+            content_hash_blob.as_slice(),
+            &source_exe,
+            &source_app,
+            copied_at,
+            root_id_blob.as_slice(),
+            image_path,
+            thumbnail_path,
+            i64::from(metadata.width().get()),
+            i64::from(metadata.height().get()),
+            metadata.format().as_str(),
+            metadata.content_size(),
+        ],
+    )? == 1;
+    if !inserted {
+        let updated = transaction.execute(
+            UPDATE_DUPLICATE_IMAGE_SQL,
+            params![
+                &source_exe,
+                &source_app,
+                content_hash_blob.as_slice(),
+                copied_at
+            ],
+        )?;
+        if updated != 1 {
+            // 唯一哈希若属于非图片行或异常触发器，不能伪装成成功重复图片。
+            return Err(StorageError::InvalidImageAssetMetadata);
+        }
+    }
+
+    let result = transaction.query_row(
+        r#"
+SELECT id, preview_text, source_exe, source_app, copy_count, is_pinned,
+       created_at, copied_at, last_used_at, image_root_id, image_path,
+       thumbnail_path, image_width, image_height, content_size
+FROM clipboard_items
+WHERE content_hash = ?1 AND item_type = 'image'
+"#,
+        params![content_hash_blob.as_slice()],
+        |row| {
+            let stored_root_blob: Vec<u8> = row.get(9)?;
+            let stored_root_bytes: [u8; 32] =
+                stored_root_blob.as_slice().try_into().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        32,
+                        rusqlite::types::Type::Blob,
+                        Box::new(StorageError::InvalidImageAssetMetadata),
+                    )
+                })?;
+            let stored_content_size: i64 = row.get(14)?;
+            let stored_content_size = u64::try_from(stored_content_size)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(14, stored_content_size))?;
+            let stored_metadata = ImageMetadata::new(
+                content_hash,
+                ImageAssetRootId::new(stored_root_bytes),
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                stored_content_size,
+            )
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    32,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            // 采用判定来自 INSERT 是否真正创建新行，不能用元数据相等替代；同根同路径的
+            // 重复捕获也必须让协调器 rollback 本次发布句柄。
+            let adopted_published_assets = inserted;
+            Ok(ImageUpsertResult {
+                mutation_revision,
+                id: row.get(0)?,
+                metadata: stored_metadata,
+                preview_text: row.get(1)?,
+                source_exe: row.get(2)?,
+                source_app: row.get(3)?,
+                copy_count: row.get(4)?,
+                is_pinned: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
+                copied_at: row.get(7)?,
+                last_used_at: row.get(8)?,
+                adopted_published_assets,
             })
         },
     )?;
@@ -1354,10 +1610,14 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        DeleteHistoryInput, HistoryCursor, HistoryQuery, SetPinnedInput, StorageExecutor,
-        TextUpsertInput, COMMAND_QUEUE_CAPACITY,
+        DeleteHistoryInput, HistoryCursor, HistoryQuery, ImageUpsertInput, SetPinnedInput,
+        StorageExecutor, TextUpsertInput, COMMAND_QUEUE_CAPACITY,
     };
-    use crate::storage::StorageError;
+    use crate::{
+        domain::{ImageAssetRootId, ImageMetadata},
+        image_storage::ImageStorageRootKind,
+        storage::StorageError,
+    };
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1392,6 +1652,151 @@ mod tests {
             source_app: Some(format!("Old App {hash_value}")),
             copied_at,
         }
+    }
+
+    /// 生成路径与哈希严格绑定的图片输入，供事务和重复资产身份测试复用。
+    fn image_input(
+        hash_value: u8,
+        root_value: u8,
+        canonical_root: PathBuf,
+        copied_at: i64,
+    ) -> ImageUpsertInput {
+        let hash = test_hash(hash_value);
+        let hash_hex = format!("{hash_value:02x}").repeat(32);
+        let metadata = ImageMetadata::new(
+            hash,
+            ImageAssetRootId::new(test_hash(root_value)),
+            format!("{}/{hash_hex}.png", &hash_hex[..2]),
+            format!("{}/{hash_hex}.webp", &hash_hex[..2]),
+            640,
+            480,
+            1024,
+        )
+        .expect("构造图片元数据失败");
+        ImageUpsertInput {
+            metadata,
+            canonical_root,
+            root_kind: ImageStorageRootKind::Custom,
+            source_exe: Some("screen.exe".to_owned()),
+            source_app: Some("截图工具".to_owned()),
+            copied_at,
+        }
+    }
+
+    /// 新图片必须在同一事务注册根并写入完整图片字段。
+    #[test]
+    fn image_upsert_registers_root_and_persists_complete_metadata() {
+        let directory = temporary_directory();
+        let root = directory.join("images-a");
+        let executor = StorageExecutor::open_at(&directory).expect("启动图片存储线程失败");
+        let result = executor
+            .upsert_image(image_input(81, 91, root.clone(), 100))
+            .expect("写入新图片失败");
+
+        assert!(result.adopted_published_assets);
+        assert_eq!(result.copy_count, 1);
+        assert_eq!(result.preview_text, "图片 640 × 480");
+        assert_eq!(
+            result.metadata.root_id(),
+            ImageAssetRootId::new(test_hash(91))
+        );
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开图片测试数据库失败");
+        let stored_root: String = connection
+            .query_row(
+                "SELECT root_path FROM image_asset_roots WHERE root_id = ?1",
+                params![test_hash(91).as_slice()],
+                |row| row.get(0),
+            )
+            .expect("读取图片根注册失败");
+        assert_eq!(PathBuf::from(stored_root), root);
+        let image_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clipboard_items WHERE item_type = 'image'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取图片记录数量失败");
+        assert_eq!(image_count, 1);
+
+        drop(connection);
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 重复哈希必须保留旧资产身份，并明确要求协调器回滚本次新根资产。
+    #[test]
+    fn duplicate_image_preserves_existing_assets_and_reports_not_adopted() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动重复图片存储线程失败");
+        let old_root = directory.join("old-root");
+        let first = executor
+            .upsert_image(image_input(82, 92, old_root.clone(), 100))
+            .expect("写入首张图片失败");
+        let mut same_assets = image_input(82, 92, old_root, 200);
+        same_assets.source_exe = Some("new-screen.exe".to_owned());
+        same_assets.source_app = Some("新截图工具".to_owned());
+        let duplicate = executor
+            .upsert_image(same_assets)
+            .expect("重复图片 upsert 失败");
+
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(duplicate.copy_count, 2);
+        assert_eq!(duplicate.created_at, first.created_at);
+        assert_eq!(duplicate.metadata, first.metadata);
+        assert!(!duplicate.adopted_published_assets);
+        assert_eq!(duplicate.source_exe.as_deref(), Some("new-screen.exe"));
+        assert_eq!(duplicate.source_app.as_deref(), Some("新截图工具"));
+
+        let other_root = executor
+            .upsert_image(image_input(82, 93, directory.join("new-root"), 300))
+            .expect("不同根的重复图片 upsert 失败");
+        assert_eq!(other_root.metadata, first.metadata);
+        assert!(!other_root.adopted_published_assets);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 稳定根 ID 可以随受管目录移动更新路径；另一根 ID 不得冒用同一路径。
+    #[test]
+    fn image_root_move_updates_path_but_path_identity_conflict_rolls_back() {
+        let directory = temporary_directory();
+        let shared_path = directory.join("moved-root");
+        let executor = StorageExecutor::open_at(&directory).expect("启动根移动存储线程失败");
+        executor
+            .upsert_image(image_input(83, 94, directory.join("old-root"), 100))
+            .expect("写入移动前图片失败");
+        executor
+            .upsert_image(image_input(84, 94, shared_path.clone(), 200))
+            .expect("同根 ID 更新路径失败");
+        let error = executor
+            .upsert_image(image_input(85, 95, shared_path.clone(), 300))
+            .expect_err("不同根 ID 冒用路径应失败");
+        assert!(matches!(error, StorageError::Sqlite(_)));
+
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开根移动数据库失败");
+        let stored_root: String = connection
+            .query_row(
+                "SELECT root_path FROM image_asset_roots WHERE root_id = ?1",
+                params![test_hash(94).as_slice()],
+                |row| row.get(0),
+            )
+            .expect("读取移动后根路径失败");
+        assert_eq!(PathBuf::from(stored_root), shared_path);
+        let rejected_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clipboard_items WHERE content_hash = ?1",
+                params![test_hash(85).as_slice()],
+                |row| row.get(0),
+            )
+            .expect("读取冲突回滚记录失败");
+        assert_eq!(rejected_count, 0);
+
+        drop(connection);
+        drop(executor);
+        remove_directory(&directory);
     }
 
     /// 验证打开执行器只有在 v2 迁移提交后才返回，并且重复打开保持幂等。

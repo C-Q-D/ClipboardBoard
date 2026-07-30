@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划，等待用户验证 ATOM-30 |
+| ATOMIC-IMAGE-HASH-001 | 原子开发 | [规范图片哈希原子计划](docs/planning/规范图片哈希原子计划.md) |
 
 <!-- codex-plan-index:end -->

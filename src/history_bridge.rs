@@ -10,15 +10,35 @@ use std::{
 };
 
 use crate::{
-    clipboard::ClipboardCapturePayload,
     clipboard::{
-        ClipboardCaptureInbox, ClipboardCaptureResult, ClipboardCopyRequest, ClipboardWorkItem,
-        ClipboardWriteError, ClipboardWriteExpectationStore, ClipboardWriter,
+        ClipboardCaptureInbox, ClipboardCapturePayload, ClipboardCaptureResult,
+        ClipboardCopyRequest, ClipboardImageBytes, ClipboardWorkItem, ClipboardWriteError,
+        ClipboardWriteExpectationStore, ClipboardWriter,
     },
     command::{UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
-    storage::{HistoryPayload, StorageClient, StorageError, TextUpsertInput, TextUpsertResult},
+    image_pipeline::{ImageInput, ImageRootSnapshot, ImageWorkerError, ImageWorkerSender},
+    storage::{
+        HistoryPayload, ImageUpsertInput, StorageClient, StorageError, TextUpsertInput,
+        TextUpsertResult,
+    },
 };
+
+/// 图片捕获协调所需的发送端和根快照；文件系统 capability 仍只归 ImageWorker 所有。
+#[derive(Clone)]
+pub struct ImageCaptureContext {
+    /// ImageWorker 的有界捕获入口。
+    sender: ImageWorkerSender,
+    /// worker 启动时冻结的根注册信息。
+    root: ImageRootSnapshot,
+}
+
+impl ImageCaptureContext {
+    /// 从同一个 ImageWorker 的发送端与根快照构造上下文。
+    pub fn new(sender: ImageWorkerSender, root: ImageRootSnapshot) -> Self {
+        Self { sender, root }
+    }
+}
 
 /// 单条捕获的 UI 投递状态；结果泵的退出只由 inbox 关闭且排空决定。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +58,17 @@ pub enum CaptureProcessError {
     Storage(StorageError),
     /// 持久化事务返回了不能安全转换为 UI 卡片的 DTO。
     InvalidPersistedRecord,
+    /// 捕获字节无法构造受限 ImageWorker 输入。
+    InvalidImageInput,
+    /// 图片 worker、解码、发布或 finalize 协议失败。
+    ImagePipeline(ImageWorkerError),
+    /// SQLite 失败后本次资产回滚也未完成。
+    ImageStorageAndRollback {
+        /// 原始存储错误。
+        storage: StorageError,
+        /// 回滚完成错误。
+        rollback: ImageWorkerError,
+    },
 }
 
 impl fmt::Display for CaptureProcessError {
@@ -46,6 +77,14 @@ impl fmt::Display for CaptureProcessError {
         match self {
             Self::Storage(error) => write!(formatter, "捕获持久化失败：{error}"),
             Self::InvalidPersistedRecord => write!(formatter, "持久化结果无法转换为 UI 卡片"),
+            Self::InvalidImageInput => formatter.write_str("图片捕获输入无效"),
+            Self::ImagePipeline(error) => write!(formatter, "图片处理失败：{error}"),
+            Self::ImageStorageAndRollback { storage, rollback } => {
+                write!(
+                    formatter,
+                    "图片事务失败且资产回滚失败：{storage}；{rollback}"
+                )
+            }
         }
     }
 }
@@ -56,6 +95,13 @@ impl From<StorageError> for CaptureProcessError {
     /// 将存储层错误包裹到捕获桥的业务错误边界。
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<ImageWorkerError> for CaptureProcessError {
+    /// 将图片 worker 的有限错误纳入捕获桥边界。
+    fn from(error: ImageWorkerError) -> Self {
+        Self::ImagePipeline(error)
     }
 }
 
@@ -125,6 +171,7 @@ pub fn run_clipboard_pump<F>(
     inbox: ClipboardCaptureInbox,
     storage: StorageClient,
     write_expectations: ClipboardWriteExpectationStore,
+    image_context: Option<ImageCaptureContext>,
     mut emit: F,
 ) where
     F: FnMut(UiEvent) -> bool,
@@ -143,9 +190,32 @@ pub fn run_clipboard_pump<F>(
                     // sequence 失配或格式错误只丢弃本次结果，不能终止后续复制事件。
                     continue;
                 };
-                let result = process_capture(&storage, capture, unix_millis_now(), |event| {
-                    ui_open && emit(event)
-                });
+                let copied_at = unix_millis_now();
+                let result = match capture.payload {
+                    ClipboardCapturePayload::Text(payload) => process_capture(
+                        &storage,
+                        ClipboardCaptureResult {
+                            sequence: capture.sequence,
+                            source: capture.source,
+                            payload: ClipboardCapturePayload::Text(payload),
+                        },
+                        copied_at,
+                        |event| ui_open && emit(event),
+                    ),
+                    ClipboardCapturePayload::Image(image) => {
+                        if let Some(context) = image_context.as_ref() {
+                            process_image_capture(
+                                &storage,
+                                context,
+                                capture.source,
+                                image,
+                                copied_at,
+                            )
+                        } else {
+                            Ok(CaptureProcessOutcome::Skipped)
+                        }
+                    }
+                };
                 match result {
                     Ok(CaptureProcessOutcome::Posted) => {}
                     Ok(CaptureProcessOutcome::UiClosed) => {
@@ -163,6 +233,55 @@ pub fn run_clipboard_pump<F>(
             }
         }
     }
+}
+
+/// 图片经过发布验证和数据库事务后，按最终资产采用结果消费一次 finalize。
+fn process_image_capture(
+    storage: &StorageClient,
+    context: &ImageCaptureContext,
+    source: Option<crate::platform::windows::ProcessSource>,
+    image: ClipboardImageBytes,
+    copied_at: i64,
+) -> Result<CaptureProcessOutcome, CaptureProcessError> {
+    let input = match image {
+        ClipboardImageBytes::RegisteredPng(bytes) => ImageInput::registered_png(bytes),
+        ClipboardImageBytes::DibV5(bytes) => ImageInput::dib_v5(bytes),
+        ClipboardImageBytes::Dib(bytes) => ImageInput::dib(bytes),
+    }
+    .map_err(|_| CaptureProcessError::InvalidImageInput)?;
+    let response = context.sender.submit(input)?;
+    let result = response
+        .recv()
+        .map_err(|_| CaptureProcessError::ImagePipeline(ImageWorkerError::Disconnected))??;
+    let (metadata, finalize) = result.into_parts();
+    let input = ImageUpsertInput {
+        metadata,
+        canonical_root: context.root.canonical_root().to_path_buf(),
+        root_kind: context.root.root_kind(),
+        source_exe: source.as_ref().map(|value| value.executable.clone()),
+        source_app: source.as_ref().map(|value| value.display_name.clone()),
+        copied_at,
+    };
+    let upsert = match storage.upsert_image(input) {
+        Ok(result) => result,
+        Err(storage_error) => {
+            return match finalize.rollback() {
+                Ok(()) => Err(CaptureProcessError::Storage(storage_error)),
+                Err(rollback) => Err(CaptureProcessError::ImageStorageAndRollback {
+                    storage: storage_error,
+                    rollback,
+                }),
+            };
+        }
+    };
+    if upsert.adopted_published_assets {
+        finalize.commit()?;
+    } else {
+        // 重复图片继续引用旧资产，只回滚本次发布句柄实际拥有的新文件。
+        finalize.rollback()?;
+    }
+    // IMG-UI-01 前图片只进入数据库，不进入尚无类型门禁的文本 UI 模型。
+    Ok(CaptureProcessOutcome::Skipped)
 }
 
 /// 先事务性 upsert，再通过可注入 sink 投递唯一 UI 事件。
@@ -285,8 +404,9 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        process_capture, process_capture_with_upsert, process_copy_payload, run_clipboard_pump,
-        CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
+        process_capture, process_capture_with_upsert, process_copy_payload, process_image_capture,
+        run_clipboard_pump, CaptureProcessError, CaptureProcessOutcome, CopyProcessError,
+        ImageCaptureContext,
     };
     use crate::{
         clipboard::{
@@ -294,7 +414,9 @@ mod tests {
             ClipboardImageBytes, ClipboardWriteError, ClipboardWriteExpectationStore,
         },
         command::UiEvent,
-        domain::ClipboardPayload,
+        domain::{CanonicalImagePixels, ClipboardPayload},
+        image_pipeline::{encode_original_png, ImageWorker},
+        image_storage::{prepare_image_storage, ImageStoragePreference},
         platform::windows::ProcessSource,
         storage::{HistoryPayload, StorageExecutor, TextUpsertResult},
     };
@@ -353,6 +475,113 @@ mod tests {
         assert_eq!(emit_calls, 0);
     }
 
+    /// 图片文件发布、数据库提交和 finalize 必须形成可重复去重的完整顺序。
+    #[test]
+    fn image_capture_persists_then_finalizes_without_ui_event() {
+        let directory = test_directory("image-persist");
+        let image_root = directory.join("images");
+        let storage = StorageExecutor::open_at(&directory).expect("启动图片事务存储失败");
+        let prepared = prepare_image_storage(ImageStoragePreference::Custom(image_root.clone()))
+            .expect("准备图片测试目录失败");
+        let worker = ImageWorker::start(prepared).expect("启动图片 worker 失败");
+        let context = ImageCaptureContext::new(worker.sender(), worker.root_snapshot().clone());
+        let pixels =
+            CanonicalImagePixels::new(1, 1, vec![10, 20, 30, 255]).expect("构造测试像素失败");
+        let mut png = Vec::new();
+        encode_original_png(&pixels, &mut png).expect("编码测试 PNG 失败");
+
+        let first = process_image_capture(
+            &storage.client(),
+            &context,
+            None,
+            ClipboardImageBytes::RegisteredPng(png.clone()),
+            100,
+        )
+        .expect("首次图片捕获失败");
+        let duplicate = process_image_capture(
+            &storage.client(),
+            &context,
+            None,
+            ClipboardImageBytes::RegisteredPng(png),
+            200,
+        )
+        .expect("重复图片捕获失败");
+        assert_eq!(first, CaptureProcessOutcome::Skipped);
+        assert_eq!(duplicate, CaptureProcessOutcome::Skipped);
+
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开图片事务数据库失败");
+        let (copy_count, image_path, thumbnail_path): (i64, String, String) = connection
+            .query_row(
+                "SELECT copy_count, image_path, thumbnail_path FROM clipboard_items WHERE item_type = 'image'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("读取图片事务结果失败");
+        assert_eq!(copy_count, 2);
+        assert!(image_root.join("original").join(image_path).is_file());
+        assert!(image_root.join("thumbnail").join(thumbnail_path).is_file());
+
+        drop(connection);
+        worker.stop().expect("停止图片 worker 失败");
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理图片事务目录失败");
+    }
+
+    /// SQLite 拒绝图片事务时必须 rollback 本次刚发布的两份资产。
+    #[test]
+    fn image_storage_failure_rolls_back_published_assets() {
+        let directory = test_directory("image-rollback");
+        let image_root = directory.join("images");
+        let storage = StorageExecutor::open_at(&directory).expect("启动图片回滚存储失败");
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开故障注入数据库失败");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_image_insert BEFORE INSERT ON clipboard_items
+                 WHEN NEW.item_type = 'image' BEGIN SELECT RAISE(ABORT, 'reject'); END;",
+            )
+            .expect("创建图片拒绝触发器失败");
+        drop(connection);
+        let prepared = prepare_image_storage(ImageStoragePreference::Custom(image_root.clone()))
+            .expect("准备图片回滚目录失败");
+        let worker = ImageWorker::start(prepared).expect("启动图片回滚 worker 失败");
+        let context = ImageCaptureContext::new(worker.sender(), worker.root_snapshot().clone());
+        let pixels = CanonicalImagePixels::new(1, 1, vec![1, 2, 3, 255]).expect("构造回滚像素失败");
+        let mut png = Vec::new();
+        encode_original_png(&pixels, &mut png).expect("编码回滚 PNG 失败");
+
+        let error = process_image_capture(
+            &storage.client(),
+            &context,
+            None,
+            ClipboardImageBytes::RegisteredPng(png),
+            100,
+        )
+        .expect_err("SQLite 故障应拒绝图片捕获");
+        assert!(matches!(error, CaptureProcessError::Storage(_)));
+        let original_files = std::fs::read_dir(image_root.join("original"))
+            .expect("读取原图目录失败")
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.expect("读取原图分片失败").path())
+                    .expect("读取原图分片目录失败")
+            })
+            .count();
+        let thumbnail_files = std::fs::read_dir(image_root.join("thumbnail"))
+            .expect("读取缩略图目录失败")
+            .flat_map(|entry| {
+                std::fs::read_dir(entry.expect("读取缩略图分片失败").path())
+                    .expect("读取缩略图分片目录失败")
+            })
+            .count();
+        assert_eq!(original_files, 0);
+        assert_eq!(thumbnail_files, 0);
+
+        worker.stop().expect("停止图片回滚 worker 失败");
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理图片回滚目录失败");
+    }
+
     /// UI 在首条投递时关闭，也必须继续排空停止期间已经发布的后续 Capture。
     #[test]
     fn ui_关闭后结果泵仍排空已发布_capture() {
@@ -370,6 +599,7 @@ mod tests {
                 pump_inbox,
                 pump_storage,
                 ClipboardWriteExpectationStore::new(),
+                None,
                 |_event| {
                     sink_entered_sender.send(()).expect("通知 UI sink 进入失败");
                     sink_release_receiver.recv().expect("等待 UI sink 释放失败");

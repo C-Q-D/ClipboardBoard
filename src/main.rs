@@ -18,7 +18,7 @@ use clipboard_board::command::UiEvent;
 #[cfg(windows)]
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
-use clipboard_board::history_bridge::run_clipboard_pump;
+use clipboard_board::history_bridge::{run_clipboard_pump, ImageCaptureContext};
 #[cfg(windows)]
 use clipboard_board::history_mutation::{
     clear_history_mutation_channel, delete_mutation_channel, pin_mutation_channel,
@@ -30,6 +30,10 @@ use clipboard_board::history_query::{
 };
 #[cfg(windows)]
 use clipboard_board::history_restore::load_startup_snapshot;
+#[cfg(windows)]
+use clipboard_board::image_pipeline::ImageWorker;
+#[cfg(windows)]
+use clipboard_board::image_storage::{prepare_image_storage, ImageStoragePreference};
 #[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
@@ -60,18 +64,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut storage = StorageExecutor::open()?;
     let startup_snapshot = load_startup_snapshot(&mut storage)?;
     post_ui_event(UiEvent::ReplaceSnapshot(startup_snapshot))?;
+    let prepared_images = prepare_image_storage(ImageStoragePreference::Default)?;
+    let image_worker = ImageWorker::start(prepared_images)?;
+    let image_context =
+        ImageCaptureContext::new(image_worker.sender(), image_worker.root_snapshot().clone());
     let write_expectations = ClipboardWriteExpectationStore::new();
     let hotkey_manager = HotkeyManager::start_with_write_expectations(write_expectations.clone())?;
     let clipboard_inbox = hotkey_manager.clipboard_inbox();
     bind_copy_request_inbox(clipboard_inbox.clone());
-    let capture_pump =
-        match start_clipboard_pump(clipboard_inbox, storage.client(), write_expectations) {
-            Ok(handle) => handle,
-            Err(error) => {
-                let _ = hotkey_manager.stop();
-                return Err(error.into());
-            }
-        };
+    let capture_pump = match start_clipboard_pump(
+        clipboard_inbox,
+        storage.client(),
+        write_expectations,
+        image_context,
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = hotkey_manager.stop();
+            let _ = image_worker.stop();
+            return Err(error.into());
+        }
+    };
     let (history_requests, history_request_receiver) = history_request_channel();
     let (history_result_sender, history_results) = history_result_channel();
     bind_history_query_bridge(history_requests.clone(), history_results.clone());
@@ -87,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             history_results.close();
             let _ = hotkey_manager.stop();
             let _ = capture_pump.join();
+            let _ = image_worker.stop();
             return Err(error.into());
         }
     };
@@ -103,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 history_results.close();
                 let _ = hotkey_manager.stop();
                 let _ = capture_pump.join();
+                let _ = image_worker.stop();
                 let _ = history_query_worker.join();
                 return Err(error.into());
             }
@@ -121,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 history_results.close();
                 let _ = hotkey_manager.stop();
                 let _ = capture_pump.join();
+                let _ = image_worker.stop();
                 let _ = history_query_worker.join();
                 let _ = pin_mutation_worker.join();
                 return Err(error.into());
@@ -142,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             history_results.close();
             let _ = hotkey_manager.stop();
             let _ = capture_pump.join();
+            let _ = image_worker.stop();
             let _ = history_query_worker.join();
             let _ = pin_mutation_worker.join();
             let _ = delete_mutation_worker.join();
@@ -163,6 +180,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join()
         .map_err(|_| "剪贴板结果泵线程异常退出")
         .map(|_| ());
+    // 捕获泵已排空所有图片事务和 finalize，随后才能停止独占资产根的 ImageWorker。
+    let image_worker_result = image_worker.stop();
     let history_query_result = history_query_worker
         .join()
         .map_err(|_| "历史查询线程异常退出")
@@ -188,6 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop_result?;
     hotkey_result?;
     capture_pump_result?;
+    image_worker_result?;
     history_query_result?;
     pin_mutation_result?;
     delete_mutation_result?;
@@ -202,13 +222,18 @@ fn start_clipboard_pump(
     inbox: ClipboardCaptureInbox,
     storage: StorageClient,
     write_expectations: ClipboardWriteExpectationStore,
+    image_context: ImageCaptureContext,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("clipboard-board-capture-pump".to_owned())
         .spawn(move || {
-            run_clipboard_pump(inbox, storage, write_expectations, |event| {
-                post_ui_event(event).is_ok()
-            });
+            run_clipboard_pump(
+                inbox,
+                storage,
+                write_expectations,
+                Some(image_context),
+                |event| post_ui_event(event).is_ok(),
+            );
         })
 }
 

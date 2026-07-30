@@ -544,6 +544,9 @@ fn convert_page(page: HistoryPage) -> Result<UiHistoryPage, HistoryQueryFailure>
     let items = page
         .items
         .iter()
+        // IMG-UI-01 前 UI DTO 没有条目类型和复制门禁；图片已可持久化，但必须在此
+        // 中间提交安全隐藏，避免被渲染成可点击复制的文本卡片。
+        .filter(|summary| summary.item_type == "text")
         .map(|summary| ui_item_from_summary(summary, now))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(UiHistoryPage {

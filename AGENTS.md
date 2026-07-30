@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划；ATOM-34 已满足，下一项为 ATOM-35 |
+| ATOMIC-DURABLE-IMAGE-PIPELINE-001 | 原子开发 | [耐久图片处理流水线原子计划](docs/planning/耐久图片处理流水线原子计划.md) |
 
 <!-- codex-plan-index:end -->

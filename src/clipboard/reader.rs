@@ -1,4 +1,4 @@
-//! 此模块定义 ClipboardIO 的读取算法、重试边界和 Win32 `CF_UNICODETEXT` 适配器。
+//! 此模块定义 ClipboardIO 的读取算法、重试边界和 Win32 文本、注册 PNG 适配器。
 //!
 //! 算法先记录 sequence，再在有界时长内打开剪贴板，读取函数必须在返回前复制自有数据，
 //! 最后关闭剪贴板并复核 sequence。测试通过 `ClipboardBackend` 注入假后端，不需要修改系统
@@ -8,11 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::domain::ClipboardPayload;
+use crate::image_decode::MAX_PNG_ENCODED_BYTES;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
-    OpenClipboard,
+    OpenClipboard, RegisterClipboardFormatW,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
@@ -56,8 +57,12 @@ pub enum ClipboardReadError {
     SequenceChanged { expected: u32, observed: u32 },
     /// 当前剪贴板没有 Unicode 文本格式。
     UnicodeTextUnavailable,
+    /// 当前剪贴板没有注册 `PNG` 格式，或系统无法取得其格式编号。
+    RegisteredPngUnavailable,
     /// 剪贴板返回的 HGLOBAL 无法读取。
     GlobalMemoryUnavailable,
+    /// 注册 PNG 的编码字节超过固定上限。
+    PngEncodedTooLarge,
     /// 文本缺少终止 NUL，或内存边界在上限前无法确认正文结束。
     MalformedUnicodeText,
     /// UTF-16 数据无法转换为有效 Unicode。
@@ -84,6 +89,12 @@ pub trait ClipboardBackend {
         &mut self,
         max_bytes: usize,
     ) -> Result<ClipboardPayload, ClipboardReadError>;
+
+    /// 在剪贴板仍打开时把注册 PNG 的 HGLOBAL 复制为拥有型编码字节。
+    fn read_registered_png_bytes(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ClipboardReadError>;
 }
 
 /// 使用后端执行一次完整的文本读取，并在打开前后复核 sequence。
@@ -113,6 +124,41 @@ pub fn read_text_with_backend<B: ClipboardBackend>(
         return Err(ClipboardReadError::CloseFailed);
     }
 
+    if sequence_after != sequence_before {
+        return Err(ClipboardReadError::SequenceChanged {
+            expected: sequence_before,
+            observed: sequence_after,
+        });
+    }
+    read_result
+}
+
+/// 使用后端执行一次完整的注册 PNG 字节读取，并在打开前后复核 sequence。
+///
+/// 成功值已经复制到 `Vec<u8>`，因此关闭剪贴板后仍可安全解码。关闭失败优先于读取错误
+/// 和 sequence 失配，避免调用方在系统所有权状态未知时误用结果。
+pub fn read_registered_png_bytes_with_backend<B: ClipboardBackend>(
+    backend: &mut B,
+    expected_sequence: Option<u32>,
+    policy: RetryPolicy,
+) -> Result<Vec<u8>, ClipboardReadError> {
+    let sequence_before = backend.sequence();
+    if let Some(expected) = expected_sequence {
+        if sequence_before != expected {
+            return Err(ClipboardReadError::SequenceChanged {
+                expected,
+                observed: sequence_before,
+            });
+        }
+    }
+
+    open_with_retry(backend, policy)?;
+    let read_result = backend.read_registered_png_bytes(MAX_PNG_ENCODED_BYTES);
+    let sequence_after = backend.sequence();
+    let close_succeeded = backend.close();
+    if !close_succeeded {
+        return Err(ClipboardReadError::CloseFailed);
+    }
     if sequence_after != sequence_before {
         return Err(ClipboardReadError::SequenceChanged {
             expected: sequence_before,
@@ -220,6 +266,24 @@ impl ClipboardBackend for Win32ClipboardBackend {
 
         read_global_unicode_text(handle, max_bytes)
     }
+
+    /// 注册系统 `PNG` 格式，并在返回前把 HGLOBAL 完整复制为拥有型字节。
+    fn read_registered_png_bytes(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ClipboardReadError> {
+        let format_name: Vec<u16> = "PNG\0".encode_utf16().collect();
+        let format = unsafe { RegisterClipboardFormatW(format_name.as_ptr()) };
+        if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
+            return Err(ClipboardReadError::RegisteredPngUnavailable);
+        }
+
+        let handle = unsafe { GetClipboardData(format) };
+        if handle.is_null() {
+            return Err(ClipboardReadError::GlobalMemoryUnavailable);
+        }
+        read_global_bytes(handle, max_bytes)
+    }
 }
 
 /// 从 HGLOBAL 读取 Unicode 文本；扫描范围同时受全局内存大小和正文上限约束。
@@ -256,15 +320,38 @@ fn read_global_unicode_text(
     result
 }
 
+/// 从 HGLOBAL 复制一份有界二进制内容，不把锁定指针或系统句柄泄漏给调用方。
+fn read_global_bytes(handle: HANDLE, max_bytes: usize) -> Result<Vec<u8>, ClipboardReadError> {
+    let byte_size = unsafe { GlobalSize(handle) };
+    if byte_size == 0 {
+        return Err(ClipboardReadError::GlobalMemoryUnavailable);
+    }
+    if byte_size > max_bytes {
+        return Err(ClipboardReadError::PngEncodedTooLarge);
+    }
+
+    let locked = unsafe { GlobalLock(handle) };
+    if locked.is_null() {
+        return Err(ClipboardReadError::GlobalMemoryUnavailable);
+    }
+    // 复制完成后立即解锁；返回值不引用 HGLOBAL，后续关闭剪贴板不会使字节失效。
+    let bytes = unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), byte_size) }.to_vec();
+    unsafe {
+        let _ = GlobalUnlock(handle);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    //! 此测试模块通过假后端验证 Unicode、空内容、重试、sequence 和文本上限边界。
+    //! 此测试模块通过假后端验证文本、注册 PNG、重试、sequence 和资源上限边界。
 
     use super::{
-        parse_utf16_text, read_text_with_backend, ClipboardBackend, ClipboardReadError,
-        RetryPolicy, MAX_TEXT_BYTES,
+        parse_utf16_text, read_registered_png_bytes_with_backend, read_text_with_backend,
+        ClipboardBackend, ClipboardReadError, RetryPolicy, MAX_TEXT_BYTES,
     };
     use crate::domain::ClipboardPayload;
+    use crate::image_decode::MAX_PNG_ENCODED_BYTES;
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -278,6 +365,8 @@ mod tests {
         last_sequence: u32,
         /// read_unicode_text 返回的固定结果。
         text: Result<ClipboardPayload, ClipboardReadError>,
+        /// read_registered_png_bytes 返回的固定结果。
+        png: Result<Vec<u8>, ClipboardReadError>,
         /// close 是否成功。
         close_ok: bool,
     }
@@ -310,6 +399,18 @@ mod tests {
         ) -> Result<ClipboardPayload, ClipboardReadError> {
             self.text.clone()
         }
+
+        /// 返回测试 PNG 字节；生产后端在这里已经完成 HGLOBAL 到 Vec 的复制。
+        fn read_registered_png_bytes(
+            &mut self,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, ClipboardReadError> {
+            let bytes = self.png.clone()?;
+            if bytes.len() > max_bytes {
+                return Err(ClipboardReadError::PngEncodedTooLarge);
+            }
+            Ok(bytes)
+        }
     }
 
     fn policy() -> RetryPolicy {
@@ -327,6 +428,7 @@ mod tests {
             sequences: VecDeque::from([7]),
             last_sequence: 7,
             text: Ok(ClipboardPayload::from_text("中文\nline")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
             close_ok: true,
         };
         let result = read_text_with_backend(&mut backend, Some(7), policy()).expect("读取应成功");
@@ -356,6 +458,7 @@ mod tests {
             sequences: VecDeque::from([3]),
             last_sequence: 3,
             text: Ok(ClipboardPayload::from_text("ok")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
             close_ok: true,
         };
         let policy = RetryPolicy {
@@ -378,6 +481,7 @@ mod tests {
             sequences: VecDeque::from([1]),
             last_sequence: 1,
             text: Ok(ClipboardPayload::from_text("never")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
             close_ok: true,
         };
         assert_eq!(
@@ -394,6 +498,7 @@ mod tests {
             sequences: VecDeque::from([8, 9]),
             last_sequence: 8,
             text: Ok(ClipboardPayload::from_text("stale")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
             close_ok: true,
         };
         assert_eq!(
@@ -413,6 +518,7 @@ mod tests {
             sequences: VecDeque::from([10]),
             last_sequence: 10,
             text: Ok(ClipboardPayload::from_text("close")),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
             close_ok: false,
         };
         assert_eq!(
@@ -473,6 +579,101 @@ mod tests {
         assert_eq!(
             parse_utf16_text(&[b'a' as u16], MAX_TEXT_BYTES),
             Err(ClipboardReadError::MalformedUnicodeText)
+        );
+    }
+
+    /// 构造专用于注册 PNG 读取协议的假后端，文本结果不会被该路径消费。
+    fn png_backend(
+        opens: impl Into<VecDeque<bool>>,
+        sequences: impl Into<VecDeque<u32>>,
+        png: Result<Vec<u8>, ClipboardReadError>,
+        close_ok: bool,
+    ) -> FakeBackend {
+        let sequences = sequences.into();
+        let last_sequence = sequences.front().copied().unwrap_or_default();
+        FakeBackend {
+            opens: opens.into(),
+            sequences,
+            last_sequence,
+            text: Err(ClipboardReadError::UnicodeTextUnavailable),
+            png,
+            close_ok,
+        }
+    }
+
+    /// 成功结果必须是关闭剪贴板后仍然有效的拥有型字节。
+    #[test]
+    fn 注册_png_字节在关闭后仍可使用() {
+        let expected = vec![0x89, b'P', b'N', b'G'];
+        let mut backend = png_backend([true], [21], Ok(expected.clone()), true);
+
+        let actual =
+            read_registered_png_bytes_with_backend(&mut backend, Some(21), policy()).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    /// 打开前和读取后的 sequence 失配都必须拒绝旧事件结果。
+    #[test]
+    fn 注册_png_sequence_失配时丢弃结果() {
+        let mut before = png_backend([true], [31], Ok(vec![1]), true);
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut before, Some(30), policy()),
+            Err(ClipboardReadError::SequenceChanged {
+                expected: 30,
+                observed: 31,
+            })
+        );
+
+        let mut after = png_backend([true], [40, 41], Ok(vec![1]), true);
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut after, Some(40), policy()),
+            Err(ClipboardReadError::SequenceChanged {
+                expected: 40,
+                observed: 41,
+            })
+        );
+    }
+
+    /// 剪贴板忙碌、格式缺失和编码超限必须返回各自稳定错误。
+    #[test]
+    fn 注册_png_忙碌缺失和超限均明确失败() {
+        let mut busy = png_backend([false], [50], Ok(vec![1]), true);
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut busy, Some(50), policy()),
+            Err(ClipboardReadError::OpenTimeout)
+        );
+
+        let mut unavailable = png_backend(
+            [true],
+            [51],
+            Err(ClipboardReadError::RegisteredPngUnavailable),
+            true,
+        );
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut unavailable, Some(51), policy()),
+            Err(ClipboardReadError::RegisteredPngUnavailable)
+        );
+
+        let mut too_large = png_backend([true], [52], Ok(vec![0; MAX_PNG_ENCODED_BYTES + 1]), true);
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut too_large, Some(52), policy()),
+            Err(ClipboardReadError::PngEncodedTooLarge)
+        );
+    }
+
+    /// 关闭失败必须覆盖读取错误，保持与文本读取相同的所有权优先级。
+    #[test]
+    fn 注册_png_关闭失败优先返回() {
+        let mut backend = png_backend(
+            [true],
+            [60],
+            Err(ClipboardReadError::RegisteredPngUnavailable),
+            false,
+        );
+        assert_eq!(
+            read_registered_png_bytes_with_backend(&mut backend, Some(60), policy()),
+            Err(ClipboardReadError::CloseFailed)
         );
     }
 }

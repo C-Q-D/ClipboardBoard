@@ -4,8 +4,8 @@
 
 - 计划 ID：ATOMIC-REGISTERED-PNG-001
 - 类型：atomic-development
-- 修订版本：2
-- 状态：active
+- 修订版本：3
+- 状态：completed
 - 父级 ID：ATOM-32
 - 创建基线：cebaf23
 
@@ -110,7 +110,7 @@
 
 ## PNG-02 从剪贴板复制注册 PNG 字节
 
-- 状态：in_progress
+- 状态：done
 - 支持的验收场景：场景 3、4。
 - 唯一目标：在 ClipboardIO 协议内复制注册 PNG 的有界拥有型编码字节。
 - 当前行为与目标行为：当前 backend 只读取 Unicode 文本；完成后可单独读取注册 PNG。
@@ -135,3 +135,12 @@
 - 风险等级：L3
 - DDD 门禁：提交前复核锁释放、关闭和 sequence 顺序。
 - 计划提交信息：`feat(clipboard): [PNG-02] 复制注册 PNG 剪贴板字节`
+
+### PNG-02 执行记录
+
+- backend 已增加注册 PNG 拥有型字节读取，生产实现通过
+  `RegisterClipboardFormatW("PNG")` 取得格式编号。
+- HGLOBAL 在锁定前检查 30 MiB 上限，锁定后只复制字节并立即解锁，不释放系统句柄。
+- 打开前 expected sequence、读取后 sequence 和关闭优先级沿用文本读取协议。
+- reader 定向测试 13 项、库 check、库 Clippy、中文注释门禁和 diff-check 均通过。
+- 最终 DDD 结论：`PASS`。

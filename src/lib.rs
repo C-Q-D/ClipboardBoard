@@ -25,6 +25,8 @@ pub mod history_mutation;
 pub mod history_query;
 // 搜索模块只负责 120ms 防抖；SQLite 查询与结果身份由 history_query 独立管理。
 pub mod search;
+// 配置深模块隐藏文件恢复和线程所有权，只向调用方暴露快照与受控 worker/client。
+pub mod settings;
 // 存储模块只暴露单线程执行器，不把 SQLite 连接、Statement 或 SQL 句柄泄漏到业务调用方。
 pub mod storage;
 pub mod thumbnail_loader;

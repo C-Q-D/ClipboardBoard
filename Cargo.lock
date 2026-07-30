@@ -810,6 +810,8 @@ dependencies = [
  "i-slint-backend-testing",
  "image",
  "rusqlite",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "windows-sys 0.61.2",

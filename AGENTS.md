@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划；ATOM-32 已完成，下一项为 ATOM-33 |
+| ATOMIC-DIB-READ-001 | 原子开发 | [DIB 与 DIBV5 读取原子计划](docs/planning/DIB读取原子计划.md) |
 
 <!-- codex-plan-index:end -->

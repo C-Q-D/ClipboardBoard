@@ -19,6 +19,8 @@ pub use prepare::{
     prepare_image_storage, ImageStorageFallback, ImageStoragePrepareError,
     ImageStoragePrepareErrorKind, PreparedImageStorage,
 };
+#[cfg(windows)]
+pub(crate) use windows_guard::{path_eq as windows_path_eq, HeldDirectory};
 
 /// 自定义图片根外部的受管恢复基目录名称。
 pub const CUSTOM_RECOVERY_DIRECTORY_NAME: &str = ".clipboardboard-recovery";

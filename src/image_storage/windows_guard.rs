@@ -37,13 +37,13 @@ pub(super) struct DirectoryFingerprint {
 
 /// 单个目录的不可克隆持有句柄和已验证身份。
 #[derive(Debug)]
-pub(super) struct HeldDirectory {
+pub(crate) struct HeldDirectory {
     /// 不共享删除权限的目录句柄。
     _file: File,
     /// 由句柄取得的规范最终路径。
     pub canonical_path: PathBuf,
     /// 由同一句柄取得的稳定指纹。
-    pub fingerprint: DirectoryFingerprint,
+    pub(super) fingerprint: DirectoryFingerprint,
 }
 
 /// 图片存储完整 Windows capability；字段不公开，调用方只能整体借用或持有。
@@ -157,7 +157,10 @@ impl WindowsStorageGuard {
 
 impl HeldDirectory {
     /// 用不共享 DELETE 的句柄打开目录，并从同一句柄读取最终路径和文件身份。
-    pub fn open(path: &Path, operation: &'static str) -> Result<Self, ImageStoragePrepareError> {
+    pub(crate) fn open(
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<Self, ImageStoragePrepareError> {
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -241,7 +244,7 @@ fn final_path(
 }
 
 /// Windows 路径比较忽略大小写，但不放宽组件边界。
-fn path_eq(left: &Path, right: &Path) -> bool {
+pub(crate) fn path_eq(left: &Path, right: &Path) -> bool {
     normalized_path_text(left).eq_ignore_ascii_case(&normalized_path_text(right))
 }
 

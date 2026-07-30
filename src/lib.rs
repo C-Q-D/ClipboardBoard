@@ -14,6 +14,8 @@ pub mod domain;
 pub mod history;
 // 图片解码模块只接收拥有型或借用编码字节，不访问剪贴板句柄和 UI。
 pub mod image_decode;
+// 图片复制准备器安全读取耐久原图并生成 DIBV5 字节，不直接访问系统剪贴板。
+pub mod image_copy;
 // 图片流水线负责规范像素编码与后续耐久发布，不访问 SQLite 或 Slint Image。
 pub mod image_pipeline;
 // 图片存储模块先公开纯路径布局；目录 IO 与 Windows 安全守卫由同模块后续原子补齐。

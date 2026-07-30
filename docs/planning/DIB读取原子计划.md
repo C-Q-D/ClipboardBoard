@@ -4,8 +4,8 @@
 
 - 计划 ID：ATOMIC-DIB-READ-001
 - 类型：atomic-development
-- 修订版本：3
-- 状态：active
+- 修订版本：4
+- 状态：completed
 - 父级 ID：ATOM-33
 - 创建基线：936891d
 
@@ -128,7 +128,7 @@
 
 ## DIB-02 从剪贴板复制 DIBV5/DIB 字节
 
-- 状态：in_progress
+- 状态：done
 - 支持的验收场景：场景 5、6。
 - 唯一目标：在 ClipboardIO 协议内优先复制 DIBV5，否则复制 DIB 的有界拥有型字节。
 - 当前行为与目标行为：当前可读取文本和注册 PNG；完成后可独立取得 DIB 字节。
@@ -153,3 +153,12 @@
 - 风险等级：L3
 - DDD 门禁：提交前复核格式优先、锁释放、关闭和 sequence 顺序。
 - 计划提交信息：`feat(clipboard): [DIB-02] 复制 DIBV5 与 DIB 字节`
+
+### DIB-02 执行记录
+
+- 已增加携带实际格式的拥有型 DIB 字节结果，并固定 `CF_DIBV5` 优先、`CF_DIB`
+  回退顺序。
+- 格式选择、72 MiB 上限检查、HGLOBAL 复制和解锁均发生在同一次打开周期内。
+- expected sequence、读取后 sequence 和关闭失败优先级沿用既有 ClipboardIO 协议。
+- reader 定向测试 18 项、库 check、库 Clippy、中文注释门禁和 diff-check 均通过。
+- 最终 DDD 结论：`PASS`。

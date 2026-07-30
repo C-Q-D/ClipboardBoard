@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::domain::ClipboardPayload;
-use crate::image_decode::MAX_PNG_ENCODED_BYTES;
+use crate::image_decode::{MAX_DIB_ENCODED_BYTES, MAX_PNG_ENCODED_BYTES};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::DataExchange::{
@@ -22,6 +22,10 @@ pub const MAX_TEXT_BYTES: usize = 5 * 1024 * 1024;
 
 /// Windows 预定义 Unicode 文本格式编号；windows-sys 不在 DataExchange 模块导出该常量。
 const CF_UNICODETEXT_FORMAT: u32 = 13;
+/// Windows 预定义 DIB 格式编号。
+const CF_DIB_FORMAT: u32 = 8;
+/// Windows 预定义 DIBV5 格式编号。
+const CF_DIBV5_FORMAT: u32 = 17;
 
 /// `OpenClipboard` 的默认总等待时长，避免剪贴板被其他进程占用时无限阻塞。
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_millis(200);
@@ -63,6 +67,10 @@ pub enum ClipboardReadError {
     GlobalMemoryUnavailable,
     /// 注册 PNG 的编码字节超过固定上限。
     PngEncodedTooLarge,
+    /// 当前剪贴板既没有 DIBV5，也没有 DIB。
+    DibUnavailable,
+    /// DIB/DIBV5 编码字节超过固定上限。
+    DibEncodedTooLarge,
     /// 文本缺少终止 NUL，或内存边界在上限前无法确认正文结束。
     MalformedUnicodeText,
     /// UTF-16 数据无法转换为有效 Unicode。
@@ -71,6 +79,56 @@ pub enum ClipboardReadError {
     TextTooLarge,
     /// 读取完成后关闭剪贴板失败；调用方不能继续假设状态一致。
     CloseFailed,
+}
+
+/// 从剪贴板取得的 DIB 格式身份，用于选择对应解析契约。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DibClipboardFormat {
+    /// `CF_DIBV5`，包含 BITMAPV5HEADER 或系统合成的 V5 数据。
+    DibV5,
+    /// `CF_DIB`，包含 BITMAPINFOHEADER 或兼容扩展头。
+    Dib,
+}
+
+impl DibClipboardFormat {
+    /// 返回 Windows 预定义剪贴板格式编号。
+    fn format_id(self) -> u32 {
+        match self {
+            Self::DibV5 => CF_DIBV5_FORMAT,
+            Self::Dib => CF_DIB_FORMAT,
+        }
+    }
+}
+
+/// 已脱离 HGLOBAL 生命周期的 DIB 剪贴板字节。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DibClipboardBytes {
+    /// 实际读取的系统格式。
+    format: DibClipboardFormat,
+    /// 在剪贴板打开期间复制出的拥有型字节。
+    bytes: Vec<u8>,
+}
+
+impl DibClipboardBytes {
+    /// 构造已拥有的 DIB 字节结果。
+    fn new(format: DibClipboardFormat, bytes: Vec<u8>) -> Self {
+        Self { format, bytes }
+    }
+
+    /// 返回实际读取的 DIB 格式。
+    pub fn format(&self) -> DibClipboardFormat {
+        self.format
+    }
+
+    /// 借用关闭剪贴板后仍然有效的编码字节。
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// 消费结果并返回拥有型编码字节。
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// ClipboardIO 使用的最小后端抽象；生产实现封装 Win32，测试实现可模拟占用和 sequence。
@@ -95,6 +153,10 @@ pub trait ClipboardBackend {
         &mut self,
         max_bytes: usize,
     ) -> Result<Vec<u8>, ClipboardReadError>;
+
+    /// 在剪贴板仍打开时优先复制 DIBV5，否则复制 DIB 的拥有型字节。
+    fn read_dib_bytes(&mut self, max_bytes: usize)
+        -> Result<DibClipboardBytes, ClipboardReadError>;
 }
 
 /// 使用后端执行一次完整的文本读取，并在打开前后复核 sequence。
@@ -154,6 +216,41 @@ pub fn read_registered_png_bytes_with_backend<B: ClipboardBackend>(
 
     open_with_retry(backend, policy)?;
     let read_result = backend.read_registered_png_bytes(MAX_PNG_ENCODED_BYTES);
+    let sequence_after = backend.sequence();
+    let close_succeeded = backend.close();
+    if !close_succeeded {
+        return Err(ClipboardReadError::CloseFailed);
+    }
+    if sequence_after != sequence_before {
+        return Err(ClipboardReadError::SequenceChanged {
+            expected: sequence_before,
+            observed: sequence_after,
+        });
+    }
+    read_result
+}
+
+/// 使用后端执行一次完整的 DIBV5/DIB 字节读取，并在打开前后复核 sequence。
+///
+/// 成功值携带实际格式和拥有型字节。函数不会解析像素；关闭失败优先于读取错误和
+/// sequence 失配，与文本和注册 PNG 的所有权协议保持一致。
+pub fn read_dib_bytes_with_backend<B: ClipboardBackend>(
+    backend: &mut B,
+    expected_sequence: Option<u32>,
+    policy: RetryPolicy,
+) -> Result<DibClipboardBytes, ClipboardReadError> {
+    let sequence_before = backend.sequence();
+    if let Some(expected) = expected_sequence {
+        if sequence_before != expected {
+            return Err(ClipboardReadError::SequenceChanged {
+                expected,
+                observed: sequence_before,
+            });
+        }
+    }
+
+    open_with_retry(backend, policy)?;
+    let read_result = backend.read_dib_bytes(MAX_DIB_ENCODED_BYTES);
     let sequence_after = backend.sequence();
     let close_succeeded = backend.close();
     if !close_succeeded {
@@ -282,7 +379,24 @@ impl ClipboardBackend for Win32ClipboardBackend {
         if handle.is_null() {
             return Err(ClipboardReadError::GlobalMemoryUnavailable);
         }
-        read_global_bytes(handle, max_bytes)
+        read_global_bytes(handle, max_bytes, ClipboardReadError::PngEncodedTooLarge)
+    }
+
+    /// 优先选择 `CF_DIBV5`，否则选择 `CF_DIB`，并复制对应 HGLOBAL。
+    fn read_dib_bytes(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<DibClipboardBytes, ClipboardReadError> {
+        let format = select_dib_clipboard_format(|format_id| unsafe {
+            IsClipboardFormatAvailable(format_id) != 0
+        })
+        .ok_or(ClipboardReadError::DibUnavailable)?;
+        let handle = unsafe { GetClipboardData(format.format_id()) };
+        if handle.is_null() {
+            return Err(ClipboardReadError::GlobalMemoryUnavailable);
+        }
+        let bytes = read_global_bytes(handle, max_bytes, ClipboardReadError::DibEncodedTooLarge)?;
+        Ok(DibClipboardBytes::new(format, bytes))
     }
 }
 
@@ -321,13 +435,17 @@ fn read_global_unicode_text(
 }
 
 /// 从 HGLOBAL 复制一份有界二进制内容，不把锁定指针或系统句柄泄漏给调用方。
-fn read_global_bytes(handle: HANDLE, max_bytes: usize) -> Result<Vec<u8>, ClipboardReadError> {
+fn read_global_bytes(
+    handle: HANDLE,
+    max_bytes: usize,
+    too_large_error: ClipboardReadError,
+) -> Result<Vec<u8>, ClipboardReadError> {
     let byte_size = unsafe { GlobalSize(handle) };
     if byte_size == 0 {
         return Err(ClipboardReadError::GlobalMemoryUnavailable);
     }
     if byte_size > max_bytes {
-        return Err(ClipboardReadError::PngEncodedTooLarge);
+        return Err(too_large_error);
     }
 
     let locked = unsafe { GlobalLock(handle) };
@@ -342,16 +460,31 @@ fn read_global_bytes(handle: HANDLE, max_bytes: usize) -> Result<Vec<u8>, Clipbo
     Ok(bytes)
 }
 
+/// 按 DIBV5、DIB 的固定顺序选择当前可用格式。
+fn select_dib_clipboard_format(
+    mut is_available: impl FnMut(u32) -> bool,
+) -> Option<DibClipboardFormat> {
+    if is_available(CF_DIBV5_FORMAT) {
+        Some(DibClipboardFormat::DibV5)
+    } else if is_available(CF_DIB_FORMAT) {
+        Some(DibClipboardFormat::Dib)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! 此测试模块通过假后端验证文本、注册 PNG、重试、sequence 和资源上限边界。
 
     use super::{
-        parse_utf16_text, read_registered_png_bytes_with_backend, read_text_with_backend,
-        ClipboardBackend, ClipboardReadError, RetryPolicy, MAX_TEXT_BYTES,
+        parse_utf16_text, read_dib_bytes_with_backend, read_registered_png_bytes_with_backend,
+        read_text_with_backend, select_dib_clipboard_format, ClipboardBackend, ClipboardReadError,
+        DibClipboardBytes, DibClipboardFormat, RetryPolicy, CF_DIBV5_FORMAT, CF_DIB_FORMAT,
+        MAX_TEXT_BYTES,
     };
     use crate::domain::ClipboardPayload;
-    use crate::image_decode::MAX_PNG_ENCODED_BYTES;
+    use crate::image_decode::{MAX_DIB_ENCODED_BYTES, MAX_PNG_ENCODED_BYTES};
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -367,6 +500,8 @@ mod tests {
         text: Result<ClipboardPayload, ClipboardReadError>,
         /// read_registered_png_bytes 返回的固定结果。
         png: Result<Vec<u8>, ClipboardReadError>,
+        /// read_dib_bytes 返回的固定结果。
+        dib: Result<DibClipboardBytes, ClipboardReadError>,
         /// close 是否成功。
         close_ok: bool,
     }
@@ -411,6 +546,18 @@ mod tests {
             }
             Ok(bytes)
         }
+
+        /// 返回测试 DIB 字节；生产后端在这里已经完成 HGLOBAL 到 Vec 的复制。
+        fn read_dib_bytes(
+            &mut self,
+            max_bytes: usize,
+        ) -> Result<DibClipboardBytes, ClipboardReadError> {
+            let result = self.dib.clone()?;
+            if result.as_bytes().len() > max_bytes {
+                return Err(ClipboardReadError::DibEncodedTooLarge);
+            }
+            Ok(result)
+        }
     }
 
     fn policy() -> RetryPolicy {
@@ -429,6 +576,7 @@ mod tests {
             last_sequence: 7,
             text: Ok(ClipboardPayload::from_text("中文\nline")),
             png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok: true,
         };
         let result = read_text_with_backend(&mut backend, Some(7), policy()).expect("读取应成功");
@@ -459,6 +607,7 @@ mod tests {
             last_sequence: 3,
             text: Ok(ClipboardPayload::from_text("ok")),
             png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok: true,
         };
         let policy = RetryPolicy {
@@ -482,6 +631,7 @@ mod tests {
             last_sequence: 1,
             text: Ok(ClipboardPayload::from_text("never")),
             png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok: true,
         };
         assert_eq!(
@@ -499,6 +649,7 @@ mod tests {
             last_sequence: 8,
             text: Ok(ClipboardPayload::from_text("stale")),
             png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok: true,
         };
         assert_eq!(
@@ -519,6 +670,7 @@ mod tests {
             last_sequence: 10,
             text: Ok(ClipboardPayload::from_text("close")),
             png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok: false,
         };
         assert_eq!(
@@ -597,6 +749,7 @@ mod tests {
             last_sequence,
             text: Err(ClipboardReadError::UnicodeTextUnavailable),
             png,
+            dib: Err(ClipboardReadError::DibUnavailable),
             close_ok,
         }
     }
@@ -673,6 +826,127 @@ mod tests {
         );
         assert_eq!(
             read_registered_png_bytes_with_backend(&mut backend, Some(60), policy()),
+            Err(ClipboardReadError::CloseFailed)
+        );
+    }
+
+    /// 构造专用于 DIB 读取协议的假后端，其他格式不会被该路径消费。
+    fn dib_backend(
+        opens: impl Into<VecDeque<bool>>,
+        sequences: impl Into<VecDeque<u32>>,
+        dib: Result<DibClipboardBytes, ClipboardReadError>,
+        close_ok: bool,
+    ) -> FakeBackend {
+        let sequences = sequences.into();
+        let last_sequence = sequences.front().copied().unwrap_or_default();
+        FakeBackend {
+            opens: opens.into(),
+            sequences,
+            last_sequence,
+            text: Err(ClipboardReadError::UnicodeTextUnavailable),
+            png: Err(ClipboardReadError::RegisteredPngUnavailable),
+            dib,
+            close_ok,
+        }
+    }
+
+    /// 格式选择必须只在 V5 缺失时回退 DIB，并在两者缺失时返回空。
+    #[test]
+    fn dib_格式选择优先_v5_再回退_dib() {
+        let mut both_calls = Vec::new();
+        let both = select_dib_clipboard_format(|format| {
+            both_calls.push(format);
+            true
+        });
+        assert_eq!(both, Some(DibClipboardFormat::DibV5));
+        assert_eq!(both_calls, vec![CF_DIBV5_FORMAT]);
+
+        let mut fallback_calls = Vec::new();
+        let fallback = select_dib_clipboard_format(|format| {
+            fallback_calls.push(format);
+            format == CF_DIB_FORMAT
+        });
+        assert_eq!(fallback, Some(DibClipboardFormat::Dib));
+        assert_eq!(fallback_calls, vec![CF_DIBV5_FORMAT, CF_DIB_FORMAT]);
+        assert_eq!(select_dib_clipboard_format(|_| false), None);
+    }
+
+    /// 成功结果必须保留实际格式，并在关闭剪贴板后继续拥有字节。
+    #[test]
+    fn dib_字节在关闭后仍保留格式和内容() {
+        let expected = vec![40, 0, 0, 0];
+        let result = DibClipboardBytes::new(DibClipboardFormat::DibV5, expected.clone());
+        let mut backend = dib_backend([true], [70], Ok(result), true);
+
+        let actual = read_dib_bytes_with_backend(&mut backend, Some(70), policy()).unwrap();
+
+        assert_eq!(actual.format(), DibClipboardFormat::DibV5);
+        assert_eq!(actual.as_bytes(), expected);
+        assert_eq!(actual.into_bytes(), expected);
+    }
+
+    /// 打开前和读取后的 sequence 失配都必须拒绝 DIB 结果。
+    #[test]
+    fn dib_sequence_失配时丢弃结果() {
+        let result = || DibClipboardBytes::new(DibClipboardFormat::Dib, vec![1]);
+        let mut before = dib_backend([true], [81], Ok(result()), true);
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut before, Some(80), policy()),
+            Err(ClipboardReadError::SequenceChanged {
+                expected: 80,
+                observed: 81,
+            })
+        );
+
+        let mut after = dib_backend([true], [90, 91], Ok(result()), true);
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut after, Some(90), policy()),
+            Err(ClipboardReadError::SequenceChanged {
+                expected: 90,
+                observed: 91,
+            })
+        );
+    }
+
+    /// 忙碌、格式缺失和输入超限必须返回各自稳定错误。
+    #[test]
+    fn dib_忙碌缺失和超限均明确失败() {
+        let result = || DibClipboardBytes::new(DibClipboardFormat::Dib, vec![1]);
+        let mut busy = dib_backend([false], [100], Ok(result()), true);
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut busy, Some(100), policy()),
+            Err(ClipboardReadError::OpenTimeout)
+        );
+
+        let mut unavailable =
+            dib_backend([true], [101], Err(ClipboardReadError::DibUnavailable), true);
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut unavailable, Some(101), policy()),
+            Err(ClipboardReadError::DibUnavailable)
+        );
+
+        let oversized = DibClipboardBytes::new(
+            DibClipboardFormat::DibV5,
+            vec![0; MAX_DIB_ENCODED_BYTES + 1],
+        );
+        let mut too_large = dib_backend([true], [102], Ok(oversized), true);
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut too_large, Some(102), policy()),
+            Err(ClipboardReadError::DibEncodedTooLarge)
+        );
+    }
+
+    /// 关闭失败必须覆盖 DIB 读取错误。
+    #[test]
+    fn dib_关闭失败优先返回() {
+        let mut backend = dib_backend(
+            [true],
+            [110],
+            Err(ClipboardReadError::DibUnavailable),
+            false,
+        );
+        assert_eq!(
+            read_dib_bytes_with_backend(&mut backend, Some(110), policy()),
             Err(ClipboardReadError::CloseFailed)
         );
     }

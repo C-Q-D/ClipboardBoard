@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| — | — | 当前无活动计划，等待用户验证 ATOM-39 |
+| ATOMIC-PARALLEL-040-060-001 | 原子开发 | [并行开发执行计划](docs/planning/并行开发执行计划.md) |
 
 <!-- codex-plan-index:end -->

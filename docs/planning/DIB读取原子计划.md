@@ -4,7 +4,7 @@
 
 - 计划 ID：ATOMIC-DIB-READ-001
 - 类型：atomic-development
-- 修订版本：2
+- 修订版本：3
 - 状态：active
 - 父级 ID：ATOM-33
 - 创建基线：936891d
@@ -91,7 +91,7 @@
 
 ## DIB-01 有界解析 DIB/DIBV5
 
-- 状态：in_progress
+- 状态：done
 - 支持的验收场景：场景 1 至 4。
 - 唯一目标：把借用的 DIB/DIBV5 字节安全转换为规范 RGBA8。
 - 当前行为与目标行为：当前仅有 PNG 解码；完成后纯函数支持常见内存 DIB。
@@ -118,9 +118,17 @@
 - DDD 门禁：提交前复核算术、行方向、掩码和 alpha 语义。
 - 计划提交信息：`feat(image): [DIB-01] 有界解析 DIB 与 DIBV5`
 
+### DIB-01 执行记录
+
+- 已实现 24/32 位 `BI_RGB`、32 位 `BI_BITFIELDS`、上下方向和 DWORD 行对齐。
+- 已锁定已知头尺寸、颜色表/profile 排除、内外掩码位置和不透明 `BI_RGB` alpha。
+- 所有输出长度、行跨度、像素偏移和输入范围均在分配前完成 checked 验证。
+- DIB 定向测试 8 项、库 check、库 Clippy、中文注释门禁和 diff-check 均通过。
+- 最终 DDD 结论：`PASS`。
+
 ## DIB-02 从剪贴板复制 DIBV5/DIB 字节
 
-- 状态：pending
+- 状态：in_progress
 - 支持的验收场景：场景 5、6。
 - 唯一目标：在 ClipboardIO 协议内优先复制 DIBV5，否则复制 DIB 的有界拥有型字节。
 - 当前行为与目标行为：当前可读取文本和注册 PNG；完成后可独立取得 DIB 字节。

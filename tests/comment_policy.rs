@@ -37,6 +37,7 @@ fn 核心源码包含中文文件级职责说明() {
         "src/domain/image_metadata.rs",
         "src/history.rs",
         "src/image_decode/mod.rs",
+        "src/image_decode/dib.rs",
         "src/image_decode/png.rs",
         "src/image_storage/mod.rs",
         "src/storage/mod.rs",

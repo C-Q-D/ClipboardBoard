@@ -242,7 +242,7 @@ impl Display for ClipboardWriteError {
 
 impl std::error::Error for ClipboardWriteError {}
 
-/// 负责执行一次 Unicode 文本写回；预期存储由调用方和捕获 worker 共享。
+/// 负责执行文本或图片写回；预期存储由调用方和捕获 worker 共享。
 pub struct ClipboardWriter;
 
 /// `SetClipboardData` 已转移 HGLOBAL 所有权后的写入结果；关闭失败不能撤销已发生的写回。

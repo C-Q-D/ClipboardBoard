@@ -310,9 +310,9 @@ mod tests {
         assert_eq!(snapshot.items[0].content_hash, hash_text("较新"));
     }
 
-    /// 启动恢复必须保留图片类型、尺寸和缩略图定位，同时保持复制门禁关闭。
+    /// 启动恢复必须保留图片类型、尺寸、缩略图定位和复制能力。
     #[test]
-    fn 启动恢复图片摘要与复制门禁() {
+    fn 启动恢复图片摘要与复制能力() {
         let directory = test_directory("image");
         let root = directory.join("images");
         let mut storage = StorageExecutor::open_at(&directory).expect("启动图片恢复存储失败");
@@ -325,7 +325,7 @@ mod tests {
         };
         assert_eq!(summary.thumbnail_path, expected_thumbnail);
         assert_eq!((summary.width, summary.height), (640, 480));
-        assert!(!image.copy_enabled());
+        assert!(image.copy_enabled());
     }
 
     /// 首页读取必须有界；超过 100 条时不得把后续记录带进启动快照。

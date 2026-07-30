@@ -20,7 +20,7 @@ export struct ClipboardCard {
     delete_pending: bool,
     // 图片卡片在缩略图接入前显示稳定占位；文本卡片保持原布局。
     is_image: bool,
-    // ATOM-38 前图片禁止触发复制，文本仍允许显式复制。
+    // 文本和图片卡片都通过稳定 ID/哈希请求后台复制，不在 UI 层携带正文或原图。
     copy_enabled: bool,
     // 图片原始尺寸仅用于摘要文案，不参与卡片动态测量。
     image_width: int,
@@ -644,11 +644,9 @@ export component AppWindow inherits Window {
                                 border-color: #4a4a4a;
 
                                 Text {
-                                    text: card.copy_enabled ? "复制" : "待支持";
-                                    color: card.copy_enabled
-                                        ? (copy-touch.pressed ? #080808 : #f5f5f5)
-                                        : #666666;
-                                    font-size: card.copy_enabled ? 12px : 10px;
+                                    text: "复制";
+                                    color: copy-touch.pressed ? #080808 : #f5f5f5;
+                                    font-size: 12px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }

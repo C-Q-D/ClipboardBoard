@@ -3,6 +3,6 @@
 
 | 计划 ID | 类型 | 文档 |
 |---|---|---|
-| ATOMIC-IMAGE-COPY-001 | 原子开发 | `docs/planning/图片写回剪贴板原子计划.md` |
+| — | — | 当前无活动计划，等待用户验证 ATOM-38 |
 
 <!-- codex-plan-index:end -->

@@ -4033,9 +4033,9 @@ mod tests {
         assert!(state.panel_visible);
     }
 
-    /// 图片复制在 ATOM-38 前必须同时被 resolver 和 reducer 拒绝。
+    /// 图片复制必须通过 resolver 和 reducer 生成同一稳定 ID/哈希命令。
     #[test]
-    fn 图片卡片禁止进入复制队列() {
+    fn 图片卡片进入复制队列() {
         let mut image = test_item(0);
         image.kind = UiClipboardItemKind::Image(UiImageSummary {
             thumbnail_path: std::path::PathBuf::from("thumbnail.webp"),
@@ -4055,9 +4055,16 @@ mod tests {
                 id: image.id,
                 content_hash: image.content_hash,
             }),
-            UiAction::None
+            UiAction::QueueCopy {
+                id: image.id,
+                content_hash: image.content_hash,
+            }
         );
+        assert_eq!(state.snapshot.selected_index, Some(0));
+        assert!(state.panel_visible);
 
+        let image_id = image.id;
+        let image_hash = image.content_hash;
         super::UI_STATE.with(|slot| {
             let mut global = slot.borrow_mut();
             *global = UiState::default();
@@ -4067,7 +4074,14 @@ mod tests {
             }));
             global.apply(UiEvent::OpenPanel);
         });
-        assert_eq!(super::resolve_copy_item(0), None);
+        assert!(matches!(
+            super::resolve_copy_item(0),
+            Some(UiEvent::CopyItem {
+                id,
+                content_hash,
+                ..
+            }) if id == image_id && content_hash == image_hash
+        ));
     }
 
     /// 没有可见面板时的迟到复制按钮事件必须被 reducer 丢弃。

@@ -941,9 +941,9 @@ mod tests {
         );
     }
 
-    /// 完整图片摘要必须转换为带尺寸和缩略图定位的不可复制卡片。
+    /// 完整图片摘要必须转换为带尺寸、缩略图定位和复制能力的卡片。
     #[test]
-    fn 图片摘要转换为不可复制界面卡片() {
+    fn 图片摘要转换为可复制界面卡片() {
         let hash_hex = "aa".repeat(32);
         let metadata = ImageMetadata::new(
             [0xaa; 32],
@@ -979,6 +979,6 @@ mod tests {
         };
         assert_eq!((image.width, image.height), (320, 200));
         assert!(image.thumbnail_path.ends_with(format!("aa/{hash_hex}.webp")));
-        assert!(!item.copy_enabled());
+        assert!(item.copy_enabled());
     }
 }

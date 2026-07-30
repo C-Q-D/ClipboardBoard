@@ -22,7 +22,7 @@ pub struct UiImageSummary {
     pub height: u32,
 }
 
-/// UI 卡片的受限内容类型；图片在 ATOM-38 前不可执行复制。
+/// UI 卡片的受限内容类型；文本和图片都能通过稳定身份请求后台复制。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum UiClipboardItemKind {
     /// 可通过按钮写回剪贴板的文本。
@@ -123,7 +123,7 @@ impl UiClipboardItem {
         })
     }
 
-    /// 将图片事务最终快照转换为不可复制的 UI 卡片摘要。
+    /// 将图片事务最终快照转换为可复制的 UI 卡片摘要。
     #[cfg(windows)]
     pub fn from_persisted_image_result(result: &ImageUpsertResult) -> Option<Self> {
         let id = u64::try_from(result.id).ok()?;
@@ -166,7 +166,10 @@ impl UiClipboardItem {
 
     /// 返回当前卡片是否允许触发系统剪贴板写回。
     pub const fn copy_enabled(&self) -> bool {
-        matches!(self.kind, UiClipboardItemKind::Text)
+        matches!(
+            self.kind,
+            UiClipboardItemKind::Text | UiClipboardItemKind::Image(_)
+        )
     }
 }
 

@@ -17,11 +17,12 @@ use crate::{
     },
     command::{UiClipboardItem, UiEvent},
     domain::ClipboardPayload,
+    image_copy::{prepare_image_clipboard, ImageCopyError},
     image_decode::decode_dib,
     image_pipeline::{ImageInput, ImageRootSnapshot, ImageWorkerError, ImageWorkerSender},
     storage::{
-        HistoryPayload, ImageUpsertInput, StorageClient, StorageError, TextUpsertInput,
-        TextUpsertResult,
+        HistoryImageSummary, HistoryPayload, ImageUpsertInput, StorageClient, StorageError,
+        TextUpsertInput, TextUpsertResult,
     },
 };
 
@@ -113,15 +114,19 @@ pub enum CopyProcessError {
     Storage(StorageError),
     /// 请求的历史 ID 已被删除或不存在。
     NotFound { id: u64 },
-    /// payload 不是当前原子支持的 text 类型。
+    /// payload 类型不是当前支持的文本或图片。
     UnsupportedType,
     /// text 记录缺少完整正文。
     MissingText,
+    /// image 记录缺少完整受限资产身份。
+    MissingImage,
     /// 数据库主键、哈希长度或 CF_UNICODETEXT 可表示性不满足写回契约。
     InvalidPayload,
     /// UI 卡片哈希与按 ID 读取的数据库哈希不一致，拒绝旧选择写回。
     HashMismatch,
-    /// Win32 Unicode 文本写回失败。
+    /// 原图读取、身份复核或 DIBV5 编码失败。
+    ImagePrepare(ImageCopyError),
+    /// Win32 系统剪贴板写回失败。
     Write(ClipboardWriteError),
 }
 
@@ -131,10 +136,12 @@ impl fmt::Display for CopyProcessError {
         match self {
             Self::Storage(error) => write!(formatter, "仅复制读取存储失败：{error}"),
             Self::NotFound { id } => write!(formatter, "仅复制目标历史不存在：{id}"),
-            Self::UnsupportedType => formatter.write_str("仅复制目标不是文本记录"),
+            Self::UnsupportedType => formatter.write_str("仅复制目标类型不受支持"),
             Self::MissingText => formatter.write_str("仅复制目标缺少文本正文"),
+            Self::MissingImage => formatter.write_str("仅复制目标缺少图片资产"),
             Self::InvalidPayload => formatter.write_str("仅复制目标 payload 不满足写回契约"),
             Self::HashMismatch => formatter.write_str("仅复制目标哈希已变化"),
+            Self::ImagePrepare(error) => write!(formatter, "仅复制图片准备失败：{error}"),
             Self::Write(error) => write!(formatter, "仅复制写回失败：{error}"),
         }
     }
@@ -153,6 +160,13 @@ impl From<ClipboardWriteError> for CopyProcessError {
     /// 将 Win32 写回错误包裹到仅复制业务边界。
     fn from(error: ClipboardWriteError) -> Self {
         Self::Write(error)
+    }
+}
+
+impl From<ImageCopyError> for CopyProcessError {
+    /// 将图片文件与编码错误包裹到仅复制业务边界。
+    fn from(error: ImageCopyError) -> Self {
+        Self::ImagePrepare(error)
     }
 }
 
@@ -350,12 +364,50 @@ pub fn process_copy_request(
     let payload = storage
         .get_history_payload(id)?
         .ok_or(CopyProcessError::NotFound { id: request.id })?;
-    process_copy_payload(&payload, request.content_hash, |text, content_hash| {
-        ClipboardWriter::write_unicode_text(text, content_hash, expectations)
-    })
+    process_typed_copy_payload(
+        &payload,
+        request.content_hash,
+        |text, content_hash| ClipboardWriter::write_unicode_text(text, content_hash, expectations),
+        |image| {
+            let prepared = prepare_image_clipboard(image)?;
+            ClipboardWriter::write_dib_v5(&prepared, expectations).map_err(CopyProcessError::Write)
+        },
+    )
 }
 
-/// 校验按 ID 读取的 payload 并调用注入的 writer；抽出纯接缝便于不改写真实剪贴板的测试。
+/// 按持久化类型分派文本或图片复制，同时保持两条路径共用 UI 请求哈希门禁。
+fn process_typed_copy_payload<T, I>(
+    payload: &HistoryPayload,
+    expected_hash: [u8; 32],
+    write_text: T,
+    write_image: I,
+) -> Result<u32, CopyProcessError>
+where
+    T: FnOnce(&str, [u8; 32]) -> Result<u32, ClipboardWriteError>,
+    I: FnOnce(&HistoryImageSummary) -> Result<u32, CopyProcessError>,
+{
+    match payload.item_type.as_str() {
+        "text" => process_copy_payload(payload, expected_hash, write_text),
+        "image" => {
+            if payload.id <= 0 || payload.text_content.is_some() {
+                return Err(CopyProcessError::InvalidPayload);
+            }
+            let content_hash = <[u8; 32]>::try_from(payload.content_hash.as_slice())
+                .map_err(|_| CopyProcessError::InvalidPayload)?;
+            let image = payload
+                .image
+                .as_ref()
+                .ok_or(CopyProcessError::MissingImage)?;
+            if content_hash != expected_hash || content_hash != *image.metadata.content_hash() {
+                return Err(CopyProcessError::HashMismatch);
+            }
+            write_image(image)
+        }
+        _ => Err(CopyProcessError::UnsupportedType),
+    }
+}
+
+/// 校验文本 payload 并调用注入的 writer；抽出纯接缝便于不改写真实剪贴板的测试。
 fn process_copy_payload<F>(
     payload: &HistoryPayload,
     expected_hash: [u8; 32],
@@ -364,7 +416,7 @@ fn process_copy_payload<F>(
 where
     F: FnOnce(&str, [u8; 32]) -> Result<u32, ClipboardWriteError>,
 {
-    if payload.id <= 0 || payload.item_type != "text" {
+    if payload.id <= 0 || payload.item_type != "text" || payload.image.is_some() {
         return Err(if payload.item_type == "text" {
             CopyProcessError::InvalidPayload
         } else {
@@ -448,8 +500,8 @@ mod tests {
 
     use super::{
         process_capture, process_capture_with_upsert, process_copy_payload, process_image_capture,
-        run_clipboard_pump, suppress_self_image_capture, CaptureProcessError,
-        CaptureProcessOutcome, CopyProcessError, ImageCaptureContext,
+        process_typed_copy_payload, run_clipboard_pump, suppress_self_image_capture,
+        CaptureProcessError, CaptureProcessOutcome, CopyProcessError, ImageCaptureContext,
     };
     use crate::{
         clipboard::{
@@ -458,11 +510,11 @@ mod tests {
             ClipboardWriteFormat,
         },
         command::{UiClipboardItemKind, UiEvent},
-        domain::{CanonicalImagePixels, ClipboardPayload},
+        domain::{CanonicalImagePixels, ClipboardPayload, ImageAssetRootId, ImageMetadata},
         image_pipeline::{encode_original_png, ImageWorker},
         image_storage::{prepare_image_storage, ImageStoragePreference},
         platform::windows::ProcessSource,
-        storage::{HistoryPayload, StorageExecutor, TextUpsertResult},
+        storage::{HistoryImageSummary, HistoryPayload, StorageExecutor, TextUpsertResult},
     };
 
     /// 创建独立临时目录，避免并行测试共享生产数据库或互相污染触发器。
@@ -791,7 +843,7 @@ mod tests {
                 panic!("图片捕获只能投递 ClipboardCaptured");
             };
             assert!(matches!(item.kind, UiClipboardItemKind::Image(_)));
-            assert!(!item.copy_enabled());
+            assert!(item.copy_enabled());
         }
 
         let connection =
@@ -1140,6 +1192,44 @@ mod tests {
         }
     }
 
+    /// 构造只用于协调器接缝测试的完整图片 payload，不读取实际文件。
+    fn image_copy_payload() -> HistoryPayload {
+        let pixels =
+            CanonicalImagePixels::new(1, 1, vec![4, 5, 6, 255]).expect("构造图片复制接缝像素失败");
+        let hash = pixels.content_hash();
+        let hash_hex = hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        HistoryPayload {
+            id: 10,
+            item_type: "image".to_owned(),
+            text_content: None,
+            preview_text: "图片 1 × 1".to_owned(),
+            content_hash: hash.to_vec(),
+            source_exe: None,
+            source_app: None,
+            copy_count: 1,
+            is_pinned: false,
+            created_at: 1,
+            copied_at: 2,
+            last_used_at: None,
+            image: Some(HistoryImageSummary {
+                metadata: ImageMetadata::new(
+                    hash,
+                    ImageAssetRootId::new([8; 32]),
+                    format!("{}/{hash_hex}.png", &hash_hex[..2]),
+                    format!("{}/{hash_hex}.webp", &hash_hex[..2]),
+                    1,
+                    1,
+                    128,
+                )
+                .expect("构造图片复制接缝元数据失败"),
+                canonical_root: std::path::PathBuf::from(r"C:\ClipboardBoard\images"),
+            }),
+        }
+    }
+
     /// 仅复制必须把按 ID 读取的完整正文和哈希原样交给 writer，不能使用 UI 预览替代正文。
     #[test]
     fn 仅复制校验后写回完整正文() {
@@ -1157,6 +1247,95 @@ mod tests {
             observed,
             Some(("完整正文\n第二行".to_owned(), expected_hash))
         );
+    }
+
+    /// 图片 payload 必须按 UI 哈希和元数据哈希复核后进入图片准备接缝。
+    #[test]
+    fn 图片复制校验后进入图片接缝() {
+        let payload = image_copy_payload();
+        let expected_hash = <[u8; 32]>::try_from(payload.content_hash.as_slice()).unwrap();
+        let mut observed = None;
+
+        let sequence = process_typed_copy_payload(
+            &payload,
+            expected_hash,
+            |_, _| panic!("图片 payload 不得进入文本 writer"),
+            |image| {
+                observed = Some(*image.metadata.content_hash());
+                Ok(78)
+            },
+        )
+        .expect("有效图片 payload 应进入图片接缝");
+
+        assert_eq!(sequence, 78);
+        assert_eq!(observed, Some(expected_hash));
+    }
+
+    /// 缺失资产、正文残留、旧 UI 哈希和未知类型必须在图片 writer 前拒绝。
+    #[test]
+    fn 图片复制拒绝不完整或不一致_payload() {
+        let payload = image_copy_payload();
+        let expected_hash = <[u8; 32]>::try_from(payload.content_hash.as_slice()).unwrap();
+        let mut image_writes = 0;
+
+        let mut missing_image = payload.clone();
+        missing_image.image = None;
+        assert!(matches!(
+            process_typed_copy_payload(
+                &missing_image,
+                expected_hash,
+                |_, _| unreachable!(),
+                |_| {
+                    image_writes += 1;
+                    Ok(1)
+                },
+            ),
+            Err(CopyProcessError::MissingImage)
+        ));
+
+        let mut residual_text = payload.clone();
+        residual_text.text_content = Some("不应存在".to_owned());
+        assert!(matches!(
+            process_typed_copy_payload(
+                &residual_text,
+                expected_hash,
+                |_, _| unreachable!(),
+                |_| {
+                    image_writes += 1;
+                    Ok(1)
+                },
+            ),
+            Err(CopyProcessError::InvalidPayload)
+        ));
+
+        assert!(matches!(
+            process_typed_copy_payload(
+                &payload,
+                [1; 32],
+                |_, _| unreachable!(),
+                |_| {
+                    image_writes += 1;
+                    Ok(1)
+                },
+            ),
+            Err(CopyProcessError::HashMismatch)
+        ));
+
+        let mut unknown = payload;
+        unknown.item_type = "future".to_owned();
+        assert!(matches!(
+            process_typed_copy_payload(
+                &unknown,
+                expected_hash,
+                |_, _| unreachable!(),
+                |_| {
+                    image_writes += 1;
+                    Ok(1)
+                },
+            ),
+            Err(CopyProcessError::UnsupportedType)
+        ));
+        assert_eq!(image_writes, 0);
     }
 
     /// stale UI 哈希、非 text、缺正文和坏哈希都必须在写回前拒绝。

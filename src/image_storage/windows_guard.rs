@@ -61,6 +61,15 @@ pub(super) struct WindowsStorageGuard {
     _recovery_base: HeldDirectory,
 }
 
+/// 单次发布期间固定原图与缩略图哈希分片目录身份的不可克隆 capability。
+#[derive(Debug)]
+pub(super) struct PublishShardGuard {
+    /// 原图分片目录句柄。
+    _original_shard: HeldDirectory,
+    /// 缩略图分片目录句柄。
+    _thumbnail_shard: HeldDirectory,
+}
+
 impl WindowsStorageGuard {
     /// 打开全部受管目录，并校验子树边界和恢复目录同卷约束。
     pub fn open(
@@ -107,6 +116,42 @@ impl WindowsStorageGuard {
             _thumbnail: thumbnail,
             _staging: staging,
             _recovery_base: recovery_base,
+        })
+    }
+
+    /// 打开并固定两个哈希分片目录，拒绝重解析点及越出对应固定子树的路径。
+    #[allow(dead_code)]
+    pub fn hold_publish_shards(
+        &self,
+        original_shard: &Path,
+        thumbnail_shard: &Path,
+    ) -> Result<PublishShardGuard, ImageStoragePrepareError> {
+        let original_shard = HeldDirectory::open(original_shard, "打开原图分片目录")?;
+        let thumbnail_shard = HeldDirectory::open(thumbnail_shard, "打开缩略图分片目录")?;
+        for (label, shard, expected_parent) in [
+            ("原图分片目录越出固定子树", &original_shard, &self._original),
+            (
+                "缩略图分片目录越出固定子树",
+                &thumbnail_shard,
+                &self._thumbnail,
+            ),
+        ] {
+            let Some(parent) = shard.canonical_path.parent() else {
+                return Err(ImageStoragePrepareError::new(
+                    ImageStoragePrepareErrorKind::UnsafePath,
+                    label,
+                ));
+            };
+            if !path_eq(parent, &expected_parent.canonical_path) {
+                return Err(ImageStoragePrepareError::new(
+                    ImageStoragePrepareErrorKind::UnsafePath,
+                    label,
+                ));
+            }
+        }
+        Ok(PublishShardGuard {
+            _original_shard: original_shard,
+            _thumbnail_shard: thumbnail_shard,
         })
     }
 }

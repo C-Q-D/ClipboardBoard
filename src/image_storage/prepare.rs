@@ -12,8 +12,8 @@ use std::{
 use crate::domain::{image_metadata::content_hash_hex, ImageAssetRootId};
 
 use super::{
-    windows_guard::WindowsStorageGuard, ImageStorageLayout, ImageStoragePathError,
-    ImageStoragePreference,
+    windows_guard::{PublishShardGuard, WindowsStorageGuard},
+    ImageAssetPaths, ImageStorageLayout, ImageStoragePathError, ImageStoragePreference,
 };
 
 /// 资产根身份文件；用于避免把含用户文件的目录误当成应用缓存目录。
@@ -140,6 +140,18 @@ pub struct PreparedImageStorage {
     _guard: WindowsStorageGuard,
 }
 
+/// 已创建且由 Windows 句柄固定身份的单次图片发布目标。
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct PreparedAssetPublish {
+    /// 哈希绑定的原图、缩略图相对与绝对路径。
+    pub paths: ImageAssetPaths,
+    /// 固定 staging 目录；发布方只能在此创建独占临时文件。
+    pub staging_directory: PathBuf,
+    /// capability 存活期间禁止两个分片目录被替换。
+    _shard_guard: PublishShardGuard,
+}
+
 impl PreparedImageStorage {
     /// 返回实际生效布局。
     pub const fn layout(&self) -> &ImageStorageLayout {
@@ -159,6 +171,37 @@ impl PreparedImageStorage {
     /// 返回自定义目录失败后的回退详情。
     pub const fn fallback(&self) -> Option<&ImageStorageFallback> {
         self.fallback.as_ref()
+    }
+
+    /// 为一个内容哈希创建并固定发布目录，不向流水线暴露顶层目录句柄。
+    #[allow(dead_code)]
+    pub(crate) fn prepare_asset_publish(
+        &self,
+        content_hash: &[u8; 32],
+    ) -> Result<PreparedAssetPublish, ImageStoragePrepareError> {
+        let paths = self.layout.asset_paths(content_hash);
+        let original_shard = paths.image_absolute.parent().ok_or_else(|| {
+            ImageStoragePrepareError::new(
+                ImageStoragePrepareErrorKind::UnsafePath,
+                "原图目标缺少分片目录",
+            )
+        })?;
+        let thumbnail_shard = paths.thumbnail_absolute.parent().ok_or_else(|| {
+            ImageStoragePrepareError::new(
+                ImageStoragePrepareErrorKind::UnsafePath,
+                "缩略图目标缺少分片目录",
+            )
+        })?;
+        create_directory(original_shard, "创建原图分片目录")?;
+        create_directory(thumbnail_shard, "创建缩略图分片目录")?;
+        let shard_guard = self
+            ._guard
+            .hold_publish_shards(original_shard, thumbnail_shard)?;
+        Ok(PreparedAssetPublish {
+            paths,
+            staging_directory: self.layout.staging_directory().to_path_buf(),
+            _shard_guard: shard_guard,
+        })
     }
 }
 

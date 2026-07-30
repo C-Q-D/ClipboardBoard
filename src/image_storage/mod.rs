@@ -14,6 +14,7 @@ mod prepare;
 #[cfg(windows)]
 mod windows_guard;
 
+pub(crate) use prepare::PreparedAssetPublish;
 pub use prepare::{
     prepare_image_storage, ImageStorageFallback, ImageStoragePrepareError,
     ImageStoragePrepareErrorKind, PreparedImageStorage,
@@ -169,10 +170,7 @@ impl ImageStorageLayout {
         let thumbnail_relative = PathBuf::from(format!("{shard}/{thumbnail_file_name}"));
 
         ImageAssetPaths {
-            image_absolute: self
-                .original_directory
-                .join(shard)
-                .join(image_file_name),
+            image_absolute: self.original_directory.join(shard).join(image_file_name),
             thumbnail_absolute: self
                 .thumbnail_directory
                 .join(shard)
@@ -290,11 +288,8 @@ mod tests {
     #[test]
     fn custom_layout_uses_external_sibling_recovery() {
         let root = PathBuf::from(r"D:\ClipboardAssets");
-        let layout = layout_from_local_app_data(
-            None,
-            ImageStoragePreference::Custom(root.clone()),
-        )
-        .expect("构造自定义布局失败");
+        let layout = layout_from_local_app_data(None, ImageStoragePreference::Custom(root.clone()))
+            .expect("构造自定义布局失败");
 
         assert_eq!(layout.root_kind().as_str(), "custom");
         assert_eq!(layout.asset_root(), root);
@@ -318,10 +313,7 @@ mod tests {
         let paths = layout.asset_paths(&[0xab; 32]);
         let hex = "ab".repeat(32);
 
-        assert_eq!(
-            paths.image_relative,
-            PathBuf::from(format!("ab/{hex}.png"))
-        );
+        assert_eq!(paths.image_relative, PathBuf::from(format!("ab/{hex}.png")));
         assert_eq!(
             paths.thumbnail_relative,
             PathBuf::from(format!("ab/{hex}.webp"))
@@ -343,9 +335,7 @@ mod tests {
         );
         assert_eq!(
             paths.thumbnail_absolute,
-            layout
-                .thumbnail_directory()
-                .join(&paths.thumbnail_relative)
+            layout.thumbnail_directory().join(&paths.thumbnail_relative)
         );
         assert_eq!(
             layout.recovery_directory(ImageAssetRootId::new([0xcd; 32])),
@@ -379,10 +369,7 @@ mod tests {
             Err(ImageStoragePathError::CustomRootMustBeAbsolute)
         );
         assert_eq!(
-            layout_from_local_app_data(
-                None,
-                ImageStoragePreference::Custom(PathBuf::from(r"D:\"))
-            ),
+            layout_from_local_app_data(None, ImageStoragePreference::Custom(PathBuf::from(r"D:\"))),
             Err(ImageStoragePathError::CustomRootMustBeDedicatedDirectory)
         );
         for invalid in [
@@ -392,10 +379,7 @@ mod tests {
             PathBuf::from(r"D:\Assets\..\images"),
         ] {
             assert_eq!(
-                layout_from_local_app_data(
-                    None,
-                    ImageStoragePreference::Custom(invalid)
-                ),
+                layout_from_local_app_data(None, ImageStoragePreference::Custom(invalid)),
                 Err(ImageStoragePathError::CustomRootMustBeDedicatedDirectory)
             );
         }

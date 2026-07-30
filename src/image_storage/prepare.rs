@@ -142,7 +142,6 @@ pub struct PreparedImageStorage {
 
 /// 已创建且由 Windows 句柄固定身份的单次图片发布目标。
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PreparedAssetPublish {
     /// 哈希绑定的原图、缩略图相对与绝对路径。
     pub paths: ImageAssetPaths,
@@ -174,7 +173,6 @@ impl PreparedImageStorage {
     }
 
     /// 为一个内容哈希创建并固定发布目录，不向流水线暴露顶层目录句柄。
-    #[allow(dead_code)]
     pub(crate) fn prepare_asset_publish(
         &self,
         content_hash: &[u8; 32],

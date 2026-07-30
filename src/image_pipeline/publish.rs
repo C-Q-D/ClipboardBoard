@@ -3,9 +3,6 @@
 //! 两个最终文件无法跨文件原子提交，因此流程固定先同步两份 staging，再依次发布；
 //! 可观察失败只回滚本次创建的文件，崩溃遗留由后续启动恢复原子处理。
 
-// PIPE-03 下一原子才会建立生产调用链；本原子必须先独立提交完整的 crate 内发布接缝。
-#![allow(dead_code)]
-
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
@@ -119,8 +116,6 @@ impl From<ImageStoragePrepareError> for ImagePublishError {
 }
 
 /// 已发布且完整回读验证的图片资产；提交数据库前保留本次文件所有权。
-// PIPE-03 worker 接入前 finalize 方法尚无生产调用方；本原子仍需独立建立所有权协议。
-#[allow(dead_code)]
 pub(crate) struct PublishedImageAssets {
     /// 可直接写入持久化记录的领域元数据。
     metadata: ImageMetadata,
@@ -148,7 +143,6 @@ impl fmt::Debug for PublishedImageAssets {
     }
 }
 
-#[allow(dead_code)]
 impl PublishedImageAssets {
     /// 返回经过回读验证的持久化元数据。
     pub const fn metadata(&self) -> &ImageMetadata {

@@ -120,7 +120,6 @@ impl WindowsStorageGuard {
     }
 
     /// 打开并固定两个哈希分片目录，拒绝重解析点及越出对应固定子树的路径。
-    #[allow(dead_code)]
     pub fn hold_publish_shards(
         &self,
         original_shard: &Path,

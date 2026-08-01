@@ -527,6 +527,7 @@ mod tests {
     //! 此测试模块覆盖捕获提交顺序、存储失败续处理、DTO 防伪和 UI sink 生命周期。
 
     use std::{
+        path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc::sync_channel,
@@ -550,8 +551,12 @@ mod tests {
         },
         command::{UiClipboardItemKind, UiEvent},
         domain::{CanonicalImagePixels, ClipboardPayload, ImageAssetRootId, ImageMetadata},
+        history_restore::load_startup_snapshot,
         image_pipeline::{encode_original_png, ImageWorker},
-        image_storage::{prepare_image_storage, ImageStoragePreference},
+        image_storage::{
+            parse_image_storage_preference, prepare_image_storage, windows_path_eq,
+            ImageStoragePreference,
+        },
         platform::windows::ProcessSource,
         storage::{HistoryImageSummary, HistoryPayload, StorageExecutor, TextUpsertResult},
     };
@@ -995,6 +1000,134 @@ mod tests {
         worker_b.stop().expect("停止根 B worker 失败");
         drop(storage);
         std::fs::remove_dir_all(directory).expect("清理跨根测试目录失败");
+    }
+
+    /// 配置切换到 B 后，新图片写入 B；启动历史仍从 SQLite 根注册表恢复 A 的旧缩略图。
+    #[test]
+    fn switched_image_root_keeps_old_assets_readable() {
+        let directory = test_directory("image-root-switch");
+        let root_a = directory.join("images-a");
+        let root_b = directory.join("images-b");
+        let preference_a =
+            parse_image_storage_preference(Some(root_a.to_str().expect("根 A 必须是 UTF-8")))
+                .expect("解析根 A 设置失败");
+        let preference_b =
+            parse_image_storage_preference(Some(root_b.to_str().expect("根 B 必须是 UTF-8")))
+                .expect("解析根 B 设置失败");
+        let mut storage = StorageExecutor::open_at(&directory).expect("启动切换根存储失败");
+
+        let pixels_a =
+            CanonicalImagePixels::new(1, 1, vec![30, 40, 50, 255]).expect("构造根 A 像素失败");
+        let mut png_a = Vec::new();
+        encode_original_png(&pixels_a, &mut png_a).expect("编码根 A PNG 失败");
+        let worker_a =
+            ImageWorker::start(prepare_image_storage(preference_a).expect("准备根 A 图片目录失败"))
+                .expect("启动根 A 图片 worker 失败");
+        let context_a =
+            ImageCaptureContext::new(worker_a.sender(), worker_a.root_snapshot().clone());
+        process_image_capture(
+            &storage.client(),
+            &context_a,
+            None,
+            ClipboardImageBytes::RegisteredPng(png_a),
+            100,
+            |_| true,
+        )
+        .expect("根 A 图片捕获失败");
+        worker_a.stop().expect("停止根 A 图片 worker 失败");
+
+        let pixels_b =
+            CanonicalImagePixels::new(1, 1, vec![80, 90, 100, 255]).expect("构造根 B 像素失败");
+        let mut png_b = Vec::new();
+        encode_original_png(&pixels_b, &mut png_b).expect("编码根 B PNG 失败");
+        let worker_b =
+            ImageWorker::start(prepare_image_storage(preference_b).expect("准备根 B 图片目录失败"))
+                .expect("启动根 B 图片 worker 失败");
+        let context_b =
+            ImageCaptureContext::new(worker_b.sender(), worker_b.root_snapshot().clone());
+        process_image_capture(
+            &storage.client(),
+            &context_b,
+            None,
+            ClipboardImageBytes::RegisteredPng(png_b),
+            200,
+            |_| true,
+        )
+        .expect("根 B 图片捕获失败");
+        worker_b.stop().expect("停止根 B 图片 worker 失败");
+
+        let page = storage
+            .client()
+            .list_history_summaries(None, 10)
+            .expect("查询切换根历史失败");
+        assert_eq!(page.items.len(), 2);
+        let summary_a = page
+            .items
+            .iter()
+            .find(|item| item.content_hash == pixels_a.content_hash())
+            .expect("缺少根 A 历史");
+        let summary_b = page
+            .items
+            .iter()
+            .find(|item| item.content_hash == pixels_b.content_hash())
+            .expect("缺少根 B 历史");
+        let image_a = summary_a.image.as_ref().expect("根 A 历史缺少图片元数据");
+        let image_b = summary_b.image.as_ref().expect("根 B 历史缺少图片元数据");
+        assert!(windows_path_eq(image_a.canonical_root.as_path(), &root_a));
+        assert!(windows_path_eq(image_b.canonical_root.as_path(), &root_b));
+        assert!(image_a.thumbnail_absolute_path().is_file());
+        assert!(image_b.thumbnail_absolute_path().is_file());
+        assert!(image_a
+            .canonical_root
+            .join("original")
+            .join(image_a.metadata.image_path().as_path())
+            .is_file());
+        assert!(image_b
+            .canonical_root
+            .join("original")
+            .join(image_b.metadata.image_path().as_path())
+            .is_file());
+
+        let connection =
+            Connection::open(directory.join("clipboard.db")).expect("打开切换根数据库失败");
+        let registered_roots = connection
+            .prepare("SELECT root_path FROM image_asset_roots")
+            .expect("查询图片根注册表失败")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("读取图片根注册表失败")
+            .map(|row| PathBuf::from(row.expect("读取图片根路径失败")))
+            .collect::<Vec<_>>();
+        assert_eq!(registered_roots.len(), 2);
+        assert!(registered_roots
+            .iter()
+            .any(|root| windows_path_eq(root, &root_a)));
+        assert!(registered_roots
+            .iter()
+            .any(|root| windows_path_eq(root, &root_b)));
+        drop(connection);
+
+        let startup_snapshot = load_startup_snapshot(&mut storage).expect("恢复切换根启动历史失败");
+        let restored_a = startup_snapshot
+            .items
+            .iter()
+            .find(|item| item.content_hash == pixels_a.content_hash())
+            .expect("启动历史缺少根 A 图片");
+        let UiClipboardItemKind::Image(restored_image_a) = &restored_a.kind else {
+            panic!("根 A 启动历史类型不是图片");
+        };
+        assert!(windows_path_eq(
+            &restored_image_a.thumbnail_path,
+            &image_a.thumbnail_absolute_path()
+        ));
+        assert!(windows_path_eq(
+            &restored_image_a.thumbnail_path,
+            &root_a
+                .join("thumbnail")
+                .join(image_a.metadata.thumbnail_path().as_path())
+        ));
+
+        drop(storage);
+        std::fs::remove_dir_all(directory).expect("清理切换根测试目录失败");
     }
 
     /// SQLite 拒绝图片事务时必须 rollback 本次刚发布的两份资产。

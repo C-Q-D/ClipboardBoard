@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::image_storage::parse_image_storage_preference;
+
 /// 当前配置文档唯一支持的 schema 版本。
 pub(crate) const CURRENT_SCHEMA_VERSION: u64 = 1;
 
@@ -98,6 +100,8 @@ pub struct HistorySettings {
     pub capture_images: bool,
     /// 是否记录来源程序名称。
     pub capture_source_app: bool,
+    /// 可选图片资产根；缺省时由图片存储模块解析为应用默认目录。
+    pub image_storage_root: Option<String>,
 }
 
 impl Default for HistorySettings {
@@ -109,6 +113,7 @@ impl Default for HistorySettings {
             image_quota_mib: 500,
             capture_images: true,
             capture_source_app: true,
+            image_storage_root: None,
         }
     }
 }
@@ -183,6 +188,8 @@ pub(crate) enum ValidationField {
     ImageQuotaMib,
     /// 排除程序规则集合。
     ExcludedApps,
+    /// 图片资产根路径。
+    ImageStorageRoot,
 }
 
 /// load 与 save 共用的语义验证器，避免写入无法重新加载的配置。
@@ -195,6 +202,10 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), Validation
     }
     if !IMAGE_QUOTA_MIB_RANGE.contains(&settings.history.image_quota_mib) {
         return Err(ValidationField::ImageQuotaMib);
+    }
+    // 路径保存和启动转换必须复用图片存储模块的唯一解析器，防止两处规则漂移。
+    if parse_image_storage_preference(settings.history.image_storage_root.as_deref()).is_err() {
+        return Err(ValidationField::ImageStorageRoot);
     }
     validate_excluded_apps(&settings.privacy.excluded_apps)?;
     Ok(())
@@ -280,7 +291,8 @@ mod tests {
 
     use super::{
         normalize_excluded_app_rule, validate_settings, AppSettings, HistorySettings,
-        IMAGE_QUOTA_MIB_RANGE, MAX_EXCLUDED_APPS, MAX_ITEMS_RANGE, RETENTION_DAYS_RANGE,
+        ValidationField, IMAGE_QUOTA_MIB_RANGE, MAX_EXCLUDED_APPS, MAX_ITEMS_RANGE,
+        RETENTION_DAYS_RANGE,
     };
 
     /// 最小值和最大值均合法，越界值均被统一验证器拒绝。
@@ -353,6 +365,22 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.privacy.excluded_apps = vec!["a.exe".to_owned(); MAX_EXCLUDED_APPS + 1];
         assert!(validate_settings(&settings).is_err());
+    }
+
+    /// 图片根设置必须复用 image_storage 的唯一解析器，并映射为稳定字段错误。
+    #[test]
+    fn validates_image_storage_root_through_shared_parser() {
+        let mut settings = AppSettings::default();
+        assert!(validate_settings(&settings).is_ok());
+
+        settings.history.image_storage_root = Some(r"D:\ClipboardAssets\Images".to_owned());
+        assert!(validate_settings(&settings).is_ok());
+
+        settings.history.image_storage_root = Some("relative\\images".to_owned());
+        assert_eq!(
+            validate_settings(&settings),
+            Err(ValidationField::ImageStorageRoot)
+        );
     }
 
     /// 自定义 Debug 只输出规则数量，不泄露规则字符串。

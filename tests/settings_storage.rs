@@ -220,6 +220,7 @@ fn saved_settings_survive_explicit_shutdown_and_restart() {
             image_quota_mib: 2_048,
             capture_images: false,
             capture_source_app: false,
+            image_storage_root: None,
         },
         ..AppSettings::default()
     };
@@ -234,6 +235,69 @@ fn saved_settings_survive_explicit_shutdown_and_restart() {
     assert_eq!(snapshot.source(), SettingsLoadSource::Primary);
     assert_eq!(snapshot.revision(), 0);
     shutdown_and_remove(restarted, directory);
+}
+
+/// 自定义图片根属于已知字段：保存后 JSON 与重启快照必须保留同一字符串值。
+#[test]
+fn image_storage_root_survives_save_and_restart() {
+    let directory = temporary_directory("image-root-restart");
+    let custom_root = directory.join("images");
+    let custom_root = custom_root
+        .to_str()
+        .expect("Windows 临时路径必须可转换为 UTF-8")
+        .to_owned();
+    let worker = SettingsWorker::start_at(&directory).expect("启动配置线程失败");
+    let mut expected = worker.client().snapshot().unwrap().settings().clone();
+    expected.history.image_storage_root = Some(custom_root.clone());
+
+    let saved = worker
+        .client()
+        .save(0, expected.clone())
+        .expect("保存图片根失败");
+    assert_eq!(
+        saved.settings().history.image_storage_root.as_deref(),
+        Some(custom_root.as_str())
+    );
+    let document: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("settings.json")).expect("读取图片根配置失败"),
+    )
+    .expect("解析图片根配置失败");
+    assert_eq!(document["history"]["image_storage_root"], custom_root);
+    shutdown_without_remove(worker);
+
+    let restarted = SettingsWorker::start_at(&directory).expect("重启配置线程失败");
+    assert_eq!(
+        restarted
+            .client()
+            .snapshot()
+            .unwrap()
+            .settings()
+            .history
+            .image_storage_root
+            .as_deref(),
+        Some(custom_root.as_str())
+    );
+    shutdown_and_remove(restarted, directory);
+}
+
+/// 图片根非法值必须在 staging 创建前被统一字段错误拒绝，不能先落盘再启动回退。
+#[test]
+fn invalid_image_storage_root_is_rejected_before_disk_write() {
+    for (label, value) in [
+        ("relative", "relative\\images"),
+        ("control", "D:\\Images\n"),
+    ] {
+        let directory = temporary_directory(&format!("image-root-invalid-{label}"));
+        let worker = SettingsWorker::start_at(&directory).expect("启动配置线程失败");
+        let mut invalid = worker.client().snapshot().unwrap().settings().clone();
+        invalid.history.image_storage_root = Some(value.to_owned());
+        assert!(matches!(
+            worker.client().save(0, invalid),
+            Err(SettingsError::InvalidSettings("history.image_storage_root"))
+        ));
+        assert!(!directory.join("settings.json").exists());
+        shutdown_and_remove(worker, directory);
+    }
 }
 
 /// 从备份恢复后保存不得用损坏主文件覆盖唯一有效恢复点。

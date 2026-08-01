@@ -307,6 +307,7 @@ fn validation_error(field: ValidationField) -> SettingsError {
         ValidationField::RetentionDays => "history.retention_days",
         ValidationField::ImageQuotaMib => "history.image_quota_mib",
         ValidationField::ExcludedApps => "privacy.excluded_apps",
+        ValidationField::ImageStorageRoot => "history.image_storage_root",
     })
 }
 

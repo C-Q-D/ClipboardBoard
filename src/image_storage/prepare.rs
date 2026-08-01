@@ -536,6 +536,11 @@ mod tests {
             ImageStoragePrepareErrorKind::UnknownDirectoryContents
         );
         assert_eq!(
+            prepared.layout().asset_root(),
+            local.join("ClipboardBoard").join("images")
+        );
+        assert_eq!(prepared.layout().root_kind(), ImageStorageRootKind::Default);
+        assert_eq!(
             fs::read(requested.join("user.txt")).expect("未知文件被删除"),
             b"keep"
         );

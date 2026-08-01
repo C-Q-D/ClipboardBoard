@@ -25,7 +25,7 @@ pub(crate) use windows_guard::{path_eq as windows_path_eq, HeldDirectory};
 /// 自定义图片根外部的受管恢复基目录名称。
 pub const CUSTOM_RECOVERY_DIRECTORY_NAME: &str = ".clipboardboard-recovery";
 
-/// 用户选择的图片资产根偏好；设置持久化将在后续原子接入。
+/// 用户选择的图片资产根偏好；设置层只保存可逆的 UTF-8 路径字符串。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageStoragePreference {
     /// 使用 `%LOCALAPPDATA%\ClipboardBoard\images`。
@@ -78,6 +78,55 @@ impl fmt::Display for ImageStoragePathError {
 }
 
 impl std::error::Error for ImageStoragePathError {}
+
+/// 将设置中的可选字符串解析为唯一的图片存储偏好。
+///
+/// 该函数是设置保存校验和启动初始化共用的唯一入口：`None` 代表产品默认根，
+/// 非空字符串必须先通过与布局构造完全相同的专用目录规则，随后才转换为
+/// `ImageStoragePreference::Custom`。函数只做字符串与路径校验，不创建目录、不访问磁盘，
+/// 因而可以在保存前安全调用并保证保存值与启动值使用同一语义。
+pub fn parse_image_storage_preference(
+    raw: Option<&str>,
+) -> Result<ImageStoragePreference, ImageStoragePathError> {
+    let Some(raw) = raw else {
+        return Ok(ImageStoragePreference::Default);
+    };
+
+    // 空字符串和全空白值都没有可持久化的目录语义；不要偷偷把它当作默认值，
+    // 否则用户会看到“保存成功”但重启后路径悄然改变。
+    if raw.trim().is_empty() || raw.chars().any(char::is_control) {
+        return Err(ImageStoragePathError::CustomRootMustBeDedicatedDirectory);
+    }
+
+    let path = PathBuf::from(raw);
+    validate_custom_root(&path)?;
+    if is_unc_share_root(raw) {
+        return Err(ImageStoragePathError::CustomRootMustBeDedicatedDirectory);
+    }
+    Ok(ImageStoragePreference::Custom(path))
+}
+
+/// 判断 UNC 是否仅指向 `\\server\share` 根，而非 share 下的专用子目录。
+///
+/// 路径来自 JSON 字符串，统一使用 ASCII 分隔符检查即可；尾部分隔符不会绕过
+/// share 根限制，控制字符和 `.`/`..` 仍由上层通用校验器拒绝。
+fn is_unc_share_root(raw: &str) -> bool {
+    let normalized = raw.replace('/', "\\");
+    let rest = if let Some(rest) = normalized.strip_prefix("\\\\?\\UNC\\") {
+        // 扩展 UNC 前缀仍指向 share 根，不能通过扩展前缀绕过专用目录限制。
+        rest
+    } else if let Some(rest) = normalized.strip_prefix("\\\\.\\UNC\\") {
+        // 设备 UNC 前缀与普通 UNC 共享相同的安全边界。
+        rest
+    } else if let Some(rest) = normalized.strip_prefix("\\\\") {
+        rest
+    } else {
+        return false;
+    };
+    let trimmed = rest.trim_end_matches('\\');
+    let mut parts = trimmed.split('\\');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(server), Some(share), None) if !server.is_empty() && !share.is_empty())
+}
 
 /// 同一内容哈希对应的原图与缩略图相对/绝对路径集合。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,8 +307,8 @@ mod tests {
     use crate::domain::{ImageAssetRootId, ImageMetadata};
 
     use super::{
-        layout_from_local_app_data, ImageStoragePathError, ImageStoragePreference,
-        ImageStorageRootKind, CUSTOM_RECOVERY_DIRECTORY_NAME,
+        layout_from_local_app_data, parse_image_storage_preference, ImageStoragePathError,
+        ImageStoragePreference, ImageStorageRootKind, CUSTOM_RECOVERY_DIRECTORY_NAME,
     };
 
     /// 验证默认布局严格位于 LOCALAPPDATA 的应用目录。
@@ -383,6 +432,39 @@ mod tests {
             assert_eq!(
                 layout_from_local_app_data(None, ImageStoragePreference::Custom(invalid)),
                 Err(ImageStoragePathError::CustomRootMustBeDedicatedDirectory)
+            );
+        }
+    }
+
+    /// 设置解析器必须与布局校验共享同一规则，并保持合法字符串的路径值不变。
+    #[test]
+    fn image_storage_preference_parser_has_one_validation_contract() {
+        assert_eq!(
+            parse_image_storage_preference(None).expect("None 应使用默认根"),
+            ImageStoragePreference::Default
+        );
+        let custom = r"D:\ClipboardAssets\Images";
+        assert_eq!(
+            parse_image_storage_preference(Some(custom)).expect("合法自定义根应通过"),
+            ImageStoragePreference::Custom(PathBuf::from(custom))
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "relative\\images",
+            r"D:\",
+            r"\\server\share",
+            r"\\?\UNC\server\share",
+            r"\\.\UNC\server\share",
+            r"D:\Assets\.\images",
+            r"D:\Assets\..\images",
+            r"D:\.clipboardboard-recovery",
+            "D:\\Assets\\images\n",
+        ] {
+            assert!(
+                parse_image_storage_preference(Some(invalid)).is_err(),
+                "非法图片根未被拒绝：{invalid:?}"
             );
         }
     }

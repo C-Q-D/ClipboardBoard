@@ -36,7 +36,7 @@ use clipboard_board::history_restore::load_startup_snapshot;
 #[cfg(windows)]
 use clipboard_board::image_pipeline::ImageWorker;
 #[cfg(windows)]
-use clipboard_board::image_storage::{prepare_image_storage, ImageStoragePreference};
+use clipboard_board::image_storage::{parse_image_storage_preference, prepare_image_storage};
 #[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
@@ -242,6 +242,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .snapshot()?;
     // 来源记录策略在启动时冻结；运行中不让结果泵同步读取配置文件。
     let capture_source_app = initial_settings.settings().history.capture_source_app;
+    // 设置快照已经过保存/加载校验，但启动仍复用同一个无副作用解析器，保证
+    // 配置语义与图片 capability 初始化永远使用同一条路径规则。
+    let image_storage_preference = parse_image_storage_preference(
+        initial_settings
+            .settings()
+            .history
+            .image_storage_root
+            .as_deref(),
+    )?;
     let settings = cleanup
         .settings
         .take()
@@ -266,7 +275,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("StorageExecutor 已放入清理槽"),
     )?;
     post_ui_event(UiEvent::ReplaceSnapshot(startup_snapshot))?;
-    let prepared_images = prepare_image_storage(ImageStoragePreference::Default)?;
+    let prepared_images = prepare_image_storage(image_storage_preference)?;
+    if let Some(fallback) = prepared_images.fallback() {
+        // 回退诊断只记录稳定分类和操作，不记录请求目录或实际完整路径；后续
+        // ImageWorker 从同一个 capability 快照取得实际生效根，禁止继续使用失败请求。
+        eprintln!(
+            "图片存储目录回退：kind={:?}, operation={}",
+            fallback.reason().kind(),
+            fallback.reason().operation()
+        );
+    }
     let image_worker = ImageWorker::start(prepared_images)?;
     let image_sender = image_worker.sender();
     let image_root = image_worker.root_snapshot().clone();

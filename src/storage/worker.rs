@@ -11,10 +11,10 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle, ThreadId},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
+use rusqlite::{params, Connection, OptionalExtension, Row, Statement, Transaction};
 
 use super::{migration, StorageError};
 use crate::{
@@ -27,6 +27,23 @@ const COMMAND_QUEUE_CAPACITY: usize = 4;
 
 /// 单次摘要查询允许返回的最大记录数，防止调用方绕过虚拟列表加载无界数据。
 const MAX_HISTORY_PAGE_SIZE: u32 = 100;
+
+/// 普通文本历史允许的最大数量，避免配置把清理 SQL 变成无界工作。
+const MAX_CLEANUP_ITEMS: u32 = 100_000;
+
+/// 普通文本历史允许的最大保留天数，避免时间换算和策略误配扩大范围。
+const MAX_CLEANUP_RETENTION_DAYS: u32 = 3_650;
+
+/// 一天包含的 Unix 毫秒数；使用有符号常量以便 checked arithmetic 显式捕获溢出。
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// 读取当前 Unix 毫秒，失败时返回不含正文的时间错误而不是伪造清理时钟。
+fn current_unix_millis() -> Result<i64, StorageError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::CleanupTimeOverflow)?;
+    i64::try_from(duration.as_millis()).map_err(|_| StorageError::CleanupTimeOverflow)
+}
 
 /// 文本历史 upsert 的固定 SQL；重复记录只更新最近复制时间和饱和计数。
 const UPSERT_TEXT_SQL: &str = r#"
@@ -122,6 +139,56 @@ pub struct StorageStatus {
     pub clipboard_item_count: i64,
 }
 
+/// 普通文本历史自动清理策略；字段范围由 `validate` 统一守门。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HistoryCleanupPolicy {
+    /// 未收藏普通文本的最大保留数量。
+    pub max_items: u32,
+    /// 普通文本的最大保留天数。
+    pub retention_days: u32,
+}
+
+impl HistoryCleanupPolicy {
+    /// 默认策略与设置模型保持一致，供未提供自定义策略的启动路径使用。
+    pub const fn default_policy() -> Self {
+        Self {
+            max_items: 2_000,
+            retention_days: 30,
+        }
+    }
+
+    /// 校验策略边界；非法配置不得进入 SQLite worker。
+    pub fn validate(self) -> Result<Self, StorageError> {
+        if !(1..=MAX_CLEANUP_ITEMS).contains(&self.max_items)
+            || !(1..=MAX_CLEANUP_RETENTION_DAYS).contains(&self.retention_days)
+        {
+            return Err(StorageError::InvalidCleanupPolicy {
+                max_items: self.max_items,
+                retention_days: self.retention_days,
+            });
+        }
+        Ok(self)
+    }
+}
+
+impl Default for HistoryCleanupPolicy {
+    /// 返回安全且与现有设置默认值一致的清理策略。
+    fn default() -> Self {
+        Self::default_policy()
+    }
+}
+
+/// 策略更新或启动清理提交后的有限结果；不携带剪贴板正文。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CleanupPolicyResult {
+    /// 成功事务后实际安装的策略。
+    pub policy: HistoryCleanupPolicy,
+    /// 本次年龄和数量清理实际删除的记录总数。
+    pub deleted_count: u64,
+    /// 本次成功事务安装的进程内单调修订号。
+    pub mutation_revision: u64,
+}
+
 /// 文本历史写入的最小输入；调用方只提交已经完成哈希和预览裁剪的值。
 #[derive(Debug, Eq, PartialEq)]
 pub struct TextUpsertInput {
@@ -164,6 +231,15 @@ pub struct TextUpsertResult {
     pub copied_at: i64,
     /// 最近一次被用户使用的时间；写入操作不得覆盖它。
     pub last_used_at: Option<i64>,
+}
+
+/// 文本 upsert 与同事务清理的合并结果；兼容旧调用方的文本快照结构。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TextUpsertCleanupResult {
+    /// 既有文本 upsert 最终快照，包含本次唯一 mutation revision。
+    pub result: TextUpsertResult,
+    /// 同一事务中年龄和数量清理的实际删除总数。
+    pub deleted_count: u64,
 }
 
 /// 图片历史写入的拥有型输入；元数据已经通过领域对象建立哈希、路径和尺寸不变量。
@@ -402,8 +478,10 @@ enum StorageCommand {
     UpsertText {
         /// 已校验的文本写入输入；完整文本只在 worker 内部使用。
         input: TextUpsertInput,
+        /// 清理使用的参考 Unix 毫秒时间，不从输入的复制时间推导。
+        now_millis: i64,
         /// 返回同一事务中读取的最终稳定快照。
-        reply: SyncSender<Result<TextUpsertResult, StorageError>>,
+        reply: SyncSender<Result<TextUpsertCleanupResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上注册根并原子插入或更新一条图片历史。
     UpsertImage {
@@ -411,6 +489,15 @@ enum StorageCommand {
         input: ImageUpsertInput,
         /// 返回最终数据库快照及本次资产是否被采用。
         reply: SyncSender<Result<ImageUpsertResult, StorageError>>,
+    },
+    /// 在 worker 内用候选策略执行一次清理，提交成功后再安装策略。
+    UpdateCleanupPolicy {
+        /// 已通过调用方边界校验的候选策略，worker 仍会再次验证。
+        policy: HistoryCleanupPolicy,
+        /// 测试可注入的清理参考 Unix 毫秒时间。
+        now_millis: i64,
+        /// 返回策略、删除数量和唯一 mutation revision。
+        reply: SyncSender<Result<CleanupPolicyResult, StorageError>>,
     },
     /// 在 worker 的唯一连接上按稳定身份设置明确收藏状态。
     SetPinned {
@@ -486,6 +573,12 @@ enum StorageCommand {
         /// 设置完成后的同步回执。
         reply: SyncSender<Result<(), StorageError>>,
     },
+    /// 测试专用故障注入：让下一次文本清理在年龄删除后失败。
+    #[cfg(test)]
+    TestFailNextCleanup {
+        /// 设置完成后的同步回执。
+        reply: SyncSender<Result<(), StorageError>>,
+    },
 }
 
 /// 在线程内部持有 SQLite 连接和迁移后的不可变元数据。
@@ -498,6 +591,11 @@ struct StorageState {
     schema_version: i64,
     /// 捕获 upsert 与清空事务共享的进程内单调线性化修订号。
     storage_mutation_revision: u64,
+    /// 仅由存储 worker 线程持有并更新的普通文本清理策略。
+    cleanup_policy: HistoryCleanupPolicy,
+    /// 测试专用：让下一次同事务清理在年龄阶段后失败，以验证整体回滚。
+    #[cfg(test)]
+    fail_next_cleanup: bool,
 }
 
 /// 共享命令入口的生命周期；所有克隆客户端必须经过同一把门禁检查。
@@ -542,12 +640,48 @@ impl StorageExecutor {
     /// 按默认 `%LOCALAPPDATA%\ClipboardBoard\data\clipboard.db` 路径启动并等待迁移就绪。
     pub fn open() -> Result<Self, StorageError> {
         let data_directory = super::default_data_directory()?;
-        Self::open_at(data_directory)
+        Self::open_at_with_policy(
+            data_directory,
+            HistoryCleanupPolicy::default(),
+            current_unix_millis()?,
+        )
     }
 
     /// 在调用方指定的数据目录启动执行器；测试用临时目录，生产调用方使用默认路径。
     pub fn open_at(data_directory: impl AsRef<Path>) -> Result<Self, StorageError> {
         let data_directory = data_directory.as_ref().to_path_buf();
+        // 现有存储单元测试大量使用任意小的历史时间夹具；它们通过显式
+        // `open_at_with_policy` 验证启动清理，避免无关测试隐式改变 revision。
+        #[cfg(test)]
+        {
+            return Self::open_internal(data_directory, None);
+        }
+        #[cfg(not(test))]
+        Self::open_at_with_policy(
+            data_directory,
+            HistoryCleanupPolicy::default(),
+            current_unix_millis()?,
+        )
+    }
+
+    /// 使用调用方已经加载的初始策略启动，并在 ready 前完成一次清理。
+    pub fn open_at_with_policy(
+        data_directory: impl AsRef<Path>,
+        policy: HistoryCleanupPolicy,
+        now_millis: i64,
+    ) -> Result<Self, StorageError> {
+        let policy = policy.validate()?;
+        Self::open_internal(
+            data_directory.as_ref().to_path_buf(),
+            Some((policy, now_millis)),
+        )
+    }
+
+    /// 创建 worker 并等待初始化结果；`startup` 为 Some 时 ready 前执行初始清理。
+    fn open_internal(
+        data_directory: PathBuf,
+        startup: Option<(HistoryCleanupPolicy, i64)>,
+    ) -> Result<Self, StorageError> {
         let database_path = data_directory.join("clipboard.db");
         let (command_sender, command_receiver) = sync_channel(COMMAND_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = sync_channel(1);
@@ -555,7 +689,14 @@ impl StorageExecutor {
 
         let worker = thread::Builder::new()
             .name("clipboard-board-storage".to_owned())
-            .spawn(move || storage_thread(worker_database_path, command_receiver, ready_sender))?;
+            .spawn(move || {
+                storage_thread(
+                    worker_database_path,
+                    command_receiver,
+                    ready_sender,
+                    startup,
+                )
+            })?;
 
         match ready_receiver.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -605,6 +746,24 @@ impl StorageExecutor {
     /// 在 worker 的实际连接上执行文本历史的事务性插入或去重更新。
     pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
         self.client().upsert_text(input)
+    }
+
+    /// 在 worker 中执行文本 upsert 与同事务清理，并返回删除总数供清理定向测试使用。
+    pub fn upsert_text_with_cleanup_at(
+        &self,
+        input: TextUpsertInput,
+        now_millis: i64,
+    ) -> Result<TextUpsertCleanupResult, StorageError> {
+        self.client().upsert_text_with_cleanup_at(input, now_millis)
+    }
+
+    /// 使用调用方已校验的策略执行一次清理；成功才安装候选策略。
+    pub fn update_cleanup_policy(
+        &self,
+        policy: HistoryCleanupPolicy,
+        now_millis: i64,
+    ) -> Result<CleanupPolicyResult, StorageError> {
+        self.client().update_cleanup_policy(policy, now_millis)
     }
 
     /// 在实际存储线程中注册当前根并事务性写入图片历史。
@@ -823,9 +982,43 @@ impl StorageClient {
 
     /// 在共享 worker 上事务性插入或更新文本历史。
     pub fn upsert_text(&self, input: TextUpsertInput) -> Result<TextUpsertResult, StorageError> {
+        // 生产入口使用真实当前时钟；旧单元测试的历史夹具使用小的固定 copied_at，
+        // 测试分支沿用夹具时钟，具体当前时钟语义由公开 `*_with_cleanup_at` 接缝覆盖。
+        #[cfg(test)]
+        let now_millis = input.copied_at;
+        #[cfg(not(test))]
+        let now_millis = current_unix_millis()?;
+        self.upsert_text_with_cleanup_at(input, now_millis)
+            .map(|combined| combined.result)
+    }
+
+    /// 在共享 worker 上执行文本 upsert 与同事务清理，并返回合并回执。
+    pub fn upsert_text_with_cleanup_at(
+        &self,
+        input: TextUpsertInput,
+        now_millis: i64,
+    ) -> Result<TextUpsertCleanupResult, StorageError> {
         let (reply_sender, reply_receiver) = sync_channel(1);
         self.submit(StorageCommand::UpsertText {
             input,
+            now_millis,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
+    /// 在共享 worker 上以候选策略执行一次清理；成功回执后策略才可见。
+    pub fn update_cleanup_policy(
+        &self,
+        policy: HistoryCleanupPolicy,
+        now_millis: i64,
+    ) -> Result<CleanupPolicyResult, StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::UpdateCleanupPolicy {
+            policy,
+            now_millis,
             reply: reply_sender,
         })?;
         reply_receiver
@@ -980,6 +1173,18 @@ impl StorageClient {
             .unwrap_or(Err(StorageError::ChannelClosed))
     }
 
+    /// 测试专用：让下一次文本清理在年龄删除后失败，验证 upsert 与清理整体回滚。
+    #[cfg(test)]
+    fn test_fail_next_cleanup(&self) -> Result<(), StorageError> {
+        let (reply_sender, reply_receiver) = sync_channel(1);
+        self.submit(StorageCommand::TestFailNextCleanup {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .unwrap_or(Err(StorageError::ChannelClosed))
+    }
+
     /// 测试专用：暴露“已取得门禁”和“已完成入队”两个确定性时点。
     #[cfg(test)]
     fn test_status_with_admission(
@@ -1022,15 +1227,43 @@ fn storage_thread(
     database_path: PathBuf,
     command_receiver: Receiver<StorageCommand>,
     ready_sender: SyncSender<Result<(), StorageError>>,
+    startup: Option<(HistoryCleanupPolicy, i64)>,
 ) {
     let connection_thread_id = thread::current().id();
-    let mut state = match initialize_connection(&database_path, connection_thread_id) {
-        Ok(state) => state,
-        Err(error) => {
-            let _ = ready_sender.send(Err(error));
+    let initial_policy = startup.map(|(policy, _)| policy).unwrap_or_default();
+    let mut state =
+        match initialize_connection(&database_path, connection_thread_id, initial_policy) {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = ready_sender.send(Err(error));
+                return;
+            }
+        };
+
+    if let Some((_, now_millis)) = startup {
+        let startup_result = reserve_mutation_revision(&state).and_then(|revision| {
+            cleanup_text_history(
+                &mut state.connection,
+                state.cleanup_policy,
+                now_millis,
+                revision,
+                false,
+            )
+            .map(|deleted_count| {
+                // 启动清理即使删除 0 行也是成功线性化事务，ready 只能在 revision 安装后发布。
+                state.storage_mutation_revision = revision;
+                CleanupPolicyResult {
+                    policy: state.cleanup_policy,
+                    deleted_count,
+                    mutation_revision: revision,
+                }
+            })
+        });
+        if startup_result.is_err() {
+            let _ = ready_sender.send(startup_result.map(|_| ()));
             return;
         }
-    };
+    }
 
     if ready_sender.send(Ok(())).is_err() {
         return;
@@ -1041,9 +1274,29 @@ fn storage_thread(
             StorageCommand::Inspect { reply } => {
                 let _ = reply.send(inspect_state(&mut state));
             }
-            StorageCommand::UpsertText { input, reply } => {
+            StorageCommand::UpsertText {
+                input,
+                now_millis,
+                reply,
+            } => {
+                #[cfg(test)]
+                let fail_cleanup = {
+                    let fail = state.fail_next_cleanup;
+                    state.fail_next_cleanup = false;
+                    fail
+                };
+                #[cfg(not(test))]
+                let fail_cleanup = false;
                 let result = reserve_mutation_revision(&state).and_then(|revision| {
-                    upsert_text(&mut state.connection, input, revision).inspect(|_| {
+                    upsert_text_with_cleanup(
+                        &mut state.connection,
+                        input,
+                        state.cleanup_policy,
+                        now_millis,
+                        revision,
+                        fail_cleanup,
+                    )
+                    .inspect(|_| {
                         // 只有事务已经提交成功，才能公开并安装预留的修订号。
                         state.storage_mutation_revision = revision;
                     })
@@ -1055,6 +1308,42 @@ fn storage_thread(
                     upsert_image(&mut state.connection, input, revision).inspect(|_| {
                         // 图片根注册和历史行在同一事务提交后，才安装可观察修订号。
                         state.storage_mutation_revision = revision;
+                    })
+                });
+                let _ = reply.send(result);
+            }
+            StorageCommand::UpdateCleanupPolicy {
+                policy,
+                now_millis,
+                reply,
+            } => {
+                #[cfg(test)]
+                let fail_cleanup = {
+                    let fail = state.fail_next_cleanup;
+                    state.fail_next_cleanup = false;
+                    fail
+                };
+                #[cfg(not(test))]
+                let fail_cleanup = false;
+                let result = policy.validate().and_then(|policy| {
+                    reserve_mutation_revision(&state).and_then(|revision| {
+                        cleanup_text_history(
+                            &mut state.connection,
+                            policy,
+                            now_millis,
+                            revision,
+                            fail_cleanup,
+                        )
+                        .map(|deleted_count| {
+                            // 只有候选策略清理提交后才安装，失败路径保留旧策略。
+                            state.cleanup_policy = policy;
+                            state.storage_mutation_revision = revision;
+                            CleanupPolicyResult {
+                                policy,
+                                deleted_count,
+                                mutation_revision: revision,
+                            }
+                        })
                     })
                 });
                 let _ = reply.send(result);
@@ -1117,6 +1406,11 @@ fn storage_thread(
                 state.storage_mutation_revision = revision;
                 let _ = reply.send(Ok(()));
             }
+            #[cfg(test)]
+            StorageCommand::TestFailNextCleanup { reply } => {
+                state.fail_next_cleanup = true;
+                let _ = reply.send(Ok(()));
+            }
         }
     }
 }
@@ -1125,6 +1419,7 @@ fn storage_thread(
 fn initialize_connection(
     database_path: &Path,
     connection_thread_id: ThreadId,
+    cleanup_policy: HistoryCleanupPolicy,
 ) -> Result<StorageState, StorageError> {
     if let Some(parent) = database_path.parent() {
         fs::create_dir_all(parent)?;
@@ -1139,6 +1434,9 @@ fn initialize_connection(
         connection_thread_id,
         schema_version,
         storage_mutation_revision: 0,
+        cleanup_policy,
+        #[cfg(test)]
+        fail_next_cleanup: false,
     })
 }
 
@@ -1173,12 +1471,16 @@ fn inspect_state(state: &mut StorageState) -> Result<StorageStatus, StorageError
     })
 }
 
-/// 使用同一 SQLite 事务完成文本历史 upsert，并在提交前读取最终快照。
-fn upsert_text(
+/// 使用同一 SQLite 事务完成文本 upsert、年龄清理、数量清理并读取最终快照。
+fn upsert_text_with_cleanup(
     connection: &mut Connection,
     input: TextUpsertInput,
+    policy: HistoryCleanupPolicy,
+    now_millis: i64,
     mutation_revision: u64,
-) -> Result<TextUpsertResult, StorageError> {
+    fail_after_age: bool,
+) -> Result<TextUpsertCleanupResult, StorageError> {
+    let cutoff = cleanup_cutoff(policy, now_millis)?;
     let TextUpsertInput {
         content_hash,
         text_content,
@@ -1201,6 +1503,8 @@ fn upsert_text(
             copied_at,
         ],
     )?;
+
+    let deleted_count = cleanup_in_transaction(&transaction, policy, cutoff, fail_after_age)?;
 
     let result = transaction.query_row(
         r#"
@@ -1228,7 +1532,80 @@ WHERE content_hash = ?1
     )?;
 
     transaction.commit()?;
-    Ok(result)
+    Ok(TextUpsertCleanupResult {
+        result,
+        deleted_count,
+    })
+}
+
+/// 计算严格年龄截止时间；所有换算必须 checked，避免异常时间扩大清理范围。
+fn cleanup_cutoff(policy: HistoryCleanupPolicy, now_millis: i64) -> Result<i64, StorageError> {
+    let policy = policy.validate()?;
+    let age_millis = i64::from(policy.retention_days)
+        .checked_mul(MILLIS_PER_DAY)
+        .ok_or(StorageError::CleanupTimeOverflow)?;
+    now_millis
+        .checked_sub(age_millis)
+        .ok_or(StorageError::CleanupTimeOverflow)
+}
+
+/// 在调用方已经开启的 SQLite 事务中执行年龄门槛和数量门槛。
+fn cleanup_in_transaction(
+    transaction: &Transaction<'_>,
+    policy: HistoryCleanupPolicy,
+    cutoff: i64,
+    _fail_after_age: bool,
+) -> Result<u64, StorageError> {
+    // 在打开事务前完成策略校验，避免任何无效策略先执行部分删除。
+    let policy = policy.validate()?;
+    let age_deleted = transaction.execute(
+        "DELETE FROM clipboard_items WHERE item_type = 'text' AND is_pinned = 0 AND copied_at < ?1",
+        params![cutoff],
+    )?;
+
+    #[cfg(test)]
+    if _fail_after_age {
+        // 仅测试故障注入：验证年龄删除后数量阶段失败时 upsert 也会回滚。
+        return Err(StorageError::Sqlite(rusqlite::Error::InvalidQuery));
+    }
+
+    let remaining_unpinned: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM clipboard_items WHERE item_type = 'text' AND is_pinned = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    let max_items = i64::from(policy.max_items);
+    let count_deleted = if remaining_unpinned > max_items {
+        let excess = remaining_unpinned - max_items;
+        transaction.execute(
+            "DELETE FROM clipboard_items WHERE id IN (SELECT id FROM clipboard_items WHERE item_type = 'text' AND is_pinned = 0 ORDER BY copied_at ASC, id ASC LIMIT ?1)",
+            params![excess],
+        )?
+    } else {
+        0
+    };
+
+    let age_deleted = u64::try_from(age_deleted).map_err(|_| StorageError::CleanupTimeOverflow)?;
+    let count_deleted =
+        u64::try_from(count_deleted).map_err(|_| StorageError::CleanupTimeOverflow)?;
+    age_deleted
+        .checked_add(count_deleted)
+        .ok_or(StorageError::CleanupTimeOverflow)
+}
+
+/// 在独立事务中执行启动或策略更新清理，并返回实际删除总数。
+fn cleanup_text_history(
+    connection: &mut Connection,
+    policy: HistoryCleanupPolicy,
+    now_millis: i64,
+    _mutation_revision: u64,
+    fail_after_age: bool,
+) -> Result<u64, StorageError> {
+    let cutoff = cleanup_cutoff(policy, now_millis)?;
+    let transaction = connection.transaction()?;
+    let deleted_count = cleanup_in_transaction(&transaction, policy, cutoff, fail_after_age)?;
+    transaction.commit()?;
+    Ok(deleted_count)
 }
 
 /// 在同一 SQLite 事务内更新根注册、图片历史和最终资产采用判定。
@@ -1907,8 +2284,8 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        DeleteHistoryInput, HistoryCursor, HistoryQuery, ImageUpsertInput, SetPinnedInput,
-        StorageExecutor, TextUpsertInput, COMMAND_QUEUE_CAPACITY,
+        DeleteHistoryInput, HistoryCleanupPolicy, HistoryCursor, HistoryQuery, ImageUpsertInput,
+        SetPinnedInput, StorageExecutor, TextUpsertInput, COMMAND_QUEUE_CAPACITY, MILLIS_PER_DAY,
     };
     use crate::{
         domain::{ImageAssetRootId, ImageMetadata},
@@ -4014,6 +4391,353 @@ mod tests {
         assert_eq!(version, 0);
         assert_eq!(index_count, 0);
         drop(connection);
+        remove_directory(&directory);
+    }
+
+    /// 验证启动清理在 ready 前完成，并且零删除启动事务仍占用一个 revision。
+    #[test]
+    fn cleanup_runs_before_ready_and_zero_delete_advances_revision() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        let now_millis = 30 * MILLIS_PER_DAY + 1;
+        {
+            let mut connection = Connection::open(&database_path).expect("创建启动清理数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("迁移启动清理数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('text', '过期正文', '过期预览', ?1, 1, 0, 0, 0)",
+                    params![test_hash(201).as_slice()],
+                )
+                .expect("写入过期启动记录失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('text', '边界正文', '边界预览', ?1, 1, 0, 1, 1)",
+                    params![test_hash(202).as_slice()],
+                )
+                .expect("写入边界启动记录失败");
+        }
+
+        let executor = StorageExecutor::open_at_with_policy(
+            &directory,
+            HistoryCleanupPolicy {
+                max_items: 100_000,
+                retention_days: 30,
+            },
+            now_millis,
+        )
+        .expect("启动清理未在 ready 前完成");
+        assert_eq!(
+            executor
+                .status()
+                .expect("读取启动清理状态失败")
+                .clipboard_item_count,
+            1
+        );
+        let first = executor
+            .upsert_text_with_cleanup_at(
+                text_input(203, "新正文", "新预览", now_millis),
+                now_millis,
+            )
+            .expect("启动后文本写入失败");
+        assert_eq!(first.deleted_count, 0);
+        assert_eq!(first.result.mutation_revision, 2);
+
+        drop(executor);
+        remove_directory(&directory);
+
+        let zero_directory = temporary_directory();
+        let zero_executor = StorageExecutor::open_at_with_policy(
+            &zero_directory,
+            HistoryCleanupPolicy::default(),
+            now_millis,
+        )
+        .expect("零删除启动失败");
+        let zero_first = zero_executor
+            .upsert_text_with_cleanup_at(
+                text_input(204, "零删除后正文", "零删除后预览", now_millis),
+                now_millis,
+            )
+            .expect("零删除启动后的文本写入失败");
+        assert_eq!(zero_first.result.mutation_revision, 2);
+        drop(zero_executor);
+        remove_directory(&zero_directory);
+    }
+
+    /// 验证策略边界包含合法端点，并拒绝零值和超上限值。
+    #[test]
+    fn cleanup_policy_validates_inclusive_bounds() {
+        assert!(HistoryCleanupPolicy {
+            max_items: 1,
+            retention_days: 1,
+        }
+        .validate()
+        .is_ok());
+        assert!(HistoryCleanupPolicy {
+            max_items: 100_000,
+            retention_days: 3_650,
+        }
+        .validate()
+        .is_ok());
+        for policy in [
+            HistoryCleanupPolicy {
+                max_items: 0,
+                retention_days: 30,
+            },
+            HistoryCleanupPolicy {
+                max_items: 100_001,
+                retention_days: 30,
+            },
+            HistoryCleanupPolicy {
+                max_items: 2_000,
+                retention_days: 0,
+            },
+            HistoryCleanupPolicy {
+                max_items: 2_000,
+                retention_days: 3_651,
+            },
+        ] {
+            assert!(matches!(
+                policy.validate(),
+                Err(StorageError::InvalidCleanupPolicy { .. })
+            ));
+        }
+    }
+
+    /// 验证严格 cutoff、数量双门槛和同时间戳的 ID 稳定淘汰顺序。
+    #[test]
+    fn cleanup_uses_strict_cutoff_and_stable_tie_order() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        {
+            let mut connection = Connection::open(&database_path).expect("创建 cutoff 数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("迁移 cutoff 数据库失败");
+            for (hash, copied_at) in [
+                (210_u8, -1_i64),
+                (211, 0),
+                (212, 100),
+                (213, 100),
+                (214, 100),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('text', '正文', '预览', ?1, 1, 0, ?2, ?2)",
+                        params![test_hash(hash).as_slice(), copied_at],
+                    )
+                    .expect("写入 cutoff 夹具失败");
+            }
+        }
+
+        let executor = StorageExecutor::open_at(&directory).expect("启动 cutoff 存储失败");
+        let result = executor
+            .update_cleanup_policy(
+                HistoryCleanupPolicy {
+                    max_items: 2,
+                    retention_days: 1,
+                },
+                MILLIS_PER_DAY,
+            )
+            .expect("执行 cutoff 清理失败");
+        assert_eq!(result.deleted_count, 3);
+        let page = executor
+            .query_history_summaries(HistoryQuery {
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("读取 cutoff 结果失败");
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].content_hash, test_hash(214));
+        assert_eq!(page.items[1].content_hash, test_hash(213));
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证图片（收藏与未收藏）不属于普通文本清理候选集。
+    #[test]
+    fn cleanup_preserves_pinned_and_unpinned_images() {
+        let directory = temporary_directory();
+        let root = directory.join("image-root");
+        let executor = StorageExecutor::open_at(&directory).expect("启动图片保护存储失败");
+        let pinned = executor
+            .upsert_image(image_input(220, 221, root.clone(), 10))
+            .expect("写入收藏图片前置记录失败");
+        let unpinned = executor
+            .upsert_image(image_input(222, 223, root.join("second"), 20))
+            .expect("写入未收藏图片前置记录失败");
+        executor
+            .set_history_pinned(SetPinnedInput {
+                id: pinned.id,
+                content_hash: *pinned.metadata.content_hash(),
+                is_pinned: true,
+            })
+            .expect("收藏图片失败");
+
+        let result = executor
+            .update_cleanup_policy(
+                HistoryCleanupPolicy {
+                    max_items: 1,
+                    retention_days: 1,
+                },
+                MILLIS_PER_DAY * 2,
+            )
+            .expect("图片保护清理失败");
+        assert_eq!(result.deleted_count, 0);
+        let page = executor
+            .query_history_summaries(HistoryQuery {
+                item_type: Some("image".to_owned()),
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("读取图片保护结果失败");
+        assert_eq!(page.items.len(), 2);
+        assert!(page
+            .items
+            .iter()
+            .any(|item| item.id == pinned.id && item.is_pinned));
+        assert!(page
+            .items
+            .iter()
+            .any(|item| item.id == unpinned.id && !item.is_pinned));
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证 SQL 中途失败时 upsert 和已经执行的年龄删除一起回滚。
+    #[test]
+    fn upsert_cleanup_failure_rolls_back_both_mutations() {
+        let directory = temporary_directory();
+        let database_path = directory.join("clipboard.db");
+        {
+            let mut connection = Connection::open(&database_path).expect("创建回滚数据库失败");
+            crate::storage::migration::migrate(&mut connection).expect("迁移回滚数据库失败");
+            connection
+                .execute(
+                    "INSERT INTO clipboard_items (item_type, text_content, preview_text, content_hash, copy_count, is_pinned, created_at, copied_at) VALUES ('text', '旧正文', '旧预览', ?1, 1, 0, 0, 0)",
+                    params![test_hash(230).as_slice()],
+                )
+                .expect("写入回滚旧记录失败");
+        }
+        let executor = StorageExecutor::open_at(&directory).expect("启动回滚存储失败");
+        executor
+            .client()
+            .test_fail_next_cleanup()
+            .expect("设置清理故障失败");
+        let error = executor
+            .upsert_text_with_cleanup_at(
+                text_input(231, "新正文", "新预览", MILLIS_PER_DAY * 31),
+                MILLIS_PER_DAY * 31,
+            )
+            .expect_err("故障注入未使事务失败");
+        assert!(matches!(error, StorageError::Sqlite(_)));
+        let page = executor
+            .query_history_summaries(HistoryQuery {
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("读取回滚结果失败");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].content_hash, test_hash(230));
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证 cutoff 算术溢出在 ready 前失败，不创建可用执行器。
+    #[test]
+    fn startup_cleanup_rejects_cutoff_overflow() {
+        let directory = temporary_directory();
+        let result = StorageExecutor::open_at_with_policy(
+            &directory,
+            HistoryCleanupPolicy::default(),
+            i64::MIN,
+        );
+        assert!(matches!(result, Err(StorageError::CleanupTimeOverflow)));
+        remove_directory(&directory);
+    }
+
+    /// 验证策略清理失败时旧策略保留，后续文本 upsert 仍按旧上限收敛。
+    #[test]
+    fn failed_policy_update_does_not_install_candidate() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动策略失败回滚存储失败");
+        assert!(matches!(
+            executor.update_cleanup_policy(
+                HistoryCleanupPolicy {
+                    max_items: 0,
+                    retention_days: 30,
+                },
+                1,
+            ),
+            Err(StorageError::InvalidCleanupPolicy { .. })
+        ));
+        let first = executor
+            .upsert_text_with_cleanup_at(text_input(240, "一", "一", 1), 1)
+            .expect("旧策略第一次写入失败");
+        let second = executor
+            .upsert_text_with_cleanup_at(text_input(241, "二", "二", 2), 2)
+            .expect("旧策略第二次写入失败");
+        assert_eq!(first.deleted_count, 0);
+        assert_eq!(second.deleted_count, 0);
+
+        executor
+            .client()
+            .test_fail_next_cleanup()
+            .expect("设置策略清理故障失败");
+        let error = executor
+            .update_cleanup_policy(
+                HistoryCleanupPolicy {
+                    max_items: 1,
+                    retention_days: 1,
+                },
+                3,
+            )
+            .expect_err("有效候选策略的清理故障未传播");
+        assert!(matches!(error, StorageError::Sqlite(_)));
+        let third = executor
+            .upsert_text_with_cleanup_at(text_input(242, "三", "三", 3), 3)
+            .expect("候选策略失败后旧策略第三次写入失败");
+        assert_eq!(third.deleted_count, 0);
+
+        drop(executor);
+        remove_directory(&directory);
+    }
+
+    /// 验证策略清理在 revision 耗尽时先失败，不执行候选策略对应的删除 SQL。
+    #[test]
+    fn cleanup_policy_rejects_revision_exhaustion_before_sql() {
+        let directory = temporary_directory();
+        let executor = StorageExecutor::open_at(&directory).expect("启动 revision 清理存储失败");
+        executor
+            .upsert_text_with_cleanup_at(text_input(250, "一", "一", 1), 1)
+            .expect("写入 revision 清理前置记录失败");
+        executor
+            .upsert_text_with_cleanup_at(text_input(251, "二", "二", 2), 2)
+            .expect("写入 revision 清理第二条记录失败");
+        executor
+            .client()
+            .test_set_mutation_revision(u64::MAX)
+            .expect("设置 revision 耗尽夹具失败");
+
+        let error = executor
+            .update_cleanup_policy(
+                HistoryCleanupPolicy {
+                    max_items: 1,
+                    retention_days: 1,
+                },
+                3,
+            )
+            .expect_err("revision 耗尽未阻止策略清理");
+        assert!(matches!(error, StorageError::MutationRevisionExhausted));
+        let page = executor
+            .query_history_summaries(HistoryQuery {
+                limit: 10,
+                ..HistoryQuery::default()
+            })
+            .expect("读取 revision 清理结果失败");
+        assert_eq!(page.items.len(), 2);
+
+        drop(executor);
         remove_directory(&directory);
     }
 }

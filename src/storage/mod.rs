@@ -9,10 +9,11 @@ mod migration;
 mod worker;
 
 pub use worker::{
-    ClearAllHistoryResult, ClearUnpinnedTextResult, DeleteHistoryInput, DeleteHistoryResult,
-    HistoryCursor, HistoryImageSummary, HistoryPage, HistoryPayload, HistoryQuery, HistorySummary,
-    ImageUpsertInput, ImageUpsertResult, SetPinnedInput, SetPinnedResult, StorageClient,
-    StorageExecutor, StorageStatus, TextUpsertInput, TextUpsertResult,
+    CleanupPolicyResult, ClearAllHistoryResult, ClearUnpinnedTextResult, DeleteHistoryInput,
+    DeleteHistoryResult, HistoryCleanupPolicy, HistoryCursor, HistoryImageSummary, HistoryPage,
+    HistoryPayload, HistoryQuery, HistorySummary, ImageUpsertInput, ImageUpsertResult,
+    SetPinnedInput, SetPinnedResult, StorageClient, StorageExecutor, StorageStatus,
+    TextUpsertCleanupResult, TextUpsertInput, TextUpsertResult,
 };
 
 /// 存储层可能向应用层传播的初始化、迁移和线程生命周期错误。
@@ -75,6 +76,15 @@ pub enum StorageError {
     },
     /// 进程内存储操作修订号已经耗尽；必须在执行 SQL 前拒绝以避免顺序身份回绕。
     MutationRevisionExhausted,
+    /// 历史清理策略超出允许范围；错误只包含无敏感的数值边界信息。
+    InvalidCleanupPolicy {
+        /// 调用方提交的普通文本数量上限。
+        max_items: u32,
+        /// 调用方提交的保留天数。
+        retention_days: u32,
+    },
+    /// 清理参考时间或保留天数换算发生有符号整数溢出。
+    CleanupTimeOverflow,
     /// 存储线程发生未预期的 panic，无法安全继续使用连接。
     WorkerPanicked,
 }
@@ -115,6 +125,14 @@ impl fmt::Display for StorageError {
                 write!(formatter, "历史记录 {id} 删除影响行数异常：{affected}")
             }
             Self::MutationRevisionExhausted => write!(formatter, "存储操作修订号已经耗尽"),
+            Self::InvalidCleanupPolicy {
+                max_items,
+                retention_days,
+            } => write!(
+                formatter,
+                "历史清理策略无效：数量上限 {max_items}、保留天数 {retention_days}"
+            ),
+            Self::CleanupTimeOverflow => write!(formatter, "历史清理截止时间计算溢出"),
             Self::WorkerPanicked => write!(formatter, "存储线程异常退出"),
         }
     }

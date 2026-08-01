@@ -187,6 +187,30 @@ pub fn run_clipboard_pump<F>(
     storage: StorageClient,
     write_expectations: ClipboardWriteExpectationStore,
     image_context: Option<ImageCaptureContext>,
+    emit: F,
+) where
+    F: FnMut(UiEvent) -> bool,
+{
+    run_clipboard_pump_with_source_policy(
+        inbox,
+        storage,
+        write_expectations,
+        image_context,
+        true,
+        emit,
+    );
+}
+
+/// 按启动时固定策略消费捕获；文本和图片在同一分派点共用来源脱敏规则。
+///
+/// `capture_source_app=false` 只影响历史/UI 结果，不影响 worker 读取前使用请求级
+/// `ProcessSourceSnapshot` 做排除判断；运行中设置切换由后续设置原子负责。
+pub fn run_clipboard_pump_with_source_policy<F>(
+    inbox: ClipboardCaptureInbox,
+    storage: StorageClient,
+    write_expectations: ClipboardWriteExpectationStore,
+    image_context: Option<ImageCaptureContext>,
+    capture_source_app: bool,
     mut emit: F,
 ) where
     F: FnMut(UiEvent) -> bool,
@@ -206,12 +230,15 @@ pub fn run_clipboard_pump<F>(
                     continue;
                 };
                 let copied_at = unix_millis_now();
+                // 来源字段在文本/图片分派前统一清空，避免某一类型绕过静态隐私策略。
+                let capture = apply_capture_source_policy(capture, capture_source_app);
+                let source = capture.source.clone();
                 let result = match capture.payload {
                     ClipboardCapturePayload::Text(payload) => process_capture(
                         &storage,
                         ClipboardCaptureResult {
                             sequence: capture.sequence,
-                            source: capture.source,
+                            source: source.clone(),
                             payload: ClipboardCapturePayload::Text(payload),
                         },
                         copied_at,
@@ -229,7 +256,7 @@ pub fn run_clipboard_pump<F>(
                             process_image_capture(
                                 &storage,
                                 context,
-                                capture.source,
+                                source,
                                 image,
                                 copied_at,
                                 |event| ui_open && emit(event),
@@ -256,6 +283,17 @@ pub fn run_clipboard_pump<F>(
             }
         }
     }
+}
+
+/// 应用启动时固定的来源字段策略；payload 类型不会改变该脱敏结果。
+fn apply_capture_source_policy(
+    mut capture: ClipboardCaptureResult,
+    capture_source_app: bool,
+) -> ClipboardCaptureResult {
+    if !capture_source_app {
+        capture.source = None;
+    }
+    capture
 }
 
 /// 仅对存在精确 DIBV5 候选的事件解码哈希，并在三元组匹配时一次性抑制自身写回。
@@ -499,9 +537,10 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        process_capture, process_capture_with_upsert, process_copy_payload, process_image_capture,
-        process_typed_copy_payload, run_clipboard_pump, suppress_self_image_capture,
-        CaptureProcessError, CaptureProcessOutcome, CopyProcessError, ImageCaptureContext,
+        apply_capture_source_policy, process_capture, process_capture_with_upsert,
+        process_copy_payload, process_image_capture, process_typed_copy_payload,
+        run_clipboard_pump, suppress_self_image_capture, CaptureProcessError,
+        CaptureProcessOutcome, CopyProcessError, ImageCaptureContext,
     };
     use crate::{
         clipboard::{
@@ -538,6 +577,35 @@ mod tests {
             }),
             payload: ClipboardPayload::from_text(text).into(),
         }
+    }
+
+    /// 静态来源策略必须同时覆盖文本和图片，关闭时只保留 payload 不保留来源字段。
+    #[test]
+    fn 来源静态脱敏同时覆盖文本和图片() {
+        let text = apply_capture_source_policy(capture(1, "正文"), false);
+        assert!(text.source.is_none());
+
+        let image = apply_capture_source_policy(
+            ClipboardCaptureResult {
+                sequence: 2,
+                source: capture(2, "占位").source,
+                payload: ClipboardCapturePayload::Image(ClipboardImageBytes::RegisteredPng(vec![
+                    1, 2, 3,
+                ])),
+            },
+            false,
+        );
+        assert!(image.source.is_none());
+        assert!(matches!(image.payload, ClipboardCapturePayload::Image(_)));
+
+        let retained = apply_capture_source_policy(capture(3, "保留来源"), true);
+        assert_eq!(
+            retained
+                .source
+                .as_ref()
+                .map(|source| source.executable.as_str()),
+            Some("editor.exe")
+        );
     }
 
     /// 构造一张 1×1、顶向下 BGRA 的最小合法 DIBV5，供真实解码抑制接缝使用。

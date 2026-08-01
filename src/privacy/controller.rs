@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use super::pause::{restore_pause, GateMode, PauseClock, PauseTimeError, RecordingGate};
+use super::pause::{
+    restore_pause, ExcludedAppsSnapshot, GateMode, PauseClock, PauseTimeError, RecordingGate,
+};
 use crate::settings::{
     AppSettings, RecordingPause, SettingsClient, SettingsError, SettingsSnapshot, SettingsWorker,
 };
@@ -182,6 +184,8 @@ pub enum PauseControllerError {
     RpcUnavailable,
     /// controller 线程 panic。
     ThreadPanicked,
+    /// 启动配置中的排除规则无法构造成运行时快照。
+    InvalidExcludedApps,
 }
 
 impl std::fmt::Display for PauseControllerError {
@@ -191,6 +195,7 @@ impl std::fmt::Display for PauseControllerError {
             Self::Time(_) => write!(formatter, "暂停时间无法安全表示"),
             Self::RpcUnavailable => write!(formatter, "配置 RPC 不可用"),
             Self::ThreadPanicked => write!(formatter, "暂停控制器线程异常退出"),
+            Self::InvalidExcludedApps => write!(formatter, "排除程序配置无效"),
         }
     }
 }
@@ -321,7 +326,10 @@ impl PrivacyRuntimeOwner {
         let (mode, deadline) =
             restore_pause(&initial.settings().privacy.recording_pause, clock.as_ref())
                 .map_err(PauseControllerError::Time)?;
-        let gate = RecordingGate::new(mode);
+        let excluded_apps =
+            ExcludedAppsSnapshot::from_rules(&initial.settings().privacy.excluded_apps)
+                .map_err(|_| PauseControllerError::InvalidExcludedApps)?;
+        let gate = RecordingGate::new_with_excluded_apps(mode, excluded_apps);
         let status = Arc::new(AtomicU8::new(status_for_pause(
             &initial.settings().privacy.recording_pause,
             mode,

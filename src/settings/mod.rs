@@ -8,6 +8,9 @@ mod persistence;
 mod windows_replace;
 mod worker;
 
+pub(crate) use model::{
+    normalize_excluded_app_rule, normalize_process_image_path, MAX_EXCLUDED_APPS,
+};
 pub use model::{
     AppSettings, HistorySettings, PrivacySettings, RecordingPause, SettingsLoadSource,
     SettingsSnapshot,

@@ -19,7 +19,7 @@ use clipboard_board::command::UiEvent;
 #[cfg(windows)]
 use clipboard_board::diagnostics::{self, DiagnosticEvent, ThreadState};
 #[cfg(windows)]
-use clipboard_board::history_bridge::{run_clipboard_pump, ImageCaptureContext};
+use clipboard_board::history_bridge::{run_clipboard_pump_with_source_policy, ImageCaptureContext};
 #[cfg(windows)]
 use clipboard_board::history_mutation::{
     clear_history_mutation_channel, delete_mutation_channel, pin_mutation_channel,
@@ -240,6 +240,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("SettingsWorker 已放入清理槽")
         .client()
         .snapshot()?;
+    // 来源记录策略在启动时冻结；运行中不让结果泵同步读取配置文件。
+    let capture_source_app = initial_settings.settings().history.capture_source_app;
     let settings = cleanup
         .settings
         .take()
@@ -290,6 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_client.clone(),
         write_expectations,
         image_context,
+        capture_source_app,
     )?;
     cleanup.capture_pump = Some(capture_pump);
     let (history_requests, history_request_receiver) = history_request_channel();
@@ -357,15 +360,17 @@ fn start_clipboard_pump(
     storage: StorageClient,
     write_expectations: ClipboardWriteExpectationStore,
     image_context: ImageCaptureContext,
+    capture_source_app: bool,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("clipboard-board-capture-pump".to_owned())
         .spawn(move || {
-            run_clipboard_pump(
+            run_clipboard_pump_with_source_policy(
                 inbox,
                 storage,
                 write_expectations,
                 Some(image_context),
+                capture_source_app,
                 |event| post_ui_event(event).is_ok(),
             );
         })

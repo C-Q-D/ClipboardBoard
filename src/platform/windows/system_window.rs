@@ -310,8 +310,8 @@ fn is_clipboard_update_message(message: u32) -> bool {
 /// 在消息线程捕获 sequence/来源快照，并把正文读取交给容量为一的 worker 队列。
 fn enqueue_clipboard_capture() {
     let sequence = unsafe { GetClipboardSequenceNumber() };
-    let source = super::source::capture_foreground_source();
-    let request = ClipboardCaptureRequest::new(sequence, source);
+    let source = super::source::capture_foreground_source_snapshot();
+    let request = ClipboardCaptureRequest::new_with_snapshot(sequence, source);
 
     CLIPBOARD_WORKER.with(|slot| {
         let worker_slot = slot.borrow();

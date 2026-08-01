@@ -306,6 +306,7 @@ fn validation_error(field: ValidationField) -> SettingsError {
         ValidationField::MaxItems => "history.max_items",
         ValidationField::RetentionDays => "history.retention_days",
         ValidationField::ImageQuotaMib => "history.image_quota_mib",
+        ValidationField::ExcludedApps => "privacy.excluded_apps",
     })
 }
 

@@ -15,7 +15,7 @@ use super::reader::{
 };
 use super::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
 use crate::domain::ClipboardPayload;
-use crate::platform::windows::ProcessSource;
+use crate::platform::windows::{ProcessSource, ProcessSourceSnapshot};
 use crate::privacy::{GateMode, RecordingGate};
 
 /// worker 请求的有限错误集合，不携带线程 panic 文本或外部字符串。
@@ -30,17 +30,33 @@ pub enum ClipboardWorkerError {
 }
 
 /// 消息线程提交给 worker 的一次剪贴板捕获请求。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClipboardCaptureRequest {
     /// `WM_CLIPBOARDUPDATE` 到达时观察到的剪贴板序号。
     pub sequence: u32,
     /// 消息线程同步捕获的来源进程快照；失败时为空，不阻塞正文读取。
-    pub source: Option<ProcessSource>,
+    pub source: Option<ProcessSourceSnapshot>,
+}
+
+impl std::fmt::Debug for ClipboardCaptureRequest {
+    /// 只输出序号和来源存在性，不能把路径或来源名称写入诊断。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClipboardCaptureRequest")
+            .field("sequence", &self.sequence)
+            .field("source_present", &self.source.is_some())
+            .finish()
+    }
 }
 
 impl ClipboardCaptureRequest {
     /// 创建带来源快照的捕获请求；正文不会在消息线程读取或复制。
     pub fn new(sequence: u32, source: Option<ProcessSource>) -> Self {
+        Self::new_with_snapshot(sequence, source.map(ProcessSourceSnapshot::from))
+    }
+
+    /// 创建带完整请求级来源快照的捕获请求。
+    pub fn new_with_snapshot(sequence: u32, source: Option<ProcessSourceSnapshot>) -> Self {
         Self { sequence, source }
     }
 }
@@ -340,7 +356,7 @@ enum ReadResponse {
         /// 与读取前后 sequence 复核绑定的提交序号。
         sequence: u32,
         /// 消息线程在同一更新消息中捕获的来源快照。
-        source: Option<ProcessSource>,
+        source: Option<ProcessSourceSnapshot>,
     },
 }
 
@@ -594,7 +610,7 @@ fn capture_with_factory<B, F>(
     gate: &RecordingGate,
     expected_sequence: Option<u32>,
     sequence: u32,
-    source: Option<ProcessSource>,
+    source: Option<ProcessSourceSnapshot>,
     inbox: &ClipboardCaptureInbox,
     expectations: &ClipboardWriteExpectationStore,
     factory: F,
@@ -603,13 +619,13 @@ where
     B: super::reader::ClipboardBackend,
     F: FnOnce() -> B,
 {
-    let _permit = gate.try_read()?;
+    let _permit = gate.try_read_for_snapshot(source.as_ref())?;
     let mut backend = factory();
     let result =
         read_capture_payload_with_backend(&mut backend, expected_sequence, RetryPolicy::default());
     let capture_result = result.map(|payload| ClipboardCaptureResult {
         sequence,
-        source,
+        source: source.as_ref().map(ProcessSourceSnapshot::result_source),
         payload,
     });
     if should_publish_capture(&capture_result, expectations) {
@@ -648,7 +664,8 @@ mod tests {
     use crate::clipboard::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
     use crate::clipboard::{ClipboardCapturePayload, ClipboardImageBytes};
     use crate::domain::ClipboardPayload;
-    use crate::privacy::{GateMode, RecordingGate};
+    use crate::platform::windows::{ProcessSource, ProcessSourceSnapshot};
+    use crate::privacy::{ExcludedAppsSnapshot, GateMode, RecordingGate};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
@@ -715,11 +732,13 @@ mod tests {
                 response: ReadResponse::Capture {
                     response: first_sender,
                     sequence: 10,
-                    source: Some(crate::platform::windows::ProcessSource {
-                        executable: "a.exe".to_owned(),
-                        display_name: "a".to_owned(),
-                        process_id: 10,
-                    }),
+                    source: Some(crate::platform::windows::ProcessSourceSnapshot::from(
+                        crate::platform::windows::ProcessSource {
+                            executable: "a.exe".to_owned(),
+                            display_name: "a".to_owned(),
+                            process_id: 10,
+                        },
+                    )),
                 },
             })
             .expect("A 请求应进入队列");
@@ -729,11 +748,13 @@ mod tests {
                 response: ReadResponse::Capture {
                     response: second_sender,
                     sequence: 11,
-                    source: Some(crate::platform::windows::ProcessSource {
-                        executable: "b.exe".to_owned(),
-                        display_name: "b".to_owned(),
-                        process_id: 11,
-                    }),
+                    source: Some(crate::platform::windows::ProcessSourceSnapshot::from(
+                        crate::platform::windows::ProcessSource {
+                            executable: "b.exe".to_owned(),
+                            display_name: "b".to_owned(),
+                            process_id: 11,
+                        },
+                    )),
                 },
             })
             .expect("B 请求应替换 A");
@@ -744,7 +765,7 @@ mod tests {
                 sequence, source, ..
             } => {
                 assert_eq!(sequence, 11);
-                assert_eq!(source.expect("B 应有来源").executable, "b.exe");
+                assert_eq!(source.expect("B 应有来源").source.executable, "b.exe");
             }
             ReadResponse::Payload(_) => panic!("捕获请求不能降级为无来源响应"),
         }
@@ -1056,5 +1077,38 @@ mod tests {
             }
             assert!(inbox.try_take().is_some());
         }
+    }
+
+    /// 排除来源在 factory 前同时拒绝文本和图片，不能触碰 backend 或结果 inbox。
+    #[test]
+    fn 排除来源在factory之前拒绝文本和图片() {
+        let excluded = ExcludedAppsSnapshot::from_rules(&["secret.exe".to_owned()]).unwrap();
+        let gate = RecordingGate::new_with_excluded_apps(GateMode::Active, excluded);
+        let inbox = ClipboardCaptureInbox::new();
+        let expectations = ClipboardWriteExpectationStore::new();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        for image in [false, true] {
+            let calls = Arc::clone(&factory_calls);
+            let source = ProcessSourceSnapshot::from(ProcessSource {
+                executable: "secret.exe".to_owned(),
+                display_name: "敏感来源".to_owned(),
+                process_id: 11,
+            });
+            let result = capture_with_factory(
+                &gate,
+                Some(45),
+                45,
+                Some(source),
+                &inbox,
+                &expectations,
+                move || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    FakeCaptureBackend { image }
+                },
+            );
+            assert_eq!(result, Err(ClipboardReadError::ExcludedApp));
+        }
+        assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+        assert!(inbox.try_take().is_none());
     }
 }

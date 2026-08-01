@@ -57,6 +57,8 @@ impl Default for RetryPolicy {
 pub enum ClipboardReadError {
     /// 记录门禁已暂停；调用方不得构造 backend 或读取正文。
     Paused,
+    /// 当前事件来源命中排除程序规则；不得构造 backend 或读取正文。
+    ExcludedApp,
     /// 在总预算内始终无法取得剪贴板所有权。
     OpenTimeout,
     /// 打开前或读取后 sequence 与预期不一致，结果必须丢弃。

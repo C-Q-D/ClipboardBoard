@@ -8,6 +8,6 @@ pub use controller::{
     SettingsClientRpcAdapter, SettingsRpcPort,
 };
 pub use pause::{
-    restore_pause, GateMode, PauseClock, PauseTimeError, RecordingGate, RecordingReadPermit,
-    SystemPauseClock,
+    restore_pause, ExcludedAppsError, ExcludedAppsSnapshot, GateMode, GateUpdate, PauseClock,
+    PauseTimeError, RecordingGate, RecordingReadPermit, SystemPauseClock,
 };

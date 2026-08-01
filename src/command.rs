@@ -556,6 +556,16 @@ pub enum UiEvent {
     ShowPanel,
     /// 请求 UI 线程退出事件循环；退出只允许由 UI 线程触发，便于统一清理后台线程。
     Quit,
+    /// 开机启动命令完成后的稳定状态反馈；只携带枚举，不携带路径或原始错误。
+    #[cfg(windows)]
+    StartupStatus {
+        /// 启动设置 owner 分配的单调事务身份，用于拒绝迟到回执。
+        transaction_id: std::num::NonZeroU64,
+        /// 命令代次，用于拒绝旧会话回执。
+        generation: u64,
+        /// 不含路径和底层错误正文的稳定结果。
+        kind: crate::platform::windows::startup::StartupResultKind,
+    },
     /// 请求 UI 线程关闭指定一次打开操作对应的临时看板。
     ///
     /// 事件携带打开代次，避免旧的 Esc 或失焦事件误关闭后来重新打开的面板。

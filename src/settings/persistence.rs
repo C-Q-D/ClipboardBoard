@@ -573,6 +573,23 @@ mod tests {
         assert_eq!(merged["hotkey"]["future_hotkey_field"]["keep"], true);
     }
 
+    /// startup 下的未知字段必须与顶层/history/privacy 一样递归保留。
+    #[test]
+    fn startup_unknown_fields_survive_known_field_merge() {
+        let old = serde_json::json!({
+            "schema_version": 1,
+            "startup": {
+                "run_on_login": false,
+                "future_startup": {"keep": ["值"]}
+            }
+        });
+        let mut settings = AppSettings::default();
+        settings.startup.run_on_login = true;
+        let merged = merge_known_settings(&old, &settings);
+        assert_eq!(merged["startup"]["run_on_login"], true);
+        assert_eq!(merged["startup"]["future_startup"]["keep"][0], "值");
+    }
+
     /// staging token 连续碰撞只重试固定次数，且不删除碰撞文件。
     #[test]
     fn staging_collision_has_bounded_retries_and_preserves_foreign_file() {

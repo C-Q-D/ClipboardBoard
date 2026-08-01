@@ -6,6 +6,7 @@
 use super::hotkey::{
     global_hotkey_request_handle, HotkeyError, HotkeyRequestHandle, HotkeyTransactionStatus,
 };
+use super::startup::{StartupCommandSender, StartupResult};
 use crate::app::post_ui_event;
 use crate::command::UiEvent;
 use crate::privacy::{PauseCommand, PauseCommandSender, PauseStatus};
@@ -15,6 +16,8 @@ use crate::settings::{
 };
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
+use std::sync::mpsc::Receiver;
+use std::thread;
 
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HWND, POINT};
 use windows_sys::Win32::UI::Shell::{
@@ -56,6 +59,12 @@ const TRAY_MENU_HOTKEY_CTRL_SHIFT_V: usize = 0x500A;
 const TRAY_MENU_HOTKEY_WIN_SHIFT_V: usize = 0x500B;
 /// 预置快捷键：Ctrl+Alt+C。
 const TRAY_MENU_HOTKEY_CTRL_ALT_C: usize = 0x500C;
+/// 启用当前用户登录启动命令。
+const TRAY_MENU_STARTUP_ENABLE: usize = 0x500D;
+/// 禁用当前用户登录启动命令。
+const TRAY_MENU_STARTUP_DISABLE: usize = 0x500E;
+/// 查询/重试当前用户登录启动状态。
+const TRAY_MENU_STARTUP_RETRY: usize = 0x500F;
 
 /// 托盘菜单返回的纯动作，不携带 HWND 或配置客户端。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +73,15 @@ enum TrayAction {
     Exit,
     Pause(PauseCommand),
     Hotkey(HotkeySettings),
+    Startup(StartupAction),
+}
+
+/// 启动设置托盘动作；动作只携带值类型，不携带 registry/settings 句柄。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupAction {
+    Enable,
+    Disable,
+    Retry,
 }
 
 /// 持有托盘通知数据直到消息线程退出，确保图标生命周期覆盖整个消息泵。
@@ -168,12 +186,15 @@ pub(crate) fn handle_callback(
     _wparam: usize,
     lparam: isize,
     pause: &PauseCommandSender,
+    startup: &StartupCommandSender,
 ) -> bool {
     let Some(_) = decode_v4_callback(lparam) else {
         return false;
     };
 
-    if let Err(error) = show_menu(window, pause).and_then(|action| dispatch_action(action, pause)) {
+    if let Err(error) =
+        show_menu(window, pause).and_then(|action| dispatch_action(action, pause, startup))
+    {
         eprintln!("显示托盘菜单失败：{error}");
     }
     true
@@ -262,6 +283,7 @@ fn show_menu(window: HWND, pause: &PauseCommandSender) -> Result<Option<TrayActi
 fn dispatch_action(
     action: Option<TrayAction>,
     pause: &PauseCommandSender,
+    startup: &StartupCommandSender,
 ) -> Result<(), HotkeyError> {
     match action {
         Some(TrayAction::Open) => post_ui_event(UiEvent::ShowPanel)
@@ -275,8 +297,39 @@ fn dispatch_action(
             .ok_or_else(|| HotkeyError::Tray("快捷键设置入口尚未就绪".to_owned()))?
             .request(settings)
             .map_err(|error| HotkeyError::Tray(error.to_string())),
+        Some(TrayAction::Startup(StartupAction::Enable)) => startup
+            .try_enable(0)
+            .map(forward_startup_result)
+            .map_err(|error| HotkeyError::Tray(error.to_string()))?,
+        Some(TrayAction::Startup(StartupAction::Disable)) => startup
+            .try_disable(0)
+            .map(forward_startup_result)
+            .map_err(|error| HotkeyError::Tray(error.to_string()))?,
+        Some(TrayAction::Startup(StartupAction::Retry)) => startup
+            .try_retry()
+            .map(forward_startup_result)
+            .map_err(|error| HotkeyError::Tray(error.to_string()))?,
         None => Ok(()),
     }
+}
+
+/// 在独立线程等待 owner 回执，再把不含路径/原始错误的稳定枚举交给 UI。
+fn forward_startup_result(receiver: Receiver<StartupResult>) -> Result<(), HotkeyError> {
+    thread::Builder::new()
+        .name("clipboard-board-startup-ui-feedback".to_owned())
+        .spawn(move || {
+            if let Ok(result) = receiver.recv() {
+                if let Err(error) = post_ui_event(UiEvent::StartupStatus {
+                    transaction_id: result.transaction_id,
+                    generation: result.generation,
+                    kind: result.kind,
+                }) {
+                    eprintln!("投递开机启动状态到 UI 失败：{error}");
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| HotkeyError::Tray(format!("启动开机启动反馈线程失败：{error}")))
 }
 
 /// 固定菜单 ID 到业务动作的纯映射。
@@ -304,6 +357,9 @@ fn action_for_command(command: usize) -> Option<TrayAction> {
             modifiers: HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT | HOTKEY_MOD_NOREPEAT,
             virtual_key: 0x43,
         })),
+        TRAY_MENU_STARTUP_ENABLE => Some(TrayAction::Startup(StartupAction::Enable)),
+        TRAY_MENU_STARTUP_DISABLE => Some(TrayAction::Startup(StartupAction::Disable)),
+        TRAY_MENU_STARTUP_RETRY => Some(TrayAction::Startup(StartupAction::Retry)),
         _ => None,
     }
 }
@@ -396,6 +452,28 @@ fn append_menu_items(
     ] {
         if unsafe { AppendMenuW(menu, hotkey_flags, id, label) } == 0 {
             return Err(last_error("AppendMenuW(快捷键预置)"));
+        }
+    }
+    if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
+        return Err(last_error("AppendMenuW(分隔线)"));
+    }
+
+    for (id, label) in [
+        (
+            TRAY_MENU_STARTUP_ENABLE,
+            windows_sys::core::w!("登录时启动 ClipboardBoard"),
+        ),
+        (
+            TRAY_MENU_STARTUP_DISABLE,
+            windows_sys::core::w!("取消登录时启动 ClipboardBoard"),
+        ),
+        (
+            TRAY_MENU_STARTUP_RETRY,
+            windows_sys::core::w!("重试/查询开机启动状态"),
+        ),
+    ] {
+        if unsafe { AppendMenuW(menu, MF_STRING, id, label) } == 0 {
+            return Err(last_error("AppendMenuW(开机启动命令)"));
         }
     }
     if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
@@ -537,13 +615,16 @@ mod tests {
 
     use super::{
         action_for_command, decode_v4_callback, hotkey_action_flags, is_supported_mouse_message,
-        pause_action_flags, status_menu_label, TrayAction, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID,
-        TRAY_MENU_EXIT, TRAY_MENU_HOTKEY_ALT_V, TRAY_MENU_HOTKEY_CTRL_ALT_C,
+        pause_action_flags, status_menu_label, StartupAction, TrayAction, TRAY_CALLBACK_MESSAGE,
+        TRAY_ICON_ID, TRAY_MENU_EXIT, TRAY_MENU_HOTKEY_ALT_V, TRAY_MENU_HOTKEY_CTRL_ALT_C,
         TRAY_MENU_HOTKEY_CTRL_SHIFT_V, TRAY_MENU_HOTKEY_WIN_SHIFT_V, TRAY_MENU_OPEN,
         TRAY_MENU_PAUSE_FIVE, TRAY_MENU_PAUSE_INDEFINITE, TRAY_MENU_PAUSE_THIRTY, TRAY_MENU_RESUME,
+        TRAY_MENU_STARTUP_DISABLE, TRAY_MENU_STARTUP_ENABLE, TRAY_MENU_STARTUP_RETRY,
         TRAY_MENU_STATUS,
     };
+    use crate::command::UiEvent;
     use crate::platform::windows::hotkey::HotkeyTransactionStatus;
+    use crate::platform::windows::startup::StartupResultKind;
     use crate::privacy::{PauseCommand, PauseStatus};
     use crate::settings::HotkeySettings;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -628,6 +709,18 @@ mod tests {
                 ..
             }))
         ));
+        assert_eq!(
+            action_for_command(TRAY_MENU_STARTUP_ENABLE),
+            Some(TrayAction::Startup(StartupAction::Enable))
+        );
+        assert_eq!(
+            action_for_command(TRAY_MENU_STARTUP_DISABLE),
+            Some(TrayAction::Startup(StartupAction::Disable))
+        );
+        assert_eq!(
+            action_for_command(TRAY_MENU_STARTUP_RETRY),
+            Some(TrayAction::Startup(StartupAction::Retry))
+        );
         assert_eq!(action_for_command(0xffff), None);
     }
 
@@ -663,5 +756,23 @@ mod tests {
         );
         assert_eq!(pause_action_flags(PauseStatus::Reconciling), MF_STRING);
         assert_eq!(pause_action_flags(PauseStatus::PausedIndefinite), MF_STRING);
+    }
+
+    /// 启动 owner 回执必须转换为不含路径/原始错误的稳定 UI 事件。
+    #[test]
+    fn 开机启动回执映射为稳定状态事件() {
+        let event = UiEvent::StartupStatus {
+            transaction_id: std::num::NonZeroU64::new(7).unwrap(),
+            generation: 2,
+            kind: StartupResultKind::ReconcileRequired,
+        };
+        assert_eq!(
+            event,
+            UiEvent::StartupStatus {
+                transaction_id: std::num::NonZeroU64::new(7).unwrap(),
+                generation: 2,
+                kind: StartupResultKind::ReconcileRequired,
+            }
+        );
     }
 }

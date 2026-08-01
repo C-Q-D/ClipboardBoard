@@ -51,6 +51,12 @@ pub mod history_restore;
 #[cfg(windows)]
 pub mod platform;
 
+/// 非 Windows 目标只提供不可用 stub，保证设置模型和跨平台单元测试仍能编译；
+/// 该 stub 不访问任何本地注册表，也不会伪造开机启动成功。
+#[cfg(not(windows))]
+#[path = "platform/non_windows.rs"]
+pub mod platform;
+
 /// 创建主窗口实例。
 ///
 /// 调用方负责启动 Slint 事件循环；创建失败时返回平台初始化错误，不在此处吞掉错误。

@@ -250,6 +250,8 @@ export component AppWindow inherits Window {
     in-out property <string> search-text: "";
     in-out property <int> search-filter: 0;
     in property <string> search-status: "idle";
+    // 开机启动操作的稳定反馈；不显示路径、命令行或底层错误详情。
+    in property <string> startup-status: "";
     // 续页加载独立于首页搜索状态，避免旧结果保留期间显示错误文案。
     in property <bool> history-next-page-loading: false;
     in property <bool> history-retry-required: false;
@@ -920,6 +922,13 @@ export component AppWindow inherits Window {
                     text: "搜索暂不可用，请稍后重试";
                     color: #d99b6c;
                     font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                if startup-status != "": Text {
+                    text: startup-status;
+                    color: #d99b6c;
+                    font-size: 12px;
                     horizontal-alignment: center;
                 }
 

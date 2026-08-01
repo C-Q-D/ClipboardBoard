@@ -8,6 +8,7 @@ use super::hotkey::{
     HotkeyThreadCommand, QueryActiveState, ThreadHotkeyState, ThreadTransactionState,
     HOTKEY_COMMAND_MESSAGE,
 };
+use super::startup::StartupCommandSender;
 use super::tray::{handle_callback, TrayGuard, TRAY_CALLBACK_MESSAGE};
 use crate::app::post_ui_event;
 use crate::clipboard::{
@@ -127,6 +128,7 @@ pub(crate) fn run(
     write_expectations: ClipboardWriteExpectationStore,
     recording_gate: RecordingGate,
     pause_commands: PauseCommandSender,
+    startup_commands: StartupCommandSender,
 ) -> Result<(), HotkeyError> {
     let thread_id = unsafe { GetCurrentThreadId() };
 
@@ -272,6 +274,7 @@ pub(crate) fn run(
 
     let message_loop_result = message_loop(
         &pause_commands,
+        &startup_commands,
         &command_receiver,
         &mut registrar,
         &signal,
@@ -492,6 +495,7 @@ fn panel_event_for_runtime_message(
 /// 拉取并分发消息，返回值 -1 被视为 Win32 错误，0 表示收到退出消息。
 fn message_loop(
     pause_commands: &PauseCommandSender,
+    startup_commands: &StartupCommandSender,
     command_receiver: &Receiver<HotkeyThreadCommand>,
     registrar: &mut impl HotkeyRegistrar,
     signal: &HotkeyRuntimeSignal,
@@ -518,7 +522,13 @@ fn message_loop(
         }
 
         if is_tray_callback_message(message.message)
-            && handle_callback(message.hwnd, message.wParam, message.lParam, pause_commands)
+            && handle_callback(
+                message.hwnd,
+                message.wParam,
+                message.lParam,
+                pause_commands,
+                startup_commands,
+            )
         {
             continue;
         }

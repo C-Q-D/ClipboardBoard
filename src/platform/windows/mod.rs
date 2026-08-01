@@ -3,6 +3,7 @@
 mod hotkey;
 mod single_instance;
 mod source;
+pub mod startup;
 mod system_window;
 mod tray;
 pub(crate) mod window;

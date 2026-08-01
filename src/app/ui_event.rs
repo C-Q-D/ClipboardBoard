@@ -232,6 +232,11 @@ struct UiState {
     search_filter: SearchFilter,
     /// 当前搜索结果状态，供 UI 区分加载中、空结果和错误。
     search_status: SearchStatus,
+    /// 当前启动设置的稳定反馈文案；不保存路径或底层错误正文。
+    startup_status: String,
+    /// 最近一次启动设置反馈的身份；旧事务/代次回执必须被拒绝。
+    #[cfg(windows)]
+    startup_status_identity: Option<(u64, u64)>,
     /// 最近一次搜索提交代次；用于验证迟到计时器身份。
     search_generation: Option<u64>,
     /// SQLite 数据集和单次请求身份协调器；只由 UI 线程修改。
@@ -306,6 +311,9 @@ impl Default for UiState {
             search_text: String::new(),
             search_filter: SearchFilter::All,
             search_status: SearchStatus::Idle,
+            startup_status: String::new(),
+            #[cfg(windows)]
+            startup_status_identity: None,
             search_generation: None,
             history_pages: HistoryPageCoordinator::default(),
             pending_history_request: None,
@@ -390,6 +398,23 @@ impl UiState {
                 self.pending_history_request = None;
                 self.reset_history_scroll_dataset();
                 UiAction::Quit
+            }
+            #[cfg(windows)]
+            UiEvent::StartupStatus {
+                transaction_id,
+                generation,
+                kind,
+            } => {
+                // 只接受更新身份的回执，禁止并发反馈线程把旧 Busy/Applied 文案覆盖新状态。
+                let identity = (generation, transaction_id.get());
+                if self
+                    .startup_status_identity
+                    .is_none_or(|previous| identity > previous)
+                {
+                    self.startup_status_identity = Some(identity);
+                    self.startup_status = kind.ui_label().to_owned();
+                }
+                UiAction::None
             }
             UiEvent::HidePanel { generation } => {
                 if self.panel_visible && generation == self.panel_generation {
@@ -1665,6 +1690,7 @@ impl UiState {
             search_text: self.search_text.clone(),
             search_filter: self.search_filter,
             search_status: self.search_status,
+            startup_status: self.startup_status.clone(),
             search_generation: self.search_generation,
             history_performance: self.history_pages.performance_snapshot(),
             panel_visible: self.panel_visible,
@@ -1732,6 +1758,8 @@ pub struct UiStateSnapshot {
     pub search_filter: SearchFilter,
     /// 当前搜索结果状态。
     pub search_status: SearchStatus,
+    /// 当前启动设置的稳定反馈文案；空字符串表示尚未收到反馈。
+    pub startup_status: String,
     /// 当前搜索代次；旧计时器测试使用它证明结果没有闪回。
     pub search_generation: Option<u64>,
     /// 当前数据集的纯数值分页性能快照；不包含游标、重试状态或活动请求。
@@ -2110,6 +2138,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             search_text,
             search_filter,
             mut search_status,
+            mut startup_status,
             mut history_next_page_loading,
             mut history_retry_required,
             mut pending_pin_mutation,
@@ -2147,6 +2176,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.search_text.clone(),
                 state.search_filter,
                 state.search_status,
+                state.startup_status.clone(),
                 state.history_next_page_loading,
                 state.history_pages.retry_required(),
                 state.pending_pin_mutation,
@@ -2177,6 +2207,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     state.mark_history_submission_failed(&failed_request);
                     snapshot = state.snapshot.clone();
                     search_status = state.search_status;
+                    startup_status = state.startup_status.clone();
                     history_next_page_loading = state.history_next_page_loading;
                     history_retry_required = state.history_pages.retry_required();
                 });
@@ -2307,6 +2338,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             };
 
             set_window_search_state(&window, &search_text, search_filter, search_status);
+            window.set_startup_status(SharedString::from(startup_status.clone()));
             window.set_history_next_page_loading(history_next_page_loading);
             window.set_history_retry_required(history_retry_required);
             window.set_pin_error_visible(pin_error_visible);
@@ -3415,6 +3447,34 @@ mod tests {
             is_pinned: false,
             kind: Default::default(),
         }
+    }
+
+    /// 开机启动反馈只把稳定文案写入 UI 快照，不携带路径或底层错误详情。
+    #[cfg(windows)]
+    #[test]
+    fn startup_status_feedback_is_visible_and_sanitized() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::StartupStatus {
+            transaction_id: std::num::NonZeroU64::new(1).unwrap(),
+            generation: 1,
+            kind: crate::platform::windows::startup::StartupResultKind::Status(
+                crate::platform::windows::startup::EffectiveStartupState::Enabled,
+            ),
+        });
+        assert_eq!(state.snapshot().startup_status, "开机启动：已启用");
+
+        // 旧事务即使晚到，也不能覆盖较新的 Busy/Retry 反馈。
+        state.apply(UiEvent::StartupStatus {
+            transaction_id: std::num::NonZeroU64::new(2).unwrap(),
+            generation: 1,
+            kind: crate::platform::windows::startup::StartupResultKind::Busy,
+        });
+        state.apply(UiEvent::StartupStatus {
+            transaction_id: std::num::NonZeroU64::new(1).unwrap(),
+            generation: 1,
+            kind: crate::platform::windows::startup::StartupResultKind::Applied,
+        });
+        assert_eq!(state.snapshot().startup_status, "开机启动处理中");
     }
 
     /// 构造带缩略图路径的图片摘要，测试不读取真实图片文件。

@@ -38,6 +38,8 @@ use clipboard_board::image_pipeline::ImageWorker;
 #[cfg(windows)]
 use clipboard_board::image_storage::{parse_image_storage_preference, prepare_image_storage};
 #[cfg(windows)]
+use clipboard_board::platform::windows::startup::StartupSettingsOwner;
+#[cfg(windows)]
 use clipboard_board::platform::windows::{acquire_or_activate, HotkeyManager, SingleInstanceRole};
 #[cfg(windows)]
 use clipboard_board::privacy::{PrivacyRuntimeOwner, SettingsClientRpcAdapter, SystemPauseClock};
@@ -57,6 +59,8 @@ use std::thread::{self, JoinHandle};
 /// Windows 运行时的统一资源回收协调器。
 #[cfg(windows)]
 struct RuntimeCleanup {
+    /// 开机启动所有者必须先于 SettingsWorker 字段销毁，避免其 Drop 访问已关闭的 client。
+    startup: Option<StartupSettingsOwner>,
     /// 尚未移交给 PrivacyRuntimeOwner 的 SettingsWorker。
     settings: Option<SettingsWorker>,
     /// 持有 controller、RPC helper 和 SettingsWorker 的隐私运行时。
@@ -98,6 +102,7 @@ impl RuntimeCleanup {
     /// 创建空的资源槽；尚未启动的阶段保持 `None`，可安全走同一失败清理路径。
     fn new() -> Self {
         Self {
+            startup: None,
             settings: None,
             privacy: None,
             storage: None,
@@ -175,6 +180,21 @@ impl RuntimeCleanup {
             record(worker.stop().map_err(|error| error.to_string()));
         }
 
+        // StartupSettingsOwner 只持有 SettingsClient clone，必须先于拥有 SettingsWorker
+        // 的 PrivacyRuntimeOwner 关闭，避免在途事务访问已关闭的 worker。
+        if let Some(mut startup) = self.startup.take() {
+            let shutdown_result = startup
+                .begin_closing()
+                .and_then(|()| startup.finish_shutdown())
+                .map_err(|error| error.to_string());
+            if let Err(error) = shutdown_result {
+                // 未完成对账时不能继续关闭 SettingsWorker；保留 owner 供下一次
+                // stop/Retry 重试，避免后台线程继续使用已停止的 SettingsClient。
+                self.startup = Some(startup);
+                record(Err(error));
+                return first_error.map_or(Ok(()), Err);
+            }
+        }
         // ClipboardIO、图片和业务线程都已停止后，才关闭 privacy controller/RPC/Settings。
         if let Some(runtime) = self.privacy.take() {
             record(runtime.stop().map_err(|error| error.to_string()));
@@ -261,6 +281,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .settings
         .take()
         .expect("SettingsWorker 启动阶段只移交一次");
+    let startup_owner = StartupSettingsOwner::start(settings.client())?;
+    let startup_sender = startup_owner.sender();
+    cleanup.startup = Some(startup_owner);
+    // 启动阶段先完成一次只读对账；错配只展示，禁止自动修复后再继续初始化主程序。
+    if let Ok(reply) = startup_sender.try_query() {
+        if let Ok(result) = reply.recv() {
+            // 只把稳定结果枚举交给 UI，禁止启动阶段把注册表路径或底层错误正文写入日志。
+            let _ = post_ui_event(UiEvent::StartupStatus {
+                transaction_id: result.transaction_id,
+                generation: result.generation,
+                kind: result.kind,
+            });
+        }
+    }
     let settings_adapter = SettingsClientRpcAdapter::new(settings.client());
     let privacy_runtime = PrivacyRuntimeOwner::start_with(
         settings,
@@ -297,12 +331,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cleanup.image_worker = Some(image_worker);
     let image_context = ImageCaptureContext::new(image_sender.clone(), image_root);
     let write_expectations = ClipboardWriteExpectationStore::new();
-    let hotkey_manager = HotkeyManager::start_with_privacy_and_settings(
+    let hotkey_manager = HotkeyManager::start_with_privacy_and_settings_and_startup(
         write_expectations.clone(),
         privacy_gate,
         privacy_sender,
         hotkey_settings_client,
         initial_settings.clone(),
+        startup_sender,
     )?;
     let clipboard_inbox = hotkey_manager.clipboard_inbox();
     cleanup.capture_inbox = Some(clipboard_inbox.clone());

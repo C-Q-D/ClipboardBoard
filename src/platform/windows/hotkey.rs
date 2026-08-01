@@ -3,6 +3,7 @@
 //! 原生 HWND 只在 `system_window` 所在线程使用；本文件只通过有界消息桥传递拥有型
 //! DTO。设置保存由独立事务线程执行，避免 Slint/UI 或 Win32 消息线程等待磁盘。
 
+use super::startup::StartupCommandSender;
 use super::system_window;
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
 use crate::privacy::{GateMode, PauseCommandSender, RecordingGate};
@@ -661,6 +662,7 @@ impl HotkeyManager {
         Self::start_internal(
             default_hotkey_spec(),
             None,
+            StartupCommandSender::disabled(),
             write_expectations,
             recording_gate,
             pause_commands,
@@ -680,6 +682,28 @@ impl HotkeyManager {
         Self::start_internal(
             hotkey,
             Some((settings_client, initial_snapshot)),
+            StartupCommandSender::disabled(),
+            write_expectations,
+            recording_gate,
+            pause_commands,
+        )
+    }
+
+    /// 从已验证设置快照启动，并同时接入当前用户开机启动托盘命令。
+    pub fn start_with_privacy_and_settings_and_startup(
+        write_expectations: ClipboardWriteExpectationStore,
+        recording_gate: RecordingGate,
+        pause_commands: PauseCommandSender,
+        settings_client: SettingsClient,
+        initial_snapshot: SettingsSnapshot,
+        startup_commands: StartupCommandSender,
+    ) -> Result<Self, HotkeyError> {
+        let hotkey =
+            HotkeySpec::from_settings(DEFAULT_HOTKEY_ID, &initial_snapshot.settings().hotkey)?;
+        Self::start_internal(
+            hotkey,
+            Some((settings_client, initial_snapshot)),
+            startup_commands,
             write_expectations,
             recording_gate,
             pause_commands,
@@ -690,6 +714,7 @@ impl HotkeyManager {
     fn start_internal(
         hotkey: HotkeySpec,
         settings: Option<(SettingsClient, SettingsSnapshot)>,
+        startup_commands: StartupCommandSender,
         write_expectations: ClipboardWriteExpectationStore,
         recording_gate: RecordingGate,
         pause_commands: PauseCommandSender,
@@ -713,6 +738,7 @@ impl HotkeyManager {
                     worker_expectations,
                     recording_gate,
                     pause_commands,
+                    startup_commands,
                 )
             })
             .map_err(|error| HotkeyError::ThreadStart(error.to_string()))?;

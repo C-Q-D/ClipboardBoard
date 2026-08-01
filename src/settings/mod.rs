@@ -14,7 +14,7 @@ pub(crate) use model::{
 };
 pub use model::{
     AppSettings, HistorySettings, HotkeySettings, PrivacySettings, RecordingPause,
-    SettingsLoadSource, SettingsSnapshot,
+    SettingsLoadSource, SettingsSnapshot, StartupSettings,
 };
 pub use worker::{SettingsClient, SettingsWorker};
 

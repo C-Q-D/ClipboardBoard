@@ -49,6 +49,8 @@ pub struct AppSettings {
     pub history: HistorySettings,
     /// 本地隐私与记录策略。
     pub privacy: PrivacySettings,
+    /// 当前用户登录时是否自动启动程序。
+    pub startup: StartupSettings,
     /// 可跨重启恢复的全局快捷键配置。
     pub hotkey: HotkeySettings,
 }
@@ -59,6 +61,7 @@ impl Default for AppSettings {
         Self {
             history: HistorySettings::default(),
             privacy: PrivacySettings::default(),
+            startup: StartupSettings::default(),
             hotkey: HotkeySettings::default(),
         }
     }
@@ -129,9 +132,18 @@ impl fmt::Debug for AppSettings {
             .debug_struct("AppSettings")
             .field("history", &self.history)
             .field("privacy", &self.privacy)
+            .field("startup", &self.startup)
             .field("hotkey", &self.hotkey)
             .finish()
     }
+}
+
+/// 当前用户登录时的启动策略；该 DTO 只保存用户意图，不携带注册表状态。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct StartupSettings {
+    /// 是否在当前账户登录时启动 ClipboardBoard。
+    pub run_on_login: bool,
 }
 
 /// 剪贴板记录隐私设置。
@@ -504,6 +516,23 @@ mod tests {
         assert!(debug.contains("excluded_apps_count"));
         assert!(!debug.contains("password-manager"));
         assert!(!debug.contains("C:\\secret"));
+    }
+
+    /// 旧配置缺少 startup 时回退 false，新增字段序列化使用稳定的布尔值。
+    #[test]
+    fn startup_defaults_when_omitted_and_round_trips() {
+        let legacy: AppSettings = serde_json::from_value(serde_json::json!({
+            "history": {},
+            "privacy": {},
+            "hotkey": {}
+        }))
+        .expect("旧配置缺少 startup 时应使用默认值");
+        assert!(!legacy.startup.run_on_login);
+
+        let mut enabled = legacy;
+        enabled.startup.run_on_login = true;
+        let serialized = serde_json::to_value(&enabled).expect("startup 字段序列化失败");
+        assert_eq!(serialized["startup"]["run_on_login"], true);
     }
 
     /// 默认快捷键保持 Alt+V，并且规范化标签不依赖运行时注册 ID。

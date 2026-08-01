@@ -7,7 +7,10 @@ mod system_window;
 mod tray;
 pub(crate) mod window;
 
-pub use hotkey::{HotkeyError, HotkeyManager};
+pub use hotkey::{
+    HotkeyError, HotkeyManager, HotkeyRequestHandle, HotkeyTransactionError,
+    HotkeyTransactionStatus,
+};
 pub use single_instance::{
     acquire_or_activate, SingleInstanceError, SingleInstanceGuard, SingleInstanceRole,
 };

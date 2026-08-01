@@ -308,6 +308,7 @@ fn validation_error(field: ValidationField) -> SettingsError {
         ValidationField::ImageQuotaMib => "history.image_quota_mib",
         ValidationField::ExcludedApps => "privacy.excluded_apps",
         ValidationField::ImageStorageRoot => "history.image_storage_root",
+        ValidationField::Hotkey => "hotkey",
     })
 }
 
@@ -478,8 +479,9 @@ mod tests {
     };
 
     use super::{
-        create_staging_with, load, merge_known_document, save, save_with_publisher, PublishFailure,
-        ReplaceFailureKind, SaveFault, STAGING_CREATE_ATTEMPTS,
+        create_staging_with, load, merge_known_document, merge_known_settings, save,
+        save_with_publisher, PublishFailure, ReplaceFailureKind, SaveFault,
+        STAGING_CREATE_ATTEMPTS,
     };
     use crate::settings::{AppSettings, HistorySettings};
 
@@ -549,6 +551,26 @@ mod tests {
         let restarted: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&merged).unwrap()).unwrap();
         assert_eq!(restarted, merged);
+    }
+
+    /// 快捷键已知字段更新时仍必须保留 hotkey 对象内未来字段，避免设置迁移丢数据。
+    #[test]
+    fn hotkey_nested_unknown_fields_survive_save_merge() {
+        let old = serde_json::json!({
+            "schema_version": 1,
+            "hotkey": {
+                "modifiers": 1,
+                "virtual_key": 86,
+                "future_hotkey_field": {"keep": true}
+            }
+        });
+        let mut updated = settings();
+        updated.hotkey.modifiers = 2 | 0x4000;
+        updated.hotkey.virtual_key = 0x4B;
+        let merged = merge_known_settings(&old, &updated);
+        assert_eq!(merged["hotkey"]["modifiers"], 2 | 0x4000);
+        assert_eq!(merged["hotkey"]["virtual_key"], 0x4B);
+        assert_eq!(merged["hotkey"]["future_hotkey_field"]["keep"], true);
     }
 
     /// staging token 连续碰撞只重试固定次数，且不删除碰撞文件。

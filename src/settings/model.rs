@@ -19,6 +19,26 @@ pub(crate) const MAX_EXCLUDED_APPS: usize = 64;
 /// 单条排除程序规则的 UTF-8 字节上限。
 pub(crate) const MAX_EXCLUDED_APP_RULE_BYTES: usize = 512;
 
+/// Windows `MOD_*` 热键修饰位；使用稳定数值让配置模型在非 Windows 目标也可验证。
+pub(crate) const HOTKEY_MOD_ALT: u32 = 0x0001;
+/// Windows `MOD_CONTROL` 热键修饰位。
+pub(crate) const HOTKEY_MOD_CONTROL: u32 = 0x0002;
+/// Windows `MOD_SHIFT` 热键修饰位。
+pub(crate) const HOTKEY_MOD_SHIFT: u32 = 0x0004;
+/// Windows `MOD_WIN` 热键修饰位。
+pub(crate) const HOTKEY_MOD_WIN: u32 = 0x0008;
+/// Windows `MOD_NOREPEAT` 可选修饰位。
+pub(crate) const HOTKEY_MOD_NOREPEAT: u32 = 0x4000;
+/// 允许持久化的物理修饰位集合。
+const HOTKEY_PHYSICAL_MODIFIERS: u32 =
+    HOTKEY_MOD_ALT | HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT | HOTKEY_MOD_WIN;
+/// 允许持久化的全部修饰位集合。
+const HOTKEY_ALLOWED_MODIFIERS: u32 = HOTKEY_PHYSICAL_MODIFIERS | HOTKEY_MOD_NOREPEAT;
+/// 默认 Alt+V 的虚拟键码。
+pub(crate) const DEFAULT_HOTKEY_VIRTUAL_KEY: u32 = 0x56;
+/// 默认 Alt+V 的修饰位。
+pub(crate) const DEFAULT_HOTKEY_MODIFIERS: u32 = HOTKEY_MOD_ALT | HOTKEY_MOD_NOREPEAT;
+
 /// ClipboardBoard 当前已知的全部设置。
 ///
 /// 后续原子只在此 DTO 上兼容增加字段；未知 JSON 字段由持久化层独立保留。
@@ -29,6 +49,8 @@ pub struct AppSettings {
     pub history: HistorySettings,
     /// 本地隐私与记录策略。
     pub privacy: PrivacySettings,
+    /// 可跨重启恢复的全局快捷键配置。
+    pub hotkey: HotkeySettings,
 }
 
 impl Default for AppSettings {
@@ -37,7 +59,66 @@ impl Default for AppSettings {
         Self {
             history: HistorySettings::default(),
             privacy: PrivacySettings::default(),
+            hotkey: HotkeySettings::default(),
         }
+    }
+}
+
+/// 可持久化的全局快捷键组合；进程内注册 ID 不写入配置。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct HotkeySettings {
+    /// Windows `MOD_*` 修饰位，只允许物理修饰和 `MOD_NOREPEAT`。
+    pub modifiers: u32,
+    /// Windows 虚拟键码，范围为 `1..=0xFE`。
+    pub virtual_key: u32,
+}
+
+impl Default for HotkeySettings {
+    /// 返回产品默认 Alt+V 组合。
+    fn default() -> Self {
+        Self {
+            modifiers: DEFAULT_HOTKEY_MODIFIERS,
+            virtual_key: DEFAULT_HOTKEY_VIRTUAL_KEY,
+        }
+    }
+}
+
+impl HotkeySettings {
+    /// 返回用于配置 UI 和错误信息的规范化名称；顺序固定为 Win、Ctrl、Alt、Shift、主键。
+    pub fn label(&self) -> String {
+        let mut parts = Vec::with_capacity(5);
+        if self.modifiers & HOTKEY_MOD_WIN != 0 {
+            parts.push("Win".to_owned());
+        }
+        if self.modifiers & HOTKEY_MOD_CONTROL != 0 {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.modifiers & HOTKEY_MOD_ALT != 0 {
+            parts.push("Alt".to_owned());
+        }
+        if self.modifiers & HOTKEY_MOD_SHIFT != 0 {
+            parts.push("Shift".to_owned());
+        }
+        parts.push(format_virtual_key(self.virtual_key));
+        parts.join(" + ")
+    }
+}
+
+/// 把常用虚拟键转换为短标签；未知键保留十六进制，避免伪造可读名称。
+fn format_virtual_key(virtual_key: u32) -> String {
+    match virtual_key {
+        0x09 => "Tab".to_owned(),
+        0x0D => "Enter".to_owned(),
+        0x1B => "Esc".to_owned(),
+        0x20 => "Space".to_owned(),
+        0x2E => "Delete".to_owned(),
+        0x70..=0x7B => format!("F{}", virtual_key - 0x6F),
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(virtual_key).map_or_else(
+            || format!("VK_{virtual_key:02X}"),
+            |character| character.to_ascii_uppercase().to_string(),
+        ),
+        _ => format!("VK_{virtual_key:02X}"),
     }
 }
 
@@ -48,6 +129,7 @@ impl fmt::Debug for AppSettings {
             .debug_struct("AppSettings")
             .field("history", &self.history)
             .field("privacy", &self.privacy)
+            .field("hotkey", &self.hotkey)
             .finish()
     }
 }
@@ -190,6 +272,8 @@ pub(crate) enum ValidationField {
     ExcludedApps,
     /// 图片资产根路径。
     ImageStorageRoot,
+    /// 全局快捷键组合。
+    Hotkey,
 }
 
 /// load 与 save 共用的语义验证器，避免写入无法重新加载的配置。
@@ -207,7 +291,33 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), Validation
     if parse_image_storage_preference(settings.history.image_storage_root.as_deref()).is_err() {
         return Err(ValidationField::ImageStorageRoot);
     }
+    validate_hotkey(&settings.hotkey)?;
     validate_excluded_apps(&settings.privacy.excluded_apps)?;
+    Ok(())
+}
+
+/// 校验持久化快捷键的位掩码、虚拟键和明确系统保留组合。
+pub(crate) fn validate_hotkey(settings: &HotkeySettings) -> Result<(), ValidationField> {
+    if settings.virtual_key == 0
+        || settings.virtual_key > 0xFE
+        || matches!(
+            settings.virtual_key,
+            0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0x5D | 0xE5 | 0xE7
+        )
+        || settings.modifiers & !HOTKEY_ALLOWED_MODIFIERS != 0
+        || settings.modifiers & HOTKEY_PHYSICAL_MODIFIERS == 0
+    {
+        return Err(ValidationField::Hotkey);
+    }
+
+    let physical = settings.modifiers & HOTKEY_PHYSICAL_MODIFIERS;
+    // 明确拒绝会覆盖常用系统行为的组合；其余动态冲突交给 RegisterHotKey 返回值。
+    let reserved = (physical == HOTKEY_MOD_ALT && matches!(settings.virtual_key, 0x09 | 0x73))
+        || (physical == HOTKEY_MOD_WIN && settings.virtual_key == 0x4C)
+        || (physical == HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT && settings.virtual_key == 0x2E);
+    if reserved {
+        return Err(ValidationField::Hotkey);
+    }
     Ok(())
 }
 
@@ -290,9 +400,11 @@ mod tests {
     //! 此测试模块验证历史数值范围的闭区间边界。
 
     use super::{
-        normalize_excluded_app_rule, validate_settings, AppSettings, HistorySettings,
-        ValidationField, IMAGE_QUOTA_MIB_RANGE, MAX_EXCLUDED_APPS, MAX_ITEMS_RANGE,
-        RETENTION_DAYS_RANGE,
+        normalize_excluded_app_rule, validate_hotkey, validate_settings, AppSettings,
+        HistorySettings, HotkeySettings, ValidationField, DEFAULT_HOTKEY_MODIFIERS,
+        DEFAULT_HOTKEY_VIRTUAL_KEY, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_NOREPEAT,
+        HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN, IMAGE_QUOTA_MIB_RANGE, MAX_EXCLUDED_APPS,
+        MAX_ITEMS_RANGE, RETENTION_DAYS_RANGE,
     };
 
     /// 最小值和最大值均合法，越界值均被统一验证器拒绝。
@@ -392,5 +504,104 @@ mod tests {
         assert!(debug.contains("excluded_apps_count"));
         assert!(!debug.contains("password-manager"));
         assert!(!debug.contains("C:\\secret"));
+    }
+
+    /// 默认快捷键保持 Alt+V，并且规范化标签不依赖运行时注册 ID。
+    #[test]
+    fn validates_default_hotkey_and_label() {
+        let hotkey = HotkeySettings::default();
+        assert_eq!(hotkey.modifiers, DEFAULT_HOTKEY_MODIFIERS);
+        assert_eq!(hotkey.virtual_key, DEFAULT_HOTKEY_VIRTUAL_KEY);
+        assert_eq!(hotkey.label(), "Alt + V");
+        assert!(validate_hotkey(&hotkey).is_ok());
+    }
+
+    /// 快捷键只允许物理修饰、有效主键，并拒绝计划明确列出的系统组合。
+    #[test]
+    fn rejects_hotkey_modifier_vk_and_reserved_boundaries() {
+        for settings in [
+            HotkeySettings {
+                modifiers: 0,
+                virtual_key: 0x56,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT | 0x20,
+                virtual_key: 0x56,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT,
+                virtual_key: 0,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT,
+                virtual_key: 0xFF,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT,
+                virtual_key: 0x09,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT,
+                virtual_key: 0x73,
+            },
+            HotkeySettings {
+                modifiers: 0x0008,
+                virtual_key: 0x4C,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT,
+                virtual_key: 0x2E,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_ALT,
+                virtual_key: 0x10,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_CONTROL,
+                virtual_key: 0x11,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_SHIFT,
+                virtual_key: 0x12,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_WIN,
+                virtual_key: 0x5B,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_WIN,
+                virtual_key: 0x5C,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_WIN,
+                virtual_key: 0x5D,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_CONTROL,
+                virtual_key: 0xE5,
+            },
+            HotkeySettings {
+                modifiers: HOTKEY_MOD_CONTROL,
+                virtual_key: 0xE7,
+            },
+        ] {
+            assert!(validate_hotkey(&settings).is_err(), "{settings:?}");
+        }
+        assert!(validate_hotkey(&HotkeySettings {
+            modifiers: HOTKEY_MOD_CONTROL | HOTKEY_MOD_NOREPEAT,
+            virtual_key: 0x4B,
+        })
+        .is_ok());
+    }
+
+    /// 快捷键字段缺失时 serde 必须回退默认组合，满足旧配置向前兼容。
+    #[test]
+    fn missing_hotkey_fields_use_default() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "history": {},
+            "privacy": {}
+        }))
+        .expect("旧配置应能解析");
+        assert_eq!(settings.hotkey, HotkeySettings::default());
     }
 }

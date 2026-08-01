@@ -9,11 +9,12 @@ mod windows_replace;
 mod worker;
 
 pub(crate) use model::{
-    normalize_excluded_app_rule, normalize_process_image_path, MAX_EXCLUDED_APPS,
+    normalize_excluded_app_rule, normalize_process_image_path, validate_hotkey, HOTKEY_MOD_ALT,
+    HOTKEY_MOD_CONTROL, HOTKEY_MOD_NOREPEAT, HOTKEY_MOD_SHIFT, HOTKEY_MOD_WIN, MAX_EXCLUDED_APPS,
 };
 pub use model::{
-    AppSettings, HistorySettings, PrivacySettings, RecordingPause, SettingsLoadSource,
-    SettingsSnapshot,
+    AppSettings, HistorySettings, HotkeySettings, PrivacySettings, RecordingPause,
+    SettingsLoadSource, SettingsSnapshot,
 };
 pub use worker::{SettingsClient, SettingsWorker};
 

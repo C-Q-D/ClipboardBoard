@@ -3,10 +3,16 @@
 //! 托盘回调只把用户动作投递到 UI 事件队列；`TrayGuard` 独占通知数据，保证
 //! `NIM_DELETE` 先于 message-only HWND 销毁，并对菜单、系统图标和错误路径做闭合处理。
 
-use super::hotkey::HotkeyError;
+use super::hotkey::{
+    global_hotkey_request_handle, HotkeyError, HotkeyRequestHandle, HotkeyTransactionStatus,
+};
 use crate::app::post_ui_event;
 use crate::command::UiEvent;
 use crate::privacy::{PauseCommand, PauseCommandSender, PauseStatus};
+use crate::settings::{
+    HotkeySettings, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_NOREPEAT, HOTKEY_MOD_SHIFT,
+    HOTKEY_MOD_WIN,
+};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
@@ -40,13 +46,24 @@ const TRAY_MENU_PAUSE_INDEFINITE: usize = 0x5005;
 const TRAY_MENU_RESUME: usize = 0x5006;
 /// 仅用于展示当前状态的灰色菜单项，不映射为业务动作。
 const TRAY_MENU_STATUS: usize = 0x5007;
+/// 当前快捷键状态展示项。
+const TRAY_MENU_HOTKEY_STATUS: usize = 0x5008;
+/// 预置快捷键：Alt+V。
+const TRAY_MENU_HOTKEY_ALT_V: usize = 0x5009;
+/// 预置快捷键：Ctrl+Shift+V。
+const TRAY_MENU_HOTKEY_CTRL_SHIFT_V: usize = 0x500A;
+/// 预置快捷键：Win+Shift+V。
+const TRAY_MENU_HOTKEY_WIN_SHIFT_V: usize = 0x500B;
+/// 预置快捷键：Ctrl+Alt+C。
+const TRAY_MENU_HOTKEY_CTRL_ALT_C: usize = 0x500C;
 
 /// 托盘菜单返回的纯动作，不携带 HWND 或配置客户端。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TrayAction {
     Open,
     Exit,
     Pause(PauseCommand),
+    Hotkey(HotkeySettings),
 }
 
 /// 持有托盘通知数据直到消息线程退出，确保图标生命周期覆盖整个消息泵。
@@ -186,7 +203,8 @@ fn show_menu(window: HWND, pause: &PauseCommandSender) -> Result<Option<TrayActi
     }
 
     // 只读取原子 PauseStatus；菜单线程不调用 SettingsClient 或其他阻塞配置接口。
-    let append_result = append_menu_items(menu, pause.status());
+    let hotkey_handle = global_hotkey_request_handle();
+    let append_result = append_menu_items(menu, pause.status(), hotkey_handle.as_ref());
     if let Err(error) = append_result {
         if let Err(cleanup_error) = destroy_menu(menu) {
             eprintln!("托盘菜单添加失败后的 DestroyMenu 也失败：{cleanup_error}");
@@ -253,6 +271,10 @@ fn dispatch_action(
         Some(TrayAction::Pause(command)) => pause
             .try_submit(command)
             .map_err(|error| HotkeyError::Tray(error.to_string())),
+        Some(TrayAction::Hotkey(settings)) => global_hotkey_request_handle()
+            .ok_or_else(|| HotkeyError::Tray("快捷键设置入口尚未就绪".to_owned()))?
+            .request(settings)
+            .map_err(|error| HotkeyError::Tray(error.to_string())),
         None => Ok(()),
     }
 }
@@ -266,6 +288,22 @@ fn action_for_command(command: usize) -> Option<TrayAction> {
         TRAY_MENU_PAUSE_THIRTY => Some(TrayAction::Pause(PauseCommand::PauseThirtyMinutes)),
         TRAY_MENU_PAUSE_INDEFINITE => Some(TrayAction::Pause(PauseCommand::PauseIndefinitely)),
         TRAY_MENU_RESUME => Some(TrayAction::Pause(PauseCommand::Resume)),
+        TRAY_MENU_HOTKEY_ALT_V => Some(TrayAction::Hotkey(HotkeySettings {
+            modifiers: HOTKEY_MOD_ALT | HOTKEY_MOD_NOREPEAT,
+            virtual_key: 0x56,
+        })),
+        TRAY_MENU_HOTKEY_CTRL_SHIFT_V => Some(TrayAction::Hotkey(HotkeySettings {
+            modifiers: HOTKEY_MOD_CONTROL | HOTKEY_MOD_SHIFT | HOTKEY_MOD_NOREPEAT,
+            virtual_key: 0x56,
+        })),
+        TRAY_MENU_HOTKEY_WIN_SHIFT_V => Some(TrayAction::Hotkey(HotkeySettings {
+            modifiers: HOTKEY_MOD_WIN | HOTKEY_MOD_SHIFT | HOTKEY_MOD_NOREPEAT,
+            virtual_key: 0x56,
+        })),
+        TRAY_MENU_HOTKEY_CTRL_ALT_C => Some(TrayAction::Hotkey(HotkeySettings {
+            modifiers: HOTKEY_MOD_CONTROL | HOTKEY_MOD_ALT | HOTKEY_MOD_NOREPEAT,
+            virtual_key: 0x43,
+        })),
         _ => None,
     }
 }
@@ -274,6 +312,7 @@ fn action_for_command(command: usize) -> Option<TrayAction> {
 fn append_menu_items(
     menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
     status: PauseStatus,
+    hotkey: Option<&HotkeyRequestHandle>,
 ) -> Result<(), HotkeyError> {
     let open_added = unsafe {
         AppendMenuW(
@@ -324,6 +363,45 @@ fn append_menu_items(
         return Err(last_error("AppendMenuW(分隔线)"));
     }
 
+    // 快捷键入口只提供经过模型校验的四个常用组合；提交走事务 worker，不在消息线程注册或写盘。
+    if unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            TRAY_MENU_HOTKEY_STATUS,
+            hotkey_status_text(hotkey),
+        )
+    } == 0
+    {
+        return Err(last_error("AppendMenuW(快捷键状态)"));
+    }
+    let hotkey_flags = hotkey_action_flags(hotkey.map(HotkeyRequestHandle::status));
+    for (id, label) in [
+        (
+            TRAY_MENU_HOTKEY_ALT_V,
+            windows_sys::core::w!("设置快捷键：Alt + V"),
+        ),
+        (
+            TRAY_MENU_HOTKEY_CTRL_SHIFT_V,
+            windows_sys::core::w!("设置快捷键：Ctrl + Shift + V"),
+        ),
+        (
+            TRAY_MENU_HOTKEY_WIN_SHIFT_V,
+            windows_sys::core::w!("设置快捷键：Win + Shift + V"),
+        ),
+        (
+            TRAY_MENU_HOTKEY_CTRL_ALT_C,
+            windows_sys::core::w!("设置快捷键：Ctrl + Alt + C"),
+        ),
+    ] {
+        if unsafe { AppendMenuW(menu, hotkey_flags, id, label) } == 0 {
+            return Err(last_error("AppendMenuW(快捷键预置)"));
+        }
+    }
+    if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
+        return Err(last_error("AppendMenuW(分隔线)"));
+    }
+
     let exit_added = unsafe {
         AppendMenuW(
             menu,
@@ -365,6 +443,41 @@ fn status_menu_text(status: PauseStatus) -> windows_sys::core::PCWSTR {
 fn pause_action_flags(status: PauseStatus) -> u32 {
     MF_STRING
         | if matches!(status, PauseStatus::Updating) {
+            MF_GRAYED
+        } else {
+            0
+        }
+}
+
+/// 将快捷键事务状态转换成不会泄露配置正文的托盘状态文字。
+fn hotkey_status_text(handle: Option<&HotkeyRequestHandle>) -> windows_sys::core::PCWSTR {
+    match handle.map(HotkeyRequestHandle::status) {
+        Some(HotkeyTransactionStatus::Idle) => windows_sys::core::w!("快捷键：可用"),
+        Some(HotkeyTransactionStatus::Busy) => windows_sys::core::w!("快捷键：正在保存…"),
+        Some(HotkeyTransactionStatus::HotkeyUnavailable) => {
+            windows_sys::core::w!("快捷键：不可用（冲突或注册失败）")
+        }
+        Some(HotkeyTransactionStatus::ReconcileRequired) => {
+            windows_sys::core::w!("快捷键：需要重启对账")
+        }
+        Some(HotkeyTransactionStatus::ActiveUnknown) => {
+            windows_sys::core::w!("快捷键：状态未知，已停用")
+        }
+        None => windows_sys::core::w!("快捷键：设置入口不可用"),
+    }
+}
+
+/// 事务繁忙、未知或不存在时禁用预置项；设置状态仍保留在灰色展示项中。
+fn hotkey_action_flags(status: Option<HotkeyTransactionStatus>) -> u32 {
+    MF_STRING
+        | if matches!(
+            status,
+            None | Some(
+                HotkeyTransactionStatus::Busy
+                    | HotkeyTransactionStatus::ReconcileRequired
+                    | HotkeyTransactionStatus::ActiveUnknown
+            )
+        ) {
             MF_GRAYED
         } else {
             0
@@ -423,12 +536,16 @@ mod tests {
     //! 此测试模块验证固定托盘消息和命令值，不依赖桌面 Shell 状态。
 
     use super::{
-        action_for_command, decode_v4_callback, is_supported_mouse_message, pause_action_flags,
-        status_menu_label, TrayAction, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID, TRAY_MENU_EXIT,
-        TRAY_MENU_OPEN, TRAY_MENU_PAUSE_FIVE, TRAY_MENU_PAUSE_INDEFINITE, TRAY_MENU_PAUSE_THIRTY,
-        TRAY_MENU_RESUME, TRAY_MENU_STATUS,
+        action_for_command, decode_v4_callback, hotkey_action_flags, is_supported_mouse_message,
+        pause_action_flags, status_menu_label, TrayAction, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID,
+        TRAY_MENU_EXIT, TRAY_MENU_HOTKEY_ALT_V, TRAY_MENU_HOTKEY_CTRL_ALT_C,
+        TRAY_MENU_HOTKEY_CTRL_SHIFT_V, TRAY_MENU_HOTKEY_WIN_SHIFT_V, TRAY_MENU_OPEN,
+        TRAY_MENU_PAUSE_FIVE, TRAY_MENU_PAUSE_INDEFINITE, TRAY_MENU_PAUSE_THIRTY, TRAY_MENU_RESUME,
+        TRAY_MENU_STATUS,
     };
+    use crate::platform::windows::hotkey::HotkeyTransactionStatus;
     use crate::privacy::{PauseCommand, PauseStatus};
+    use crate::settings::HotkeySettings;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MF_GRAYED, MF_STRING, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
     };
@@ -483,7 +600,53 @@ mod tests {
             Some(TrayAction::Pause(PauseCommand::Resume))
         );
         assert_eq!(action_for_command(TRAY_MENU_STATUS), None);
+        assert!(matches!(
+            action_for_command(TRAY_MENU_HOTKEY_ALT_V),
+            Some(TrayAction::Hotkey(HotkeySettings {
+                virtual_key: 0x56,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            action_for_command(TRAY_MENU_HOTKEY_CTRL_SHIFT_V),
+            Some(TrayAction::Hotkey(HotkeySettings {
+                virtual_key: 0x56,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            action_for_command(TRAY_MENU_HOTKEY_WIN_SHIFT_V),
+            Some(TrayAction::Hotkey(HotkeySettings {
+                virtual_key: 0x56,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            action_for_command(TRAY_MENU_HOTKEY_CTRL_ALT_C),
+            Some(TrayAction::Hotkey(HotkeySettings {
+                virtual_key: 0x43,
+                ..
+            }))
+        ));
         assert_eq!(action_for_command(0xffff), None);
+    }
+
+    /// 快捷键事务在途、未知或入口缺失时必须禁用四个预置命令。
+    #[test]
+    fn 快捷键预置启用状态稳定() {
+        assert_eq!(
+            hotkey_action_flags(Some(HotkeyTransactionStatus::Idle)),
+            MF_STRING
+        );
+        assert_eq!(
+            hotkey_action_flags(Some(HotkeyTransactionStatus::Busy)),
+            MF_STRING | MF_GRAYED
+        );
+        assert_eq!(
+            hotkey_action_flags(Some(HotkeyTransactionStatus::ActiveUnknown)),
+            MF_STRING | MF_GRAYED
+        );
+        assert_eq!(hotkey_action_flags(None), MF_STRING | MF_GRAYED);
     }
 
     /// 菜单状态只读取原子 PauseStatus；仅更新期间禁用动作，对账允许最新命令覆盖。

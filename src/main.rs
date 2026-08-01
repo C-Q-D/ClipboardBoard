@@ -240,6 +240,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("SettingsWorker 已放入清理槽")
         .client()
         .snapshot()?;
+    // 快捷键事务 worker 需要独立 SettingsClient；主线程只读取一次已验证启动快照。
+    let hotkey_settings_client = cleanup
+        .settings
+        .as_ref()
+        .expect("SettingsWorker 已放入清理槽")
+        .client();
     // 来源记录策略在启动时冻结；运行中不让结果泵同步读取配置文件。
     let capture_source_app = initial_settings.settings().history.capture_source_app;
     // 设置快照已经过保存/加载校验，但启动仍复用同一个无副作用解析器，保证
@@ -258,7 +264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_adapter = SettingsClientRpcAdapter::new(settings.client());
     let privacy_runtime = PrivacyRuntimeOwner::start_with(
         settings,
-        initial_settings,
+        initial_settings.clone(),
         Box::new(settings_adapter),
         Arc::new(SystemPauseClock::new()),
     )?;
@@ -291,10 +297,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cleanup.image_worker = Some(image_worker);
     let image_context = ImageCaptureContext::new(image_sender.clone(), image_root);
     let write_expectations = ClipboardWriteExpectationStore::new();
-    let hotkey_manager = HotkeyManager::start_with_privacy(
+    let hotkey_manager = HotkeyManager::start_with_privacy_and_settings(
         write_expectations.clone(),
         privacy_gate,
         privacy_sender,
+        hotkey_settings_client,
+        initial_settings.clone(),
     )?;
     let clipboard_inbox = hotkey_manager.clipboard_inbox();
     cleanup.capture_inbox = Some(clipboard_inbox.clone());

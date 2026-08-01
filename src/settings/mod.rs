@@ -8,7 +8,10 @@ mod persistence;
 mod windows_replace;
 mod worker;
 
-pub use model::{AppSettings, HistorySettings, SettingsLoadSource, SettingsSnapshot};
+pub use model::{
+    AppSettings, HistorySettings, PrivacySettings, RecordingPause, SettingsLoadSource,
+    SettingsSnapshot,
+};
 pub use worker::{SettingsClient, SettingsWorker};
 
 /// 配置模块可能返回的稳定错误；任何变体都不包含配置正文。

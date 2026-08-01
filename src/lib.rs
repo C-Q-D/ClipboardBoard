@@ -27,6 +27,9 @@ pub mod history_query;
 pub mod search;
 // 配置深模块隐藏文件恢复和线程所有权，只向调用方暴露快照与受控 worker/client。
 pub mod settings;
+// 隐私模块在 ClipboardIO 正文读取前提供可持久化暂停门禁。
+#[cfg(windows)]
+pub mod privacy;
 // 存储模块只暴露单线程执行器，不把 SQLite 连接、Statement 或 SQL 句柄泄漏到业务调用方。
 pub mod storage;
 pub mod thumbnail_loader;

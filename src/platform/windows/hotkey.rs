@@ -5,6 +5,7 @@
 
 use super::system_window;
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardWriteExpectationStore};
+use crate::privacy::{GateMode, PauseCommandSender, RecordingGate};
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -89,6 +90,19 @@ impl HotkeyManager {
     pub fn start_with_write_expectations(
         write_expectations: ClipboardWriteExpectationStore,
     ) -> Result<Self, HotkeyError> {
+        Self::start_with_privacy(
+            write_expectations,
+            RecordingGate::new(GateMode::Active),
+            PauseCommandSender::disabled(),
+        )
+    }
+
+    /// 使用共享记录门禁和非阻塞暂停命令入口启动消息线程。
+    pub fn start_with_privacy(
+        write_expectations: ClipboardWriteExpectationStore,
+        recording_gate: RecordingGate,
+        pause_commands: PauseCommandSender,
+    ) -> Result<Self, HotkeyError> {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let clipboard_inbox = ClipboardCaptureInbox::new();
         let worker_inbox = clipboard_inbox.clone();
@@ -101,6 +115,8 @@ impl HotkeyManager {
                     ready_sender,
                     worker_inbox,
                     worker_expectations,
+                    recording_gate,
+                    pause_commands,
                 )
             })
             .map_err(|error| HotkeyError::ThreadStart(error.to_string()))?;

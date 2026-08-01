@@ -11,6 +11,7 @@ use crate::clipboard::{
     ClipboardWriteExpectationStore,
 };
 use crate::command::UiEvent;
+use crate::privacy::{PauseCommandSender, RecordingGate};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::SyncSender;
@@ -48,6 +49,8 @@ pub(crate) fn run(
     ready_sender: SyncSender<Result<u32, HotkeyError>>,
     clipboard_inbox: ClipboardCaptureInbox,
     write_expectations: ClipboardWriteExpectationStore,
+    recording_gate: RecordingGate,
+    pause_commands: PauseCommandSender,
 ) -> Result<(), HotkeyError> {
     let thread_id = unsafe { GetCurrentThreadId() };
 
@@ -114,9 +117,10 @@ pub(crate) fn run(
         return Err(error);
     }
 
-    let clipboard_worker = match ClipboardIoWorker::start_with_inbox_and_expectations(
+    let clipboard_worker = match ClipboardIoWorker::start_with_gate(
         clipboard_inbox,
         write_expectations,
+        recording_gate,
     ) {
         Ok(worker) => worker,
         Err(_) => {
@@ -175,7 +179,7 @@ pub(crate) fn run(
         return Err(HotkeyError::StartupChannelClosed);
     }
 
-    let message_loop_result = message_loop();
+    let message_loop_result = message_loop(&pause_commands);
     // 先停止更新通知，再回收 worker，确保退出阶段不再接受新的剪贴板事件。
     let listener_result = unsafe { unregister_clipboard_listener(window) };
     let worker_result = stop_clipboard_worker();
@@ -261,10 +265,6 @@ unsafe extern "system" fn window_proc(
     wparam: windows_sys::Win32::Foundation::WPARAM,
     lparam: windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT {
-    if is_tray_callback_message(message) && handle_callback(window, wparam, lparam) {
-        return 0;
-    }
-
     if let Some(event) = panel_event_for_message(message, wparam) {
         if let Err(error) = post_ui_event(event) {
             eprintln!("面板显示状态事件无法进入 UI 事件队列：{error}");
@@ -343,7 +343,7 @@ fn panel_event_for_message(
 }
 
 /// 拉取并分发消息，返回值 -1 被视为 Win32 错误，0 表示收到退出消息。
-fn message_loop() -> Result<(), HotkeyError> {
+fn message_loop(pause_commands: &PauseCommandSender) -> Result<(), HotkeyError> {
     loop {
         let mut message = MSG::default();
         let result = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
@@ -357,6 +357,11 @@ fn message_loop() -> Result<(), HotkeyError> {
             return Ok(());
         }
 
+        if is_tray_callback_message(message.message)
+            && handle_callback(message.hwnd, message.wParam, message.lParam, pause_commands)
+        {
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);

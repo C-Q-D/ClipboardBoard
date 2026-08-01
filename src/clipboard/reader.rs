@@ -55,6 +55,8 @@ impl Default for RetryPolicy {
 /// ClipboardIO 读取失败的有限集合；不携带窗口标题、正文或 Win32 错误文本。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardReadError {
+    /// 记录门禁已暂停；调用方不得构造 backend 或读取正文。
+    Paused,
     /// 在总预算内始终无法取得剪贴板所有权。
     OpenTimeout,
     /// 打开前或读取后 sequence 与预期不一致，结果必须丢弃。
@@ -103,12 +105,23 @@ impl DibClipboardFormat {
 }
 
 /// 已脱离 HGLOBAL 生命周期的 DIB 剪贴板字节。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct DibClipboardBytes {
     /// 实际读取的系统格式。
     format: DibClipboardFormat,
     /// 在剪贴板打开期间复制出的拥有型字节。
     bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for DibClipboardBytes {
+    /// 只输出格式和编码长度，禁止把 DIB 字节写入诊断或错误格式化结果。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DibClipboardBytes")
+            .field("format", &self.format)
+            .field("encoded_len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// 图片捕获的拥有型编码；Debug 只输出格式和长度，不泄漏图片字节。
@@ -148,12 +161,30 @@ impl ClipboardImageBytes {
 }
 
 /// 一次剪贴板捕获的唯一拥有型 payload；跨类型优先级由读取入口固定。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ClipboardCapturePayload {
     /// Unicode 文本领域 payload。
     Text(ClipboardPayload),
     /// PNG、DIBV5 或 DIB 的唯一最优图片编码。
     Image(ClipboardImageBytes),
+}
+
+impl std::fmt::Debug for ClipboardCapturePayload {
+    /// 只输出 payload 类型和长度，禁止 Debug 递归展开文本正文或图片字节。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(payload) => formatter
+                .debug_struct("ClipboardCapturePayload")
+                .field("kind", &"text")
+                .field("byte_len", &payload.as_text().len())
+                .finish(),
+            Self::Image(image) => formatter
+                .debug_struct("ClipboardCapturePayload")
+                .field("kind", &"image")
+                .field("encoded_len", &image.encoded_len())
+                .finish(),
+        }
+    }
 }
 
 impl From<ClipboardPayload> for ClipboardCapturePayload {
@@ -671,6 +702,15 @@ mod tests {
             }
             Ok(result)
         }
+    }
+
+    /// DIB Debug 只输出来源格式和长度，不应出现原始编码字节。
+    #[test]
+    fn dib_debug不泄漏编码正文() {
+        let bytes = DibClipboardBytes::new(DibClipboardFormat::Dib, vec![0xde, 0xad, 0xbe, 0xef]);
+        let debug = format!("{bytes:?}");
+        assert!(!debug.contains("222"));
+        assert!(debug.contains("encoded_len"));
     }
 
     fn policy() -> RetryPolicy {

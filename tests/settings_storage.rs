@@ -73,6 +73,7 @@ fn settings_with_max_items(max_items: u32) -> AppSettings {
             max_items,
             ..HistorySettings::default()
         },
+        ..AppSettings::default()
     }
 }
 
@@ -91,18 +92,7 @@ fn missing_configuration_returns_defaults_without_using_local_app_data() {
 
     assert_eq!(snapshot.source(), SettingsLoadSource::Defaults);
     assert_eq!(snapshot.revision(), 0);
-    assert_eq!(
-        snapshot.settings(),
-        &AppSettings {
-            history: HistorySettings {
-                max_items: 2_000,
-                retention_days: 30,
-                image_quota_mib: 500,
-                capture_images: true,
-                capture_source_app: true,
-            },
-        }
-    );
+    assert_eq!(snapshot.settings(), &AppSettings::default());
     assert!(!directory.join("settings.json").exists());
     assert!(!directory.join("settings.json.bak").exists());
 
@@ -231,6 +221,7 @@ fn saved_settings_survive_explicit_shutdown_and_restart() {
             capture_images: false,
             capture_source_app: false,
         },
+        ..AppSettings::default()
     };
     let saved = worker.client().save(0, expected.clone()).unwrap();
     assert_eq!(saved.revision(), 1);
@@ -375,6 +366,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     max_items: 0,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.max_items",
         ),
@@ -385,6 +377,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     max_items: 100_001,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.max_items",
         ),
@@ -395,6 +388,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     retention_days: 0,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.retention_days",
         ),
@@ -405,6 +399,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     retention_days: 3_651,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.retention_days",
         ),
@@ -415,6 +410,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     image_quota_mib: 15,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.image_quota_mib",
         ),
@@ -425,6 +421,7 @@ fn save_rejects_all_numeric_out_of_range_values() {
                     image_quota_mib: 10_241,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             },
             "history.image_quota_mib",
         ),

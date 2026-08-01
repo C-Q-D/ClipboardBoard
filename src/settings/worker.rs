@@ -524,6 +524,7 @@ mod tests {
                 max_items,
                 ..HistorySettings::default()
             },
+            ..AppSettings::default()
         }
     }
 

@@ -20,6 +20,8 @@ pub(crate) const IMAGE_QUOTA_MIB_RANGE: std::ops::RangeInclusive<u32> = 16..=10_
 pub struct AppSettings {
     /// 历史与图片容量设置。
     pub history: HistorySettings,
+    /// 本地隐私与记录策略。
+    pub privacy: PrivacySettings,
 }
 
 impl Default for AppSettings {
@@ -27,8 +29,30 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             history: HistorySettings::default(),
+            privacy: PrivacySettings::default(),
         }
     }
+}
+
+/// 剪贴板记录隐私设置。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct PrivacySettings {
+    /// 当前持久化的记录暂停状态。
+    pub recording_pause: RecordingPause,
+}
+
+/// 可跨重启恢复的记录暂停模式。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", content = "until_unix_millis", rename_all = "snake_case")]
+pub enum RecordingPause {
+    /// 正常读取剪贴板更新。
+    #[default]
+    Active,
+    /// 暂停到指定 UTC Unix epoch 毫秒。
+    UntilUnixMillis(u64),
+    /// 无限暂停，必须由用户显式恢复。
+    Indefinite,
 }
 
 /// 历史记录与图片捕获的限制配置。
@@ -172,6 +196,7 @@ mod tests {
                     image_quota_mib,
                     ..HistorySettings::default()
                 },
+                ..AppSettings::default()
             };
             assert_eq!(validate_settings(&settings).is_ok(), expected);
         }

@@ -16,6 +16,7 @@ use super::reader::{
 use super::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
 use crate::domain::ClipboardPayload;
 use crate::platform::windows::ProcessSource;
+use crate::privacy::{GateMode, RecordingGate};
 
 /// worker 请求的有限错误集合，不携带线程 panic 文本或外部字符串。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,7 +46,7 @@ impl ClipboardCaptureRequest {
 }
 
 /// worker 成功完成一次捕获后返回的拥有型结果。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClipboardCaptureResult {
     /// 与本次读取绑定的剪贴板序号，供后续历史协调器建立幂等键。
     pub sequence: u32,
@@ -53,6 +54,18 @@ pub struct ClipboardCaptureResult {
     pub source: Option<ProcessSource>,
     /// 已脱离 HGLOBAL 生命周期的唯一文本或图片 payload。
     pub payload: ClipboardCapturePayload,
+}
+
+impl std::fmt::Debug for ClipboardCaptureResult {
+    /// 只输出序号、来源是否存在和 payload 摘要，禁止诊断递归展开正文。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClipboardCaptureResult")
+            .field("sequence", &self.sequence)
+            .field("source_present", &self.source.is_some())
+            .field("payload", &self.payload)
+            .finish()
+    }
 }
 
 /// UI 请求只复制某条历史时提交的轻量命令；正文仍必须从存储线程按 ID 读取。
@@ -270,11 +283,11 @@ impl ClipboardCaptureInbox {
         self.signal_work();
     }
 
-    /// 标记结果桥关闭；保留已经发布的捕获结果，但丢弃尚未执行的复制命令。
+    /// 标记结果桥关闭，保留已经发布的捕获结果并唤醒等待中的结果泵。
     ///
-    /// 该方法只由 worker 在 `join` 完成后调用；这样在途读取仍有机会发布最终结果，
-    /// 关闭不会把已经交接给桥的正文静默丢弃，也不会在 UI 已退出后启动新的 Win32 写回。
-    pub(crate) fn close(&self) {
+    /// 生命周期协调器应在 join 结果泵之前调用它：线性化点之前已取出的在途读取仍可
+    /// 发布最终结果，之后的新捕获和写回请求一律被拒绝，不会在 UI 已退出后继续工作。
+    pub fn close(&self) {
         self.close_copy_requests();
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
@@ -410,12 +423,20 @@ impl LatestRequestQueue {
 impl ClipboardIoWorker {
     /// 创建并启动 ClipboardIO worker 线程；创建失败返回有限错误而不 panic。
     pub fn start() -> Result<Self, ClipboardWorkerError> {
-        Self::start_with_inbox(ClipboardCaptureInbox::new())
+        Self::start_with_gate(
+            ClipboardCaptureInbox::new(),
+            ClipboardWriteExpectationStore::new(),
+            RecordingGate::new(GateMode::Active),
+        )
     }
 
     /// 使用调用方提供的结果桥启动 worker，便于消息线程和后续协调器共享同一接缝。
     pub fn start_with_inbox(inbox: ClipboardCaptureInbox) -> Result<Self, ClipboardWorkerError> {
-        Self::start_with_inbox_and_expectations(inbox, ClipboardWriteExpectationStore::new())
+        Self::start_with_gate(
+            inbox,
+            ClipboardWriteExpectationStore::new(),
+            RecordingGate::new(GateMode::Active),
+        )
     }
 
     /// 使用调用方提供的写回预期启动 worker；自身写回事件会在发布历史前一次性消费。
@@ -423,13 +444,25 @@ impl ClipboardIoWorker {
         inbox: ClipboardCaptureInbox,
         expectations: ClipboardWriteExpectationStore,
     ) -> Result<Self, ClipboardWorkerError> {
+        Self::start_with_gate(inbox, expectations, RecordingGate::new(GateMode::Active))
+    }
+
+    /// 使用调用方共享门禁启动 worker，暂停时 backend 甚至不会被构造。
+    pub fn start_with_gate(
+        inbox: ClipboardCaptureInbox,
+        expectations: ClipboardWriteExpectationStore,
+        gate: RecordingGate,
+    ) -> Result<Self, ClipboardWorkerError> {
         let queue = Arc::new(LatestRequestQueue::new());
         let worker_queue = Arc::clone(&queue);
         let worker_inbox = inbox.clone();
         let worker_expectations = expectations;
+        let worker_gate = gate.clone();
         let join_handle = thread::Builder::new()
             .name("ClipboardIoWorker".to_owned())
-            .spawn(move || worker_loop(worker_queue, worker_inbox, worker_expectations))
+            .spawn(move || {
+                worker_loop(worker_queue, worker_inbox, worker_expectations, worker_gate)
+            })
             .map_err(|_| ClipboardWorkerError::ThreadStart)?;
 
         Ok(Self {
@@ -521,16 +554,19 @@ fn worker_loop(
     queue: Arc<LatestRequestQueue>,
     inbox: ClipboardCaptureInbox,
     expectations: ClipboardWriteExpectationStore,
+    gate: RecordingGate,
 ) {
     while let Some(request) = queue.pop() {
-        let mut backend = Win32ClipboardBackend;
         match request.response {
             ReadResponse::Payload(response) => {
-                let result = read_text_with_backend(
-                    &mut backend,
-                    request.expected_sequence,
-                    RetryPolicy::default(),
-                );
+                let result = gate.try_read().and_then(|_permit| {
+                    let mut backend = Win32ClipboardBackend;
+                    read_text_with_backend(
+                        &mut backend,
+                        request.expected_sequence,
+                        RetryPolicy::default(),
+                    )
+                });
                 let _ = response.send(result);
             }
             ReadResponse::Capture {
@@ -538,26 +574,48 @@ fn worker_loop(
                 sequence,
                 source,
             } => {
-                let result = read_capture_payload_with_backend(
-                    &mut backend,
+                let capture_result = capture_with_factory(
+                    &gate,
                     request.expected_sequence,
-                    RetryPolicy::default(),
-                );
-                let capture_result = result.map(|payload| ClipboardCaptureResult {
                     sequence,
                     source,
-                    payload,
-                });
-                let publish_capture = should_publish_capture(&capture_result, &expectations);
-                // 先发布到公共桥，再尝试响应直连调用方；即使直连 Receiver 已被丢弃，
-                // 后续历史协调器仍能观察到同一个最新结果或 sequence 失配错误。
-                if publish_capture {
-                    inbox.publish(capture_result.clone());
-                }
+                    &inbox,
+                    &expectations,
+                    || Win32ClipboardBackend,
+                );
                 let _ = response.send(capture_result);
             }
         }
     }
+}
+
+/// 生产与测试共用的唯一捕获路径；许可覆盖 factory、读取、结果形成和 inbox 发布。
+fn capture_with_factory<B, F>(
+    gate: &RecordingGate,
+    expected_sequence: Option<u32>,
+    sequence: u32,
+    source: Option<ProcessSource>,
+    inbox: &ClipboardCaptureInbox,
+    expectations: &ClipboardWriteExpectationStore,
+    factory: F,
+) -> Result<ClipboardCaptureResult, ClipboardReadError>
+where
+    B: super::reader::ClipboardBackend,
+    F: FnOnce() -> B,
+{
+    let _permit = gate.try_read()?;
+    let mut backend = factory();
+    let result =
+        read_capture_payload_with_backend(&mut backend, expected_sequence, RetryPolicy::default());
+    let capture_result = result.map(|payload| ClipboardCaptureResult {
+        sequence,
+        source,
+        payload,
+    });
+    if should_publish_capture(&capture_result, expectations) {
+        inbox.publish(capture_result.clone());
+    }
+    capture_result
 }
 
 /// 仅在捕获结果不是已登记的自身 Unicode 写回时发布到历史桥，并保证预期只消费一次。
@@ -582,15 +640,33 @@ mod tests {
     //! 此测试模块验证 worker 的 latest-wins 队列、异步响应和停止回收协议。
 
     use super::{
-        should_publish_capture, ClipboardCaptureInbox, ClipboardCaptureRequest,
-        ClipboardCaptureResult, ClipboardCopyRequest, ClipboardIoWorker, ClipboardWorkItem,
-        ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
+        capture_with_factory, should_publish_capture, ClipboardCaptureInbox,
+        ClipboardCaptureRequest, ClipboardCaptureResult, ClipboardCopyRequest, ClipboardIoWorker,
+        ClipboardWorkItem, ClipboardWorkerError, LatestRequestQueue, ReadRequest, ReadResponse,
     };
+    use crate::clipboard::reader::{ClipboardBackend, ClipboardReadError, DibClipboardBytes};
     use crate::clipboard::writer::{ClipboardWriteExpectationStore, ClipboardWriteFormat};
-    use crate::clipboard::ClipboardCapturePayload;
+    use crate::clipboard::{ClipboardCapturePayload, ClipboardImageBytes};
     use crate::domain::ClipboardPayload;
+    use crate::privacy::{GateMode, RecordingGate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    /// 捕获结果的 Debug 只能输出类型摘要，不得回显文本正文或图片编码字节。
+    #[test]
+    fn 捕获结果_debug不泄漏正文() {
+        let result = ClipboardCaptureResult {
+            sequence: 7,
+            source: None,
+            payload: ClipboardCapturePayload::Text(ClipboardPayload::from_text("敏感剪贴板正文")),
+        };
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("敏感剪贴板正文"));
+        assert!(debug.contains("byte_len"));
+        assert!(debug.contains("source_present"));
+    }
 
     /// 新 worker 可以提交请求；当前桌面无剪贴板时结果仍必须有限返回而不挂起调用方。
     #[test]
@@ -896,5 +972,89 @@ mod tests {
 
         assert!(!should_publish_capture(&result, &expectations));
         assert!(should_publish_capture(&result, &expectations));
+    }
+
+    /// 假 backend 支持文本或注册 PNG，对照同一生产捕获函数的两类结果。
+    struct FakeCaptureBackend {
+        image: bool,
+    }
+
+    impl ClipboardBackend for FakeCaptureBackend {
+        fn open(&mut self) -> bool {
+            true
+        }
+
+        fn close(&mut self) -> bool {
+            true
+        }
+
+        fn sequence(&mut self) -> u32 {
+            44
+        }
+
+        fn read_unicode_text(
+            &mut self,
+            _max_bytes: usize,
+        ) -> Result<ClipboardPayload, ClipboardReadError> {
+            Ok(ClipboardPayload::from_text("允许读取"))
+        }
+
+        fn read_registered_png_bytes(
+            &mut self,
+            _max_bytes: usize,
+        ) -> Result<Vec<u8>, ClipboardReadError> {
+            if self.image {
+                Ok(vec![1, 2, 3])
+            } else {
+                Err(ClipboardReadError::RegisteredPngUnavailable)
+            }
+        }
+
+        fn read_dib_bytes(
+            &mut self,
+            _max_bytes: usize,
+        ) -> Result<DibClipboardBytes, ClipboardReadError> {
+            Err(ClipboardReadError::DibUnavailable)
+        }
+    }
+
+    /// 暂停路径不得构造 backend；Active 对照必须发布文本和图片。
+    #[test]
+    fn 生产捕获路径在factory之前执行暂停门禁() {
+        let paused = RecordingGate::new(GateMode::Paused);
+        let inbox = ClipboardCaptureInbox::new();
+        let expectations = ClipboardWriteExpectationStore::new();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&factory_calls);
+        let result = capture_with_factory(
+            &paused,
+            Some(44),
+            44,
+            None,
+            &inbox,
+            &expectations,
+            move || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                FakeCaptureBackend { image: false }
+            },
+        );
+        assert_eq!(result, Err(ClipboardReadError::Paused));
+        assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+        assert!(inbox.try_take().is_none());
+
+        let active = RecordingGate::new(GateMode::Active);
+        for image in [false, true] {
+            let result =
+                capture_with_factory(&active, Some(44), 44, None, &inbox, &expectations, || {
+                    FakeCaptureBackend { image }
+                })
+                .unwrap();
+            match (image, result.payload) {
+                (true, ClipboardCapturePayload::Image(ClipboardImageBytes::RegisteredPng(_)))
+                | (false, ClipboardCapturePayload::Text(_)) => {}
+                _ => panic!("Active 对照返回了错误类型"),
+            }
+            assert!(inbox.try_take().is_some());
+        }
     }
 }

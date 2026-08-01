@@ -6,6 +6,7 @@
 use super::hotkey::HotkeyError;
 use crate::app::post_ui_event;
 use crate::command::UiEvent;
+use crate::privacy::{PauseCommand, PauseCommandSender, PauseStatus};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
@@ -16,8 +17,8 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CopyIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, LoadIconW,
-    SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, MF_STRING, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
+    SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// 托盘回调消息使用独立编号，避免与单实例唤起消息混淆。
@@ -29,6 +30,24 @@ pub(crate) const TRAY_ICON_ID: u32 = 1;
 const TRAY_MENU_OPEN: usize = 0x5001;
 /// “退出”菜单命令 ID；不复用系统保留值。
 const TRAY_MENU_EXIT: usize = 0x5002;
+/// 暂停五分钟命令。
+const TRAY_MENU_PAUSE_FIVE: usize = 0x5003;
+/// 暂停三十分钟命令。
+const TRAY_MENU_PAUSE_THIRTY: usize = 0x5004;
+/// 无限暂停命令。
+const TRAY_MENU_PAUSE_INDEFINITE: usize = 0x5005;
+/// 恢复记录命令。
+const TRAY_MENU_RESUME: usize = 0x5006;
+/// 仅用于展示当前状态的灰色菜单项，不映射为业务动作。
+const TRAY_MENU_STATUS: usize = 0x5007;
+
+/// 托盘菜单返回的纯动作，不携带 HWND 或配置客户端。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayAction {
+    Open,
+    Exit,
+    Pause(PauseCommand),
+}
 
 /// 持有托盘通知数据直到消息线程退出，确保图标生命周期覆盖整个消息泵。
 pub(crate) struct TrayGuard {
@@ -127,12 +146,17 @@ impl Drop for TrayGuard {
 }
 
 /// 处理 Shell 托盘回调；版本 4 将图标 ID 和鼠标消息打包在 lParam 的高低字中。
-pub(crate) fn handle_callback(window: HWND, _wparam: usize, lparam: isize) -> bool {
+pub(crate) fn handle_callback(
+    window: HWND,
+    _wparam: usize,
+    lparam: isize,
+    pause: &PauseCommandSender,
+) -> bool {
     let Some(_) = decode_v4_callback(lparam) else {
         return false;
     };
 
-    if let Err(error) = show_menu(window) {
+    if let Err(error) = show_menu(window, pause).and_then(|action| dispatch_action(action, pause)) {
         eprintln!("显示托盘菜单失败：{error}");
     }
     true
@@ -155,13 +179,14 @@ fn is_supported_mouse_message(message: u32) -> bool {
 }
 
 /// 创建并同步显示最小托盘菜单；菜单句柄在所有分支都由 `DestroyMenu` 回收。
-fn show_menu(window: HWND) -> Result<(), HotkeyError> {
+fn show_menu(window: HWND, pause: &PauseCommandSender) -> Result<Option<TrayAction>, HotkeyError> {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return Err(last_error("CreatePopupMenu"));
     }
 
-    let append_result = append_menu_items(menu);
+    // 只读取原子 PauseStatus；菜单线程不调用 SettingsClient 或其他阻塞配置接口。
+    let append_result = append_menu_items(menu, pause.status());
     if let Err(error) = append_result {
         if let Err(cleanup_error) = destroy_menu(menu) {
             eprintln!("托盘菜单添加失败后的 DestroyMenu 也失败：{cleanup_error}");
@@ -210,21 +235,45 @@ fn show_menu(window: HWND) -> Result<(), HotkeyError> {
                 "TrackPopupMenu 失败，错误码 {track_error_code}"
             )));
         }
-        return Ok(());
+        return Ok(None);
     }
+    Ok(action_for_command(command))
+}
 
-    match command {
-        TRAY_MENU_OPEN => post_ui_event(UiEvent::ShowPanel)
+/// 把纯动作投递到各自非阻塞入口；暂停接收不代表事务完成。
+fn dispatch_action(
+    action: Option<TrayAction>,
+    pause: &PauseCommandSender,
+) -> Result<(), HotkeyError> {
+    match action {
+        Some(TrayAction::Open) => post_ui_event(UiEvent::ShowPanel)
             .map_err(|error| HotkeyError::Tray(format!("托盘打开事件无法进入 UI 队列：{error}"))),
-        TRAY_MENU_EXIT => post_ui_event(UiEvent::Quit)
+        Some(TrayAction::Exit) => post_ui_event(UiEvent::Quit)
             .map_err(|error| HotkeyError::Tray(format!("托盘退出事件无法进入 UI 队列：{error}"))),
-        _ => Ok(()),
+        Some(TrayAction::Pause(command)) => pause
+            .try_submit(command)
+            .map_err(|error| HotkeyError::Tray(error.to_string())),
+        None => Ok(()),
+    }
+}
+
+/// 固定菜单 ID 到业务动作的纯映射。
+fn action_for_command(command: usize) -> Option<TrayAction> {
+    match command {
+        TRAY_MENU_OPEN => Some(TrayAction::Open),
+        TRAY_MENU_EXIT => Some(TrayAction::Exit),
+        TRAY_MENU_PAUSE_FIVE => Some(TrayAction::Pause(PauseCommand::PauseFiveMinutes)),
+        TRAY_MENU_PAUSE_THIRTY => Some(TrayAction::Pause(PauseCommand::PauseThirtyMinutes)),
+        TRAY_MENU_PAUSE_INDEFINITE => Some(TrayAction::Pause(PauseCommand::PauseIndefinitely)),
+        TRAY_MENU_RESUME => Some(TrayAction::Pause(PauseCommand::Resume)),
+        _ => None,
     }
 }
 
 /// 添加固定的“打开/退出”菜单项，任何失败都交给调用方清理菜单句柄。
 fn append_menu_items(
     menu: windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
+    status: PauseStatus,
 ) -> Result<(), HotkeyError> {
     let open_added = unsafe {
         AppendMenuW(
@@ -236,6 +285,43 @@ fn append_menu_items(
     } != 0;
     if !open_added {
         return Err(last_error("AppendMenuW(打开)"));
+    }
+    if unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            TRAY_MENU_STATUS,
+            status_menu_text(status),
+        )
+    } == 0
+    {
+        return Err(last_error("AppendMenuW(暂停状态)"));
+    }
+    if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
+        return Err(last_error("AppendMenuW(分隔线)"));
+    }
+    let action_flags = pause_action_flags(status);
+    for (id, label) in [
+        (
+            TRAY_MENU_PAUSE_FIVE,
+            windows_sys::core::w!("暂停记录 5 分钟"),
+        ),
+        (
+            TRAY_MENU_PAUSE_THIRTY,
+            windows_sys::core::w!("暂停记录 30 分钟"),
+        ),
+        (
+            TRAY_MENU_PAUSE_INDEFINITE,
+            windows_sys::core::w!("暂停记录（无限期）"),
+        ),
+        (TRAY_MENU_RESUME, windows_sys::core::w!("恢复记录")),
+    ] {
+        if unsafe { AppendMenuW(menu, action_flags, id, label) } == 0 {
+            return Err(last_error("AppendMenuW(暂停命令)"));
+        }
+    }
+    if unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, null()) } == 0 {
+        return Err(last_error("AppendMenuW(分隔线)"));
     }
 
     let exit_added = unsafe {
@@ -250,6 +336,39 @@ fn append_menu_items(
         return Err(last_error("AppendMenuW(退出)"));
     }
     Ok(())
+}
+
+/// 将只读暂停状态映射为菜单上的人类可读状态文本。
+fn status_menu_label(status: PauseStatus) -> &'static str {
+    match status {
+        PauseStatus::Active => "状态：正在记录",
+        PauseStatus::PausedTimed => "状态：定时暂停",
+        PauseStatus::PausedIndefinite => "状态：无限暂停",
+        PauseStatus::Updating => "状态：正在更新",
+        PauseStatus::Reconciling => "状态：等待对账",
+    }
+}
+
+/// 将状态文本转换为静态 UTF-16 指针，供 AppendMenuW 使用。
+fn status_menu_text(status: PauseStatus) -> windows_sys::core::PCWSTR {
+    debug_assert!(!status_menu_label(status).is_empty());
+    match status {
+        PauseStatus::Active => windows_sys::core::w!("状态：正在记录"),
+        PauseStatus::PausedTimed => windows_sys::core::w!("状态：定时暂停"),
+        PauseStatus::PausedIndefinite => windows_sys::core::w!("状态：无限暂停"),
+        PauseStatus::Updating => windows_sys::core::w!("状态：正在更新"),
+        PauseStatus::Reconciling => windows_sys::core::w!("状态：等待对账"),
+    }
+}
+
+/// 只有正在提交当前事务时禁用四类动作；对账状态允许最新命令覆盖悬挂策略。
+fn pause_action_flags(status: PauseStatus) -> u32 {
+    MF_STRING
+        | if matches!(status, PauseStatus::Updating) {
+            MF_GRAYED
+        } else {
+            0
+        }
 }
 
 /// 销毁菜单；菜单销毁失败必须被观察到，避免句柄泄漏被静默吞掉。
@@ -304,9 +423,15 @@ mod tests {
     //! 此测试模块验证固定托盘消息和命令值，不依赖桌面 Shell 状态。
 
     use super::{
-        decode_v4_callback, is_supported_mouse_message, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID,
+        action_for_command, decode_v4_callback, is_supported_mouse_message, pause_action_flags,
+        status_menu_label, TrayAction, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID, TRAY_MENU_EXIT,
+        TRAY_MENU_OPEN, TRAY_MENU_PAUSE_FIVE, TRAY_MENU_PAUSE_INDEFINITE, TRAY_MENU_PAUSE_THIRTY,
+        TRAY_MENU_RESUME, TRAY_MENU_STATUS,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_APP, WM_LBUTTONUP, WM_RBUTTONUP};
+    use crate::privacy::{PauseCommand, PauseStatus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MF_GRAYED, MF_STRING, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP,
+    };
 
     /// 托盘回调必须和单实例唤起、热键消息使用不同编号。
     #[test]
@@ -334,5 +459,46 @@ mod tests {
         assert_eq!(decode_v4_callback(left_click), Some(WM_LBUTTONUP));
         assert_eq!(decode_v4_callback(right_click), Some(WM_RBUTTONUP));
         assert_eq!(decode_v4_callback(wrong_icon), None);
+    }
+
+    /// 四类隐私命令与原有打开/退出使用固定且互异的纯动作映射。
+    #[test]
+    fn 托盘暂停命令映射稳定() {
+        assert_eq!(action_for_command(TRAY_MENU_OPEN), Some(TrayAction::Open));
+        assert_eq!(action_for_command(TRAY_MENU_EXIT), Some(TrayAction::Exit));
+        assert_eq!(
+            action_for_command(TRAY_MENU_PAUSE_FIVE),
+            Some(TrayAction::Pause(PauseCommand::PauseFiveMinutes))
+        );
+        assert_eq!(
+            action_for_command(TRAY_MENU_PAUSE_THIRTY),
+            Some(TrayAction::Pause(PauseCommand::PauseThirtyMinutes))
+        );
+        assert_eq!(
+            action_for_command(TRAY_MENU_PAUSE_INDEFINITE),
+            Some(TrayAction::Pause(PauseCommand::PauseIndefinitely))
+        );
+        assert_eq!(
+            action_for_command(TRAY_MENU_RESUME),
+            Some(TrayAction::Pause(PauseCommand::Resume))
+        );
+        assert_eq!(action_for_command(TRAY_MENU_STATUS), None);
+        assert_eq!(action_for_command(0xffff), None);
+    }
+
+    /// 菜单状态只读取原子 PauseStatus；仅更新期间禁用动作，对账允许最新命令覆盖。
+    #[test]
+    fn 菜单状态展示和启用策略稳定() {
+        assert_eq!(status_menu_label(PauseStatus::Active), "状态：正在记录");
+        assert_eq!(
+            status_menu_label(PauseStatus::PausedTimed),
+            "状态：定时暂停"
+        );
+        assert_eq!(
+            pause_action_flags(PauseStatus::Updating),
+            MF_STRING | MF_GRAYED
+        );
+        assert_eq!(pause_action_flags(PauseStatus::Reconciling), MF_STRING);
+        assert_eq!(pause_action_flags(PauseStatus::PausedIndefinite), MF_STRING);
     }
 }

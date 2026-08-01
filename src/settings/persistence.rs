@@ -284,26 +284,20 @@ fn merge_known_settings(document: &Value, settings: &AppSettings) -> Value {
     merge_known_document(document, &known)
 }
 
-/// 通用合并接缝：所有顶层已知键覆盖旧值，history 对象额外递归保留未知键。
+/// 通用递归合并接缝：已知值覆盖同名旧值，每层对象继续保留未知键。
 fn merge_known_document(document: &Value, known: &Value) -> Value {
-    let mut root = document.as_object().cloned().unwrap_or_default();
-    for (key, known_value) in known.as_object().expect("已知配置文档必须是对象") {
-        if key == "history" {
-            let mut history = root
-                .remove(key)
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
-            if let Some(known_history) = known_value.as_object() {
-                for (history_key, history_value) in known_history {
-                    history.insert(history_key.clone(), history_value.clone());
-                }
-                root.insert(key.clone(), Value::Object(history));
-                continue;
-            }
-        }
-        root.insert(key.clone(), known_value.clone());
+    let (Some(old), Some(known)) = (document.as_object(), known.as_object()) else {
+        return known.clone();
+    };
+    let mut merged = old.clone();
+    for (key, known_value) in known {
+        let value = merged.get(key).map_or_else(
+            || known_value.clone(),
+            |old_value| merge_known_document(old_value, known_value),
+        );
+        merged.insert(key.clone(), value);
     }
-    Value::Object(root)
+    Value::Object(merged)
 }
 
 /// 将内部字段枚举映射为不含值的公共错误。
@@ -526,6 +520,7 @@ mod tests {
                 max_items: 2_222,
                 ..HistorySettings::default()
             },
+            ..AppSettings::default()
         }
     }
 

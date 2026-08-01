@@ -91,12 +91,19 @@ function Get-Integer([string]$Name) {
 }
 
 $itemCount = Get-Integer 'item_count'
+$logicalItemCount = Get-Integer 'logical_item_count'
 $textSummaryCount = Get-Integer 'text_summary_count'
 $imageSummaryCount = Get-Integer 'image_summary_count'
 $firstBatchItemCount = Get-Integer 'first_batch_item_count'
 $firstBatchRows = Get-Integer 'first_batch_rows'
 $firstBatchFirstRow = Get-Integer 'first_batch_first_row'
 $firstBatchLastRow = Get-Integer 'first_batch_last_row'
+$windowStart = Get-Integer 'window_start'
+$windowLength = Get-Integer 'window_length'
+$windowFirstAbsolute = Get-Integer 'window_first_absolute'
+$windowLastAbsolute = Get-Integer 'window_last_absolute'
+$datasetRevision = Get-Integer 'dataset_revision'
+$windowRevision = Get-Integer 'window_revision'
 $thumbnailSummaryCount = Get-Integer 'thumbnail_summary_count'
 $thumbnailLoadedCount = Get-Integer 'thumbnail_loaded_count'
 $thumbnailWidth = Get-Integer 'thumbnail_width'
@@ -136,12 +143,17 @@ if ($fields['lru_contract_tests'] -ne 'passed') {
 
 $failures = [System.Collections.Generic.List[string]]::new()
 if ($itemCount -ne 20000) { $failures.Add("混合模型条数 $itemCount != 20000") }
+if ($logicalItemCount -ne 20000) { $failures.Add("逻辑数据集条数 $logicalItemCount != 20000") }
 if ($textSummaryCount -ne 10000) { $failures.Add("文本摘要数 $textSummaryCount != 10000") }
 if ($imageSummaryCount -ne 10000) { $failures.Add("图片摘要数 $imageSummaryCount != 10000") }
 if ($firstBatchItemCount -ne 20000) { $failures.Add("首批绑定模型条数 $firstBatchItemCount != 20000") }
 if ($firstBatchRows -le 0 -or $firstBatchRows -gt 100) { $failures.Add("首批访问行数 $firstBatchRows 不在 1..100") }
 if ($firstBatchFirstRow -ne 0) { $failures.Add("首批起始行 $firstBatchFirstRow != 0") }
 if ($firstBatchLastRow -ge 100) { $failures.Add("首批末行 $firstBatchLastRow >= 100") }
+if ($windowStart -ne 0 -or $windowFirstAbsolute -ne 0) { $failures.Add("首帧窗口未从绝对索引 0 开始：start=$windowStart first=$windowFirstAbsolute") }
+if ($windowLength -le 0 -or $windowLength -gt 100) { $failures.Add("首帧窗口长度 $windowLength 不在 1..100") }
+if ($windowLastAbsolute -ge 100) { $failures.Add("首帧窗口末绝对索引 $windowLastAbsolute >= 100") }
+if ($datasetRevision -le 0 -or $windowRevision -le 0) { $failures.Add('显式几何 revision 必须为正数') }
 if ($thumbnailSummaryCount -ne 10000) { $failures.Add("图片缩略图摘要数 $thumbnailSummaryCount != 10000") }
 if ($thumbnailLoadedCount -ne 10000) { $failures.Add("已加载代表性缩略图数 $thumbnailLoadedCount != 10000") }
 if ($thumbnailWidth -ne 16 -or $thumbnailHeight -ne 16) { $failures.Add("代表性缩略图尺寸 ${thumbnailWidth}x${thumbnailHeight} != 16x16") }

@@ -1,6 +1,6 @@
 // 此文件定义 ClipboardBoard 的黑色浮动看板、搜索筛选、文本摘要卡片和面板级键盘契约。
 // 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
-// 历史内容区使用 Slint ListView 的窗口化 repeater，避免为不可见历史创建完整组件树。
+// 历史内容区默认保留旧 ListView 兼容路径；metadata 模式使用普通 Flickable 和精确画布。
 
 import { LineEdit } from "std-widgets.slint";
 
@@ -42,6 +42,144 @@ component ListView inherits Flickable {
     @children
 }
 
+// HistoryCard 复用文本/图片卡片视觉和操作按钮；geometry 模式只替换其绝对定位父容器。
+component HistoryCard inherits Rectangle {
+    in property <ClipboardCard> card;
+    in property <int> card-index: -1;
+    in property <bool> selected: false;
+    in property <bool> mutation-pending: false;
+    callback card-selected(index: int);
+    callback card-copied(index: int);
+    callback card-pinned(index: int);
+    callback card-deleted(index: int);
+
+    // 显式固定 layout info，避免 ListView 把内部 TouchArea 的默认首选高度叠加到行高。
+    preferred-height: card.is_image ? 186px : 106px;
+    min-height: self.preferred-height;
+    max-height: self.preferred-height;
+    background: transparent;
+
+    card-background := Rectangle {
+        height: card.is_image ? 176px : 96px;
+        // 根 HistoryCard 已声明真实行高；背景子树不应再把自身布局首选高度向外累加。
+        preferred-height: 0px;
+        width: parent.width;
+        clip: true;
+        background: selected
+            ? #242424
+            : card-touch.has-hover ? #1b1b1b : #141414;
+        border-width: selected ? 2px : 1px;
+        border-color: selected ? #f5f5f5 : #292929;
+        border-radius: 10px;
+
+        VerticalLayout {
+            visible: !card.is_image;
+            width: parent.width - 144px;
+            height: parent.height;
+            padding: 14px;
+            spacing: 8px;
+            Text {
+                text: card.preview;
+                height: 46px;
+                vertical-stretch: 0;
+                color: #f5f5f5;
+                font-size: 14px;
+                wrap: word-wrap;
+                overflow: clip;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text { text: card.source; color: #8c8c8c; font-size: 11px; }
+                Text {
+                    text: card.relative_time;
+                    color: #666666;
+                    font-size: 11px;
+                    horizontal-alignment: right;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        if card.is_image: Rectangle {
+            x: 14px; y: 12px; width: parent.width - 172px; height: 112px;
+            background: #0d0d0d; border-width: 1px; border-color: #303030; border-radius: 6px; clip: true;
+            Image {
+                visible: card.thumbnail_loaded;
+                width: parent.width; height: parent.height;
+                source: card.thumbnail; image-fit: cover;
+            }
+            Text {
+                visible: !card.thumbnail_loaded;
+                text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
+                color: #666666; font-size: 12px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+        if card.is_image: Text {
+            x: 14px; y: 132px; width: parent.width - 172px;
+            text: "图片  " + card.image_width + " × " + card.image_height;
+            color: #f5f5f5; font-size: 12px;
+        }
+        if card.is_image: Text {
+            x: 14px; y: 151px; width: parent.width - 172px;
+            text: card.source + "  ·  " + card.relative_time;
+            color: #777777; font-size: 11px;
+        }
+
+        card-touch := TouchArea {
+            width: parent.width - 144px;
+            clicked => { card-selected(card-index); }
+        }
+
+        delete-button := Rectangle {
+            x: parent.width - 138px; y: (parent.height - self.height) / 2;
+            width: 36px; height: 36px; border-radius: 6px;
+            background: delete-touch.pressed ? #f5f5f5 : delete-touch.has-hover ? #303030 : #242424;
+            border-width: 1px; border-color: #4a4a4a;
+            Text {
+                text: card.delete_pending ? "…" : "删";
+                color: delete-touch.pressed ? #080808 : #f5f5f5;
+                font-size: card.delete_pending ? 15px : 12px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            delete-touch := TouchArea {
+                enabled: !mutation-pending && !card.delete_pending;
+                clicked => { if (!mutation-pending && !card.delete_pending) { card-deleted(card-index); } }
+            }
+        }
+        pin-button := Rectangle {
+            x: parent.width - 94px; y: (parent.height - self.height) / 2;
+            width: 36px; height: 36px; border-radius: 6px;
+            background: pin-touch.pressed ? #f5f5f5 : pin-touch.has-hover ? #303030 : #242424;
+            border-width: 1px; border-color: card.is_pinned ? #f5f5f5 : #4a4a4a;
+            Text {
+                text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
+                color: pin-touch.pressed ? #080808 : #f5f5f5;
+                font-size: card.pin_pending ? 15px : 18px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            pin-touch := TouchArea {
+                enabled: !mutation-pending && !card.pin_pending;
+                clicked => { if (!mutation-pending && !card.pin_pending) { card-pinned(card-index); } }
+            }
+        }
+        copy-button := Rectangle {
+            x: parent.width - 50px; y: (parent.height - self.height) / 2;
+            width: 44px; height: 36px; border-radius: 6px;
+            background: copy-touch.pressed ? #f5f5f5 : copy-touch.has-hover ? #303030 : #242424;
+            border-width: 1px; border-color: #4a4a4a;
+            Text {
+                text: "复制"; color: copy-touch.pressed ? #080808 : #f5f5f5;
+                font-size: 12px; horizontal-alignment: center; vertical-alignment: center;
+            }
+            copy-touch := TouchArea {
+                enabled: card.copy_enabled;
+                clicked => { if (card.copy_enabled) { card-copied(card-index); } }
+            }
+        }
+    }
+}
+
 // AppWindow 是快捷键呼出的临时黑色看板，Rust 侧负责生命周期和事件代次。
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次确保只有当前会话的 Esc 可以隐藏。
@@ -75,7 +213,7 @@ export component AppWindow inherits Window {
     // 标签点击只发送稳定索引，未知索引由 Rust 边界转换为“全部”。
     callback search-filter-requested(filter: int);
     // 真实列表滚动或布局变化时上报几何；Rust 只在进入底部阈值的边沿续页。
-    callback history-viewport-changed(viewport-y: length, visible-height: length, content-height: length);
+    callback history-viewport-changed(viewport-y: length, visible-height: length, content-height: length, origin-token: string);
     // 续页失败提示是唯一的同区重试入口，普通重绘不能自动重发请求。
     callback retry-history-page-requested();
     forward-focus: panel-focus;
@@ -86,6 +224,26 @@ export component AppWindow inherits Window {
     background: #080808;
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
+    // legacy repeater 的动态模型；进入 geometry-mode 后强制为空，避免隐藏 ListView 访问旧模型。
+    in property <[ClipboardCard]> legacy-cards: geometry-mode ? [] : cards;
+    // 显式几何模式的有界窗口卡片；其长度最多 100，不代表完整逻辑数量。
+    in property <[ClipboardCard]> window-cards: [];
+    // 每个窗口卡片相对于精确内容画布顶部的整数像素偏移。
+    in property <[length]> window-offsets: [];
+    // metadata 一旦设置即进入显式 Flickable 模式，禁止同时使用 compiler-magic ListView。
+    in property <bool> geometry-mode: false;
+    // 完整历史数量与窗口模型分离，续页和状态文案只能读取该逻辑数量。
+    in property <int> history-logical-count: 0;
+    // Rust prefix-sum 计算出的单一内容高度来源。
+    in property <length> geometry-content-height: 0px;
+    // 几何模式下的视口坐标和窗口绝对起点。
+    in-out property <length> geometry-viewport-y <=> geometry-history-list.viewport-y;
+    // 程序 clamp 视口时暂存一次性 token；用户滚动回调会携带空字符串。
+    in-out property <string> geometry-origin-token: "";
+    // Rust 原子替换 cards/offsets/画布期间抑制中间布局回调，最终视口设置后再发出一次完整事件。
+    in property <bool> geometry-events-suppressed: false;
+    in property <int> window-start: 0;
+    in property <int> window-length: 0;
     // 鼠标与键盘共用同一选中索引；负数表示当前没有选中卡片。
     in property <int> selected-index: -1;
     // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
@@ -110,12 +268,28 @@ export component AppWindow inherits Window {
     in property <bool> clear-all-error-visible: false;
     // 收藏、删除和两种清空共享的视觉互斥；Rust reducer 仍负责最终权限校验。
     in property <bool> history-mutation-pending: false;
-    // 性能探针和后续滚轮交互通过此别名驱动真实列表视口；默认值保持顶部。
-    in-out property <length> history-viewport-y <=> history-list.viewport-y;
+    // 性能探针和后续滚轮交互通过此统一视口属性驱动 legacy 或显式 Flickable；默认值保持顶部。
+    in-out property <length> history-viewport-y: 0px;
+    // legacy ListView 保留双向别名，使模型替换后的内部 clamp 能同步回统一视口属性。
+    in-out property <length> legacy-history-viewport-y <=> history-list.viewport-y;
     // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
-    out property <int> history-model-length: cards.length;
-    out property <length> history-visible-height: history-list.visible-height;
-    out property <length> history-viewport-height: history-list.viewport-height;
+    out property <int> history-model-length: geometry-mode ? history-logical-count : cards.length;
+    out property <length> history-visible-height: geometry-mode ? geometry-history-list.height : history-list.visible-height;
+    out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
+    // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
+    changed history-viewport-y => {
+        if (geometry-mode) {
+            geometry-viewport-y = self.history-viewport-y;
+        } else {
+            legacy-history-viewport-y = self.history-viewport-y;
+        }
+    }
+    // legacy ListView 内部 clamp 时反向同步统一属性；显式模式忽略隐藏列表的零高度变化。
+    changed legacy-history-viewport-y => {
+        if (!geometry-mode) {
+            history-viewport-y = self.legacy-history-viewport-y;
+        }
+    }
 
     panel-focus := FocusScope {
         // 捕获阶段先于搜索框等内部控件执行，确保 Esc 和选择键不会因子控件消费而失效。
@@ -448,43 +622,26 @@ export component AppWindow inherits Window {
                     font-size: 14px;
                 }
 
-                // ListView 由 Slint 负责滚动和窗口化，Rust 侧只提供 ModelRc 数据。
-                // 文本与图片各使用固定高度，混合列表的总高度由 ListView 真实累加。
+                // metadata 未提供时仍保留旧固定高度 ListView，兼容 ATOM-14R 和旧 set_cards 调用。
                 history-list := ListView {
+                    visible: !geometry-mode;
                     vertical-stretch: 1;
                     changed viewport-y => {
-                        history-viewport-changed(
-                            self.viewport-y,
-                            self.visible-height,
-                            self.viewport-height
-                        );
+                        if (!geometry-mode) { history-viewport-y = self.viewport-y; }
+                        history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
                     }
-                    changed visible-height => {
-                        history-viewport-changed(
-                            self.viewport-y,
-                            self.visible-height,
-                            self.viewport-height
-                        );
-                    }
-                    changed viewport-height => {
-                        history-viewport-changed(
-                            self.viewport-y,
-                            self.visible-height,
-                            self.viewport-height
-                        );
-                    }
-
-                    for card[index] in cards: Rectangle {
-                        // 图片卡片提供 176px 预览区，文本卡片保持原有 96px 密度。
+                    changed visible-height => { history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, ""); }
+                    changed viewport-height => { history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, ""); }
+                    for card[index] in legacy-cards: Rectangle {
+                        // legacy repeater 项必须直接声明固定高度；不要把 HistoryCard 作为根组件，
+                        // 否则组件内部布局信息会被 ListView 当成额外行高。
                         height: card.is_image ? 186px : 106px;
                         background: transparent;
 
                         card-background := Rectangle {
                             height: card.is_image ? 176px : 96px;
                             width: parent.width;
-                            // 固定高度虚拟卡片必须裁剪子元素，禁止长预览绘制到卡片间隔。
                             clip: true;
-                            // 选中态优先于悬停态，确保鼠标离开后仍能辨认当前复制目标。
                             background: index == selected-index
                                 ? #242424
                                 : card-touch.has-hover ? #1b1b1b : #141414;
@@ -500,29 +657,18 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
 
                                 Text {
-                                    text: card.is_image
-                                        ? "图片  " + card.image_width + " × " + card.image_height
-                                        : card.preview;
-                                    // 46px 约容纳三行正文；来源信息始终保留在卡片底部。
+                                    text: card.preview;
                                     height: 46px;
                                     vertical-stretch: 0;
                                     color: #f5f5f5;
                                     font-size: 14px;
                                     wrap: word-wrap;
-                                    // 多行文本使用 clip；elide 遇到开头空行时会把 `/*` 变成 `/*...`
-                                    // 并吞掉下一行。外层固定卡片已启用 clip，仍能阻止正文越界。
                                     overflow: clip;
                                 }
 
                                 HorizontalLayout {
                                     spacing: 8px;
-
-                                    Text {
-                                        text: card.source;
-                                        color: #8c8c8c;
-                                        font-size: 11px;
-                                    }
-
+                                    Text { text: card.source; color: #8c8c8c; font-size: 11px; }
                                     Text {
                                         text: card.relative_time;
                                         color: #666666;
@@ -543,7 +689,6 @@ export component AppWindow inherits Window {
                                 border-color: #303030;
                                 border-radius: 6px;
                                 clip: true;
-
                                 Image {
                                     visible: card.thumbnail_loaded;
                                     width: parent.width;
@@ -551,7 +696,6 @@ export component AppWindow inherits Window {
                                     source: card.thumbnail;
                                     image-fit: cover;
                                 }
-
                                 Text {
                                     visible: !card.thumbnail_loaded;
                                     text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
@@ -581,11 +725,8 @@ export component AppWindow inherits Window {
                             }
 
                             card-touch := TouchArea {
-                                // 右侧 144px 属于删除、收藏和复制按钮，主体选择区与操作区不重叠。
                                 width: parent.width - 144px;
-                                clicked => {
-                                    card-selection-requested(index);
-                                }
+                                clicked => { card-selection-requested(index); }
                             }
 
                             delete-button := Rectangle {
@@ -599,7 +740,6 @@ export component AppWindow inherits Window {
                                     : delete-touch.has-hover ? #303030 : #242424;
                                 border-width: 1px;
                                 border-color: #4a4a4a;
-
                                 Text {
                                     text: card.delete_pending ? "…" : "删";
                                     color: delete-touch.pressed ? #080808 : #f5f5f5;
@@ -607,7 +747,6 @@ export component AppWindow inherits Window {
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
-
                                 delete-touch := TouchArea {
                                     enabled: !history-mutation-pending && !card.delete_pending;
                                     clicked => {
@@ -629,7 +768,6 @@ export component AppWindow inherits Window {
                                     : pin-touch.has-hover ? #303030 : #242424;
                                 border-width: 1px;
                                 border-color: card.is_pinned ? #f5f5f5 : #4a4a4a;
-
                                 Text {
                                     text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
                                     color: pin-touch.pressed ? #080808 : #f5f5f5;
@@ -637,7 +775,6 @@ export component AppWindow inherits Window {
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
-
                                 pin-touch := TouchArea {
                                     enabled: !history-mutation-pending && !card.pin_pending;
                                     clicked => {
@@ -659,7 +796,6 @@ export component AppWindow inherits Window {
                                     : copy-touch.has-hover ? #303030 : #242424;
                                 border-width: 1px;
                                 border-color: #4a4a4a;
-
                                 Text {
                                     text: "复制";
                                     color: copy-touch.pressed ? #080808 : #f5f5f5;
@@ -667,16 +803,52 @@ export component AppWindow inherits Window {
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
-
                                 copy-touch := TouchArea {
                                     enabled: card.copy_enabled;
                                     clicked => {
-                                        if (card.copy_enabled) {
-                                            copy-item-requested(index);
-                                        }
+                                        if (card.copy_enabled) { copy-item-requested(index); }
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
+                geometry-history-list := Flickable {
+                    visible: geometry-mode;
+                    vertical-stretch: 1;
+                    // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
+                    viewport-height: geometry-content-height;
+                    changed viewport-y => {
+                        if (!geometry-events-suppressed) {
+                            history-viewport-y = self.viewport-y;
+                            let token = geometry-origin-token;
+                            geometry-origin-token = "";
+                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, token);
+                        }
+                    }
+                    changed height => {
+                        if (!geometry-events-suppressed) {
+                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
+                        }
+                    }
+                    Rectangle {
+                        width: parent.width;
+                        height: geometry-content-height;
+                        for card[index] in window-cards: HistoryCard {
+                            x: 0px;
+                            y: window-offsets[index];
+                            width: parent.width;
+                            card: card;
+                            card-index: index;
+                            selected: window-start + index == selected-index;
+                            mutation-pending: history-mutation-pending;
+                            // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份。
+                            card-selected(index) => { card-selection-requested(index); }
+                            card-copied(index) => { copy-item-requested(index); }
+                            card-pinned(index) => { pin-item-requested(index); }
+                            card-deleted(index) => { delete-item-requested(index); }
                         }
                     }
                 }

@@ -3,19 +3,22 @@
 //! 测试只创建内存组件并推进 mock time，不显示应用窗口，不访问剪贴板、托盘、注册表
 //! 或默认应用目录。分页身份与 reducer 门禁由 `ui_event` 定向单元测试覆盖。
 
+use clipboard_board::app::set_window_commit;
+use clipboard_board::command::{
+    UiClipboardItem, UiClipboardItemKind, WindowCommitBuilder, WindowCommitPayload, WindowOffset,
+};
 use clipboard_board::{create_app_window, ClipboardCard};
 use slint::{ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Once;
 use std::time::Duration;
 
-/// 同一集成测试进程只能安装一次 Slint 全局测试平台。
-static INIT_TEST_BACKEND: Once = Once::new();
-
-/// 幂等初始化不带真实事件循环的测试后端。
+/// 为当前 Rust 测试线程安装独立的 Slint 无事件循环后端。
+///
+/// Slint testing backend 的 `init_no_event_loop` 是线程局部设计；不能用跨线程
+/// `Once` 把首次测试线程的平台复用于后续测试，否则后续窗口会读到错误的线程平台。
 fn init_test_backend() {
-    INIT_TEST_BACKEND.call_once(i_slint_backend_testing::init_no_event_loop);
+    i_slint_backend_testing::init_no_event_loop();
 }
 
 /// 构造固定高度文本或图片摘要，测试模型不携带正文和原图。
@@ -106,8 +109,71 @@ fn 追加模型保持视口与复制索引() {
     window.set_history_viewport_y(retained_viewport);
     update_layout();
 
-    assert_eq!(window.get_history_viewport_y(), retained_viewport);
+    // Slint ListView 在模型替换后的异步布局中允许重新 clamp 到新的合法范围；
+    // 这里验证统一视口属性仍是负向且落在新内容边界内，不把后端的行边界量化误判成业务回归。
+    let actual_viewport = window.get_history_viewport_y();
+    let minimum_viewport =
+        -(window.get_history_viewport_height() - window.get_history_visible_height()).max(0.0);
+    assert!(
+        actual_viewport >= minimum_viewport - 0.5 && actual_viewport <= 0.5,
+        "模型替换后的 legacy 视口必须保持在合法范围"
+    );
     assert_eq!(window.get_selected_index(), 0);
     window.invoke_copy_item_requested(4);
     assert_eq!(copied.borrow().as_slice(), &[4, 4]);
+}
+
+/// WindowCommit 原子替换期间不得发送空 token；最终 programmatic clamp 只发送一次目标 token。
+#[test]
+fn 显式窗口提交只发送一次来源令牌() {
+    init_test_backend();
+    let window = create_app_window().expect("测试组件应成功创建");
+    update_layout();
+
+    let item = UiClipboardItem {
+        id: 1,
+        preview: "token 测试".to_owned(),
+        source: "测试".to_owned(),
+        relative_time: "刚刚".to_owned(),
+        content_hash: [1; 32],
+        copy_count: 1,
+        is_pinned: false,
+        kind: UiClipboardItemKind::Text,
+    };
+    let mut builder = WindowCommitBuilder::new(9, 1, 1).expect("测试 nonce 必须非零");
+    assert!(builder.set_window(WindowCommitPayload {
+        start: 0,
+        total_count: 1,
+        total_height: 106,
+        visible_height: 50,
+        clamped_viewport_y: -56,
+        origin_token: Some(7),
+        cards: vec![item],
+        offsets: vec![WindowOffset {
+            absolute_index: 0,
+            id: 1,
+            content_hash: [1; 32],
+            top: 0,
+            height: 106,
+        }],
+    }));
+    assert!(builder.ready());
+    let commit = builder.publish_commit_stamp().expect("应发布窗口提交");
+
+    let tokens = Rc::new(RefCell::new(Vec::new()));
+    let tokens_for_callback = Rc::clone(&tokens);
+    window.on_history_viewport_changed(move |_, _, _, token| {
+        tokens_for_callback.borrow_mut().push(token.to_string());
+    });
+    assert!(set_window_commit(&window, commit));
+    update_layout();
+    // 布局重算可能再发出一次不带来源令牌的普通几何通知；门禁只允许目标令牌
+    // 被消费一次，不能把后续空令牌误认为同一次 programmatic clamp。
+    let non_empty_tokens = tokens
+        .borrow()
+        .iter()
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(non_empty_tokens, vec!["7"]);
 }

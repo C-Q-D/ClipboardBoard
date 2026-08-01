@@ -182,6 +182,306 @@ pub struct UiSnapshot {
     pub selected_index: Option<usize>,
 }
 
+/// 窗口化历史模型中的绝对定位和稳定身份；不携带 Slint 模型或剪贴板正文。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowOffset {
+    /// 完整数据集中的绝对索引。
+    pub absolute_index: u64,
+    /// 数据库稳定 ID。
+    pub id: u64,
+    /// 与 ID 共同组成稳定身份的内容哈希。
+    pub content_hash: [u8; 32],
+    /// 卡片在精确内容画布中的整数像素顶部。
+    pub top: i64,
+    /// 卡片外层整数像素高度。
+    pub height: i64,
+}
+
+/// WindowCommitBuilder 的一次性窗口字段载荷。
+///
+/// 将几何、来源令牌和拥有型卡片放进单一 DTO，避免构造器调用方在多个位置
+/// 依赖长参数列表而遗漏字段；`set_window` 仍会对所有字段执行统一校验。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowCommitPayload {
+    /// 窗口起始绝对索引。
+    pub start: u64,
+    /// 完整逻辑数据集数量。
+    pub total_count: u64,
+    /// 精确前缀和总高度。
+    pub total_height: i64,
+    /// 当前 UI 可见区域高度。
+    pub visible_height: i64,
+    /// clamp 后的负向视口坐标。
+    pub clamped_viewport_y: i64,
+    /// 程序主动修正视口时使用的一次性来源 token。
+    pub origin_token: Option<u64>,
+    /// 当前有界窗口的摘要卡片。
+    pub cards: Vec<UiClipboardItem>,
+    /// 与卡片顺序一一对应的绝对定位和稳定身份。
+    pub offsets: Vec<WindowOffset>,
+}
+
+/// 显式窗口卡片允许的有限操作；事件身份校验通过后才进入对应 reducer 分支。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowCardAction {
+    /// 只更新当前选中项。
+    Select,
+    /// 请求把当前记录写回系统剪贴板。
+    Copy,
+    /// 请求设置明确的收藏状态，禁止使用隐式 toggle。
+    Pin { is_pinned: bool },
+    /// 请求删除当前记录。
+    Delete,
+}
+
+/// 一次窗口模型发布的完整拥有型提交单元。
+///
+/// 所有字段在 `WindowCommitBuilder` 的 Ready 阶段一次性校验，UI 只能接受 checksum
+/// 与 revision 同时匹配的 Published 提交，避免 cards 与 offsets 跨代次撕裂。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowCommit {
+    /// 当前进程的不可持久化 session nonce。
+    pub session_nonce: u128,
+    /// 完整逻辑数据集修订号。
+    pub dataset_revision: u64,
+    /// 当前窗口修订号。
+    pub window_revision: u64,
+    /// 发布修订号；Published 时必须与 window_revision 相同。
+    pub commit_revision: u64,
+    /// 窗口起始绝对索引。
+    pub start: u64,
+    /// 窗口长度。
+    pub length: u64,
+    /// 完整逻辑数据集数量。
+    pub total_count: u64,
+    /// 精确前缀和总高度。
+    pub total_height: i64,
+    /// 当前 UI 可见区域高度。
+    pub visible_height: i64,
+    /// clamp 后的负向视口坐标。
+    pub clamped_viewport_y: i64,
+    /// 程序主动修正视口时使用的一次性来源 token。
+    pub origin_token: Option<u64>,
+    /// 当前有界窗口的摘要卡片，长度不超过 100。
+    pub cards: Vec<UiClipboardItem>,
+    /// 每张卡片的绝对定位和身份，顺序必须与 cards 一致。
+    pub offsets: Vec<WindowOffset>,
+    /// 固定小端 canonical descriptor 的 BLAKE3 校验和。
+    pub commit_checksum: [u8; 32],
+}
+
+impl WindowCommit {
+    /// 依据固定字段宽度生成 canonical descriptor，禁止使用平台相关 f32 bits。
+    pub fn canonical_descriptor(&self) -> Vec<u8> {
+        let mut descriptor = Vec::with_capacity(128 + self.offsets.len() * 88);
+        descriptor.extend_from_slice(&self.session_nonce.to_le_bytes());
+        descriptor.extend_from_slice(&self.dataset_revision.to_le_bytes());
+        descriptor.extend_from_slice(&self.window_revision.to_le_bytes());
+        descriptor.extend_from_slice(&self.commit_revision.to_le_bytes());
+        descriptor.extend_from_slice(&self.start.to_le_bytes());
+        descriptor.extend_from_slice(&self.length.to_le_bytes());
+        descriptor.extend_from_slice(&self.total_count.to_le_bytes());
+        descriptor.extend_from_slice(&self.total_height.to_le_bytes());
+        descriptor.extend_from_slice(&self.visible_height.to_le_bytes());
+        descriptor.extend_from_slice(&self.clamped_viewport_y.to_le_bytes());
+        match self.origin_token {
+            Some(token) => {
+                descriptor.push(1);
+                descriptor.extend_from_slice(&token.to_le_bytes());
+            }
+            None => descriptor.push(0),
+        }
+        for offset in &self.offsets {
+            descriptor.extend_from_slice(&offset.absolute_index.to_le_bytes());
+            descriptor.extend_from_slice(&offset.id.to_le_bytes());
+            descriptor.extend_from_slice(&offset.content_hash);
+            descriptor.extend_from_slice(&offset.top.to_le_bytes());
+            descriptor.extend_from_slice(&offset.height.to_le_bytes());
+        }
+        descriptor
+    }
+
+    /// 计算当前字段的 BLAKE3 checksum。
+    pub fn calculate_checksum(&self) -> [u8; 32] {
+        *blake3::hash(&self.canonical_descriptor()).as_bytes()
+    }
+
+    /// 校验提交自身的字段、窗口边界和 checksum；失败时 fail-closed。
+    pub fn validate(&self) -> bool {
+        let Some(window_end) = self.start.checked_add(self.length) else {
+            return false;
+        };
+        if self.session_nonce == 0
+            || self.dataset_revision == 0
+            || self.window_revision == 0
+            || self.commit_revision != self.window_revision
+            || self.length != self.cards.len() as u64
+            || self.cards.len() != self.offsets.len()
+            || self.cards.len() > 100
+            || self.total_height < 0
+            || self.visible_height < 0
+            || self.total_count < window_end
+        {
+            return false;
+        }
+        let max_offset = self.total_height.saturating_sub(self.visible_height).max(0);
+        let Some(negative_offset) = self.clamped_viewport_y.checked_neg() else {
+            return false;
+        };
+        if self.clamped_viewport_y > 0 || negative_offset > max_offset {
+            return false;
+        }
+        if self.length == 0 {
+            if self.start != 0 || self.total_count != 0 || self.total_height != 0 {
+                return false;
+            }
+        } else if self.total_count == 0 {
+            return false;
+        }
+        let mut previous_end = 0_i64;
+        for (position, (card, offset)) in self.cards.iter().zip(&self.offsets).enumerate() {
+            let Some(expected_index) = self.start.checked_add(position as u64) else {
+                return false;
+            };
+            if card.id != offset.id
+                || card.content_hash != offset.content_hash
+                || offset.height <= 0
+                || offset.top < 0
+                || offset.absolute_index != expected_index
+                || (position > 0 && offset.top != previous_end)
+            {
+                return false;
+            }
+            let Some(offset_end) = offset.top.checked_add(offset.height) else {
+                return false;
+            };
+            if offset_end > self.total_height {
+                return false;
+            }
+            previous_end = offset_end;
+        }
+        self.calculate_checksum() == self.commit_checksum
+    }
+
+    /// 判断事件身份是否完整匹配当前 Published 提交。
+    pub fn accepts_identity(&self, identity: &WindowEventIdentity) -> bool {
+        self.validate()
+            && identity.session_nonce == self.session_nonce
+            && identity.dataset_revision == self.dataset_revision
+            && identity.window_revision == self.window_revision
+            && identity.commit_revision == self.commit_revision
+            && identity.commit_checksum == self.commit_checksum
+    }
+}
+
+/// 视口/卡片事件携带的最小提交身份；任一字段不匹配都必须丢弃。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowEventIdentity {
+    /// 进程 session nonce。
+    pub session_nonce: u128,
+    /// 完整数据集修订号。
+    pub dataset_revision: u64,
+    /// 窗口修订号。
+    pub window_revision: u64,
+    /// 发布修订号。
+    pub commit_revision: u64,
+    /// Published checksum。
+    pub commit_checksum: [u8; 32],
+}
+
+/// WindowCommit 的构建阶段，避免中间 setters 被 UI 当作已发布模型消费。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowCommitState {
+    /// 尚未完成字段校验和 checksum 计算。
+    Building,
+    /// 字段和 checksum 已就绪，但尚未发布。
+    Ready,
+    /// checksum 已安装，事件可以消费。
+    Published,
+}
+
+/// WindowCommit 的受限构造器；发布前不暴露半成品。
+#[derive(Clone, Debug)]
+pub struct WindowCommitBuilder {
+    state: WindowCommitState,
+    commit: WindowCommit,
+}
+
+impl WindowCommitBuilder {
+    /// 创建 Building 状态，revision 和 session nonce 必须为非零。
+    pub fn new(session_nonce: u128, dataset_revision: u64, window_revision: u64) -> Option<Self> {
+        if session_nonce == 0 || dataset_revision == 0 || window_revision == 0 {
+            return None;
+        }
+        Some(Self {
+            state: WindowCommitState::Building,
+            commit: WindowCommit {
+                session_nonce,
+                dataset_revision,
+                window_revision,
+                commit_revision: window_revision,
+                start: 0,
+                length: 0,
+                total_count: 0,
+                total_height: 0,
+                visible_height: 0,
+                clamped_viewport_y: 0,
+                origin_token: None,
+                cards: Vec::new(),
+                offsets: Vec::new(),
+                commit_checksum: [0; 32],
+            },
+        })
+    }
+
+    /// 设置所有窗口字段；Building 之外拒绝中间更新。
+    pub fn set_window(&mut self, payload: WindowCommitPayload) -> bool {
+        if self.state != WindowCommitState::Building
+            || payload.cards.len() != payload.offsets.len()
+            || payload.cards.len() > 100
+        {
+            return false;
+        }
+        self.commit.start = payload.start;
+        self.commit.length = payload.cards.len() as u64;
+        self.commit.total_count = payload.total_count;
+        self.commit.total_height = payload.total_height;
+        self.commit.visible_height = payload.visible_height;
+        self.commit.clamped_viewport_y = payload.clamped_viewport_y;
+        self.commit.origin_token = payload.origin_token;
+        self.commit.cards = payload.cards;
+        self.commit.offsets = payload.offsets;
+        true
+    }
+
+    /// 进入 Ready 阶段并计算 checksum；非法几何直接 fail-closed。
+    pub fn ready(&mut self) -> bool {
+        if self.state != WindowCommitState::Building {
+            return false;
+        }
+        self.commit.commit_checksum = self.commit.calculate_checksum();
+        if !self.commit.validate() {
+            return false;
+        }
+        self.state = WindowCommitState::Ready;
+        true
+    }
+
+    /// 单一发布闩锁；只有 Ready 能进入 Published。
+    pub fn publish_commit_stamp(&mut self) -> Option<WindowCommit> {
+        if self.state != WindowCommitState::Ready {
+            return None;
+        }
+        self.state = WindowCommitState::Published;
+        Some(self.commit.clone())
+    }
+
+    /// 返回当前阶段。
+    pub const fn state(&self) -> WindowCommitState {
+        self.state
+    }
+}
+
 /// 看板当前支持的受限历史筛选；UI 索引只能转换成这里声明的固定查询类型。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SearchFilter {
@@ -315,6 +615,30 @@ pub enum UiEvent {
         visible_height: i32,
         /// 新模型全部混合卡片对应的真实内容高度。
         content_height: i32,
+    },
+    /// 显式几何 Flickable 的带提交身份视口事件；旧 ListView 事件仍保留给 legacy 适配器。
+    HistoryWindowViewportChanged {
+        /// session、dataset、window、commit revision 与 checksum 的完整身份。
+        identity: WindowEventIdentity,
+        /// 原始负向视口坐标，应用层会再次 clamp。
+        viewport_y: i64,
+        /// 当前可见区域整数高度。
+        visible_height: i64,
+        /// 回调携带的 origin token；用户手势必须为 None。
+        origin_token: Option<u64>,
+    },
+    /// 显式窗口卡片操作事件；local index 不能单独决定目标记录。
+    HistoryWindowCardRequested {
+        /// 当前 Published WindowCommit 身份。
+        identity: WindowEventIdentity,
+        /// 窗口内对应的绝对索引。
+        absolute_index: u64,
+        /// 稳定数据库 ID。
+        id: u64,
+        /// 与 ID 共同校验的内容哈希。
+        content_hash: [u8; 32],
+        /// 通过身份校验后要执行的有限卡片操作。
+        action: WindowCardAction,
     },
     /// 用户点击固定失败提示后显式重试当前游标。
     RetryHistoryPage,
@@ -502,5 +826,138 @@ mod tests {
         assert_eq!(SearchFilter::from_index(-1), SearchFilter::All);
         assert_eq!(SearchFilter::from_index(4), SearchFilter::All);
         assert_eq!(SearchFilter::from_index(i32::MAX), SearchFilter::All);
+    }
+}
+
+#[cfg(test)]
+mod window_commit_tests {
+    //! WindowCommit checksum、状态闩锁和稳定身份隔离的窄测试。
+
+    use super::{
+        UiClipboardItem, UiClipboardItemKind, WindowCommitBuilder, WindowCommitPayload,
+        WindowOffset,
+    };
+
+    fn card(id: u64) -> UiClipboardItem {
+        UiClipboardItem {
+            id,
+            preview: format!("摘要-{id}"),
+            source: "测试".to_owned(),
+            relative_time: "刚刚".to_owned(),
+            content_hash: [id as u8; 32],
+            copy_count: 1,
+            is_pinned: false,
+            kind: UiClipboardItemKind::Text,
+        }
+    }
+
+    fn commit() -> super::WindowCommit {
+        let mut builder = WindowCommitBuilder::new(9, 1, 1).unwrap();
+        assert!(builder.set_window(WindowCommitPayload {
+            start: 0,
+            total_count: 1,
+            total_height: 106,
+            visible_height: 50,
+            clamped_viewport_y: 0,
+            origin_token: None,
+            cards: vec![card(1)],
+            offsets: vec![WindowOffset {
+                absolute_index: 0,
+                id: 1,
+                content_hash: [1; 32],
+                top: 0,
+                height: 106,
+            }],
+        }));
+        assert!(builder.ready());
+        builder.publish_commit_stamp().unwrap()
+    }
+
+    #[test]
+    fn canonical_checksum_逐字段篡改即失效() {
+        let original = commit();
+        assert!(original.validate());
+        let mut changed = original.clone();
+        changed.offsets[0].top = 1;
+        assert!(!changed.validate());
+        assert_ne!(
+            original.canonical_descriptor(),
+            changed.canonical_descriptor()
+        );
+    }
+
+    /// 即使攻击者重新计算 checksum，窗口内部出现 gap 或越过总高度也必须拒绝。
+    #[test]
+    fn 几何窗口必须连续且落在总高度内() {
+        let mut builder = WindowCommitBuilder::new(9, 1, 1).unwrap();
+        assert!(builder.set_window(WindowCommitPayload {
+            start: 0,
+            total_count: 2,
+            total_height: 212,
+            visible_height: 50,
+            clamped_viewport_y: 0,
+            origin_token: None,
+            cards: vec![card(1), card(2)],
+            offsets: vec![
+                WindowOffset {
+                    absolute_index: 0,
+                    id: 1,
+                    content_hash: [1; 32],
+                    top: 0,
+                    height: 106,
+                },
+                WindowOffset {
+                    absolute_index: 1,
+                    id: 2,
+                    content_hash: [2; 32],
+                    top: 106,
+                    height: 106,
+                },
+            ],
+        }));
+        assert!(builder.ready());
+        let mut valid = builder.publish_commit_stamp().unwrap();
+        assert!(valid.validate());
+
+        valid.offsets[1].top = 107;
+        valid.commit_checksum = valid.calculate_checksum();
+        assert!(!valid.validate());
+
+        valid.offsets[1].top = 106;
+        valid.offsets[1].height = 107;
+        valid.commit_checksum = valid.calculate_checksum();
+        assert!(!valid.validate());
+    }
+
+    #[test]
+    fn building_ready_published_只能单向推进() {
+        let mut builder = WindowCommitBuilder::new(9, 1, 1).unwrap();
+        assert_eq!(builder.state(), super::WindowCommitState::Building);
+        assert!(builder.publish_commit_stamp().is_none());
+        assert!(builder.set_window(WindowCommitPayload {
+            start: 0,
+            total_count: 0,
+            total_height: 0,
+            visible_height: 50,
+            clamped_viewport_y: 0,
+            origin_token: None,
+            cards: Vec::new(),
+            offsets: Vec::new(),
+        }));
+        assert!(builder.ready());
+        assert_eq!(builder.state(), super::WindowCommitState::Ready);
+        assert!(builder.publish_commit_stamp().is_some());
+        assert_eq!(builder.state(), super::WindowCommitState::Published);
+        assert!(!builder.set_window(WindowCommitPayload {
+            start: 0,
+            total_count: 0,
+            total_height: 0,
+            visible_height: 50,
+            clamped_viewport_y: 0,
+            origin_token: None,
+            cards: Vec::new(),
+            offsets: Vec::new(),
+        }));
+        assert!(builder.publish_commit_stamp().is_none());
     }
 }

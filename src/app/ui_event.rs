@@ -4,9 +4,13 @@
 //! 只有 `invoke_from_event_loop` 执行的闭包才会触碰 reducer。窗口显示、隐藏、位置和
 //! 原生窗口定位也必须在这个 UI 线程闭包内完成，避免原生消息线程直接碰 Slint 对象。
 
+use crate::app::history_geometry::{HistoryGeometry, HistoryGeometryItem};
 #[cfg(windows)]
 use crate::clipboard::{ClipboardCaptureInbox, ClipboardCopyRequest};
-use crate::command::{SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot};
+use crate::command::{
+    SearchFilter, SearchStatus, UiClipboardItem, UiEvent, UiSnapshot, WindowCardAction,
+    WindowCommit, WindowCommitBuilder, WindowCommitPayload, WindowEventIdentity, WindowOffset,
+};
 use crate::history::MemoryHistory;
 use crate::history_mutation::{
     ClearHistoryMutationRequest, ClearHistoryMutationResult, ClearHistoryMutationSender,
@@ -28,6 +32,8 @@ use slint::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(not(windows))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 #[cfg(windows)]
 use std::time::Duration;
@@ -57,6 +63,8 @@ const HISTORY_BOTTOM_EXIT_THRESHOLD: i32 = IMAGE_CARD_HEIGHT * 3;
 const THUMBNAIL_ITEM_BUFFER: usize = 10;
 /// UI 纹理和失败占位的硬容量上限；滚动大量图片时仍保持有界。
 const THUMBNAIL_CACHE_CAPACITY: usize = 500;
+/// Slint f32 length 可无损承载的连续整数范围；超出范围直接关闭显式几何提交。
+const MAX_EXACT_SLINT_INTEGER: i64 = 1_i64 << 24;
 /// 清空全部强确认必须逐字匹配的固定短语；不做 trim 或大小写等宽松处理。
 const CLEAR_ALL_CONFIRMATION_PHRASE: &str = "清空全部";
 
@@ -111,6 +119,41 @@ enum AppendBindingGate {
     RevisionExhausted,
 }
 
+/// 为每个进程生成不可持久化的非零窗口会话 nonce；系统 RNG 失败时关闭显式窗口协议。
+fn new_session_nonce() -> Option<u128> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let mut bytes = [0_u8; 16];
+        // SAFETY: 缓冲区由本函数独占且长度与 API 参数一致，系统 RNG 不保留指针。
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status == 0 {
+            let value = u128::from_le_bytes(bytes);
+            if value != 0 {
+                return Some(value);
+            }
+        }
+        // RNG 失败时关闭显式窗口协议；调用方会继续使用 legacy 摘要路径。
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 测试后端没有 BCrypt，进程内计数器仍保证每次新会话不同。
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+        Some(0xCB43_52A7_2026_0801_0000_0000_0000_0000_u128 | counter)
+    }
+}
+
 /// 单次原生定位与激活尝试的有限结果；调用方据此决定重试或只记录固定诊断。
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +205,23 @@ where
 /// UI 线程独占的内部状态，外部线程不能直接取得其实例或引用。
 struct UiState {
     snapshot: UiSnapshot,
+    /// 当前筛选数据集的显式混合高度 prefix-sum；为空时仍保持 legacy set_cards 路径。
+    history_geometry: Option<HistoryGeometry>,
+    /// 进程内不可持久化会话 nonce；旧进程窗口事件不得重放到当前状态。
+    session_nonce: Option<u128>,
+    /// 数据集和窗口提交的单调修订号，溢出时 fail-closed。
+    dataset_revision: u64,
+    window_revision: u64,
+    /// 程序主动 clamp 视口使用的 checked 来源 token。
+    next_origin_token: u64,
+    /// 最近一次完整发布的窗口提交；显式事件只接受该快照身份。
+    published_window: Option<WindowCommit>,
+    /// 当前程序 clamp 产生的一次性 origin token；用户滚动不会错误清除它。
+    pending_origin_token: Option<u64>,
+    /// 当前显式几何视口；负向坐标在事件入口先被 clamp。
+    history_viewport_y: i64,
+    /// 当前可见区域的整数高度；测试后端未布局时使用稳定默认值。
+    history_visible_height: i64,
     /// 历史顺序和重复合并由独立协调器维护，UI 状态只同步其摘要快照。
     history: MemoryHistory,
     /// UI 线程独占的防抖协调器；它只负责查询代次，不访问 SQLite 或 Slint。
@@ -232,6 +292,15 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             snapshot: UiSnapshot::default(),
+            history_geometry: None,
+            session_nonce: new_session_nonce(),
+            dataset_revision: 1,
+            window_revision: 1,
+            next_origin_token: 0,
+            published_window: None,
+            pending_origin_token: None,
+            history_viewport_y: 0,
+            history_visible_height: 500,
             history: MemoryHistory::new(UI_HISTORY_MEMORY_CAPACITY),
             search: SearchCoordinator::default(),
             search_text: String::new(),
@@ -417,6 +486,99 @@ impl UiState {
                     content_height,
                 );
                 UiAction::None
+            }
+            UiEvent::HistoryWindowViewportChanged {
+                identity,
+                viewport_y,
+                visible_height,
+                origin_token,
+            } => {
+                // 显式路径先验证完整提交身份；迟到窗口事件不得影响新的 prefix 快照。
+                if self
+                    .published_window
+                    .as_ref()
+                    .is_some_and(|window| window.accepts_identity(&identity))
+                {
+                    let Some(window) = self.published_window.as_ref() else {
+                        return UiAction::None;
+                    };
+                    if let Some(token) = origin_token {
+                        // 程序 clamp 回调只能消费当前提交尚未消费的一次性 token；
+                        // 重复/迟到回调即使 checksum 相同也不得再次改变视口状态。
+                        if window.origin_token != Some(token)
+                            || self.pending_origin_token != Some(token)
+                        {
+                            return UiAction::None;
+                        }
+                        self.pending_origin_token = None;
+                    }
+                    if let (Ok(viewport_y), Ok(visible_height)) =
+                        (i32::try_from(viewport_y), i32::try_from(visible_height))
+                    {
+                        self.handle_history_viewport(
+                            viewport_y,
+                            visible_height,
+                            i32::try_from(
+                                self.published_window
+                                    .as_ref()
+                                    .map(|window| window.total_height)
+                                    .unwrap_or(0),
+                            )
+                            .unwrap_or(i32::MAX),
+                        );
+                    }
+                }
+                UiAction::None
+            }
+            UiEvent::HistoryWindowCardRequested {
+                identity,
+                absolute_index,
+                id,
+                content_hash,
+                action,
+            } => {
+                let Some(window) = self.published_window.as_ref() else {
+                    return UiAction::None;
+                };
+                if !window.accepts_identity(&identity) {
+                    return UiAction::None;
+                }
+                let Some(local_index) = absolute_index.checked_sub(window.start) else {
+                    return UiAction::None;
+                };
+                let Some(offset) = window.offsets.get(local_index as usize) else {
+                    return UiAction::None;
+                };
+                if offset.absolute_index != absolute_index
+                    || offset.id != id
+                    || offset.content_hash != content_hash
+                {
+                    return UiAction::None;
+                }
+                let Some(item) = self.snapshot.items.get(absolute_index as usize) else {
+                    return UiAction::None;
+                };
+                if item.id == id && item.content_hash == content_hash {
+                    self.snapshot.selected_index = Some(absolute_index as usize);
+                    match action {
+                        WindowCardAction::Select => UiAction::SelectItem,
+                        WindowCardAction::Copy if item.copy_enabled() => {
+                            UiAction::QueueCopy { id, content_hash }
+                        }
+                        WindowCardAction::Copy => UiAction::None,
+                        WindowCardAction::Pin { is_pinned } => self.begin_pin_mutation(
+                            self.panel_generation,
+                            id,
+                            content_hash,
+                            is_pinned,
+                        ),
+                        WindowCardAction::Delete => {
+                            self.begin_delete_mutation(self.panel_generation, id, content_hash)
+                        }
+                    }
+                } else {
+                    UiAction::None
+                }
             }
             UiEvent::RetryHistoryPage => {
                 if self.panel_visible && self.history_pages.retry_required() {
@@ -1037,6 +1199,9 @@ impl UiState {
         self.history_was_near_bottom = false;
         self.history_next_page_loading = false;
         self.append_binding_gate = AppendBindingGate::Idle;
+        // 新数据集/新面板不复用旧 Published 快照，迟到卡片和视口事件必须立即失效。
+        self.published_window = None;
+        self.pending_origin_token = None;
     }
 
     /// 根据滞回阈值更新底部状态；中间区保持调用前状态。
@@ -1075,6 +1240,9 @@ impl UiState {
         visible_height: i32,
         content_height: i32,
     ) {
+        // 先保存原始负向坐标和可见高度，下一次 WindowCommit 会统一 clamp 并生成新窗口。
+        self.history_viewport_y = i64::from(viewport_y);
+        self.history_visible_height = i64::from(visible_height.max(0));
         if !self.panel_visible || self.append_binding_gate != AppendBindingGate::Idle {
             return;
         }
@@ -1266,6 +1434,7 @@ impl UiState {
                 self.history_was_near_bottom = false;
                 self.history.replace(items.clone());
                 self.snapshot.items = items;
+                self.refresh_history_geometry();
                 self.snapshot.selected_index = selected_identity.and_then(|(id, hash)| {
                     self.snapshot
                         .items
@@ -1284,6 +1453,7 @@ impl UiState {
             HistoryPageApplication::Append(items) => {
                 self.snapshot.items.extend(items);
                 self.history.replace(self.snapshot.items.clone());
+                self.refresh_history_geometry();
                 self.prune_capture_revisions();
                 self.search_status = if self.snapshot.items.is_empty() {
                     SearchStatus::Empty
@@ -1345,6 +1515,103 @@ impl UiState {
             .cloned()
             .collect();
         restore_selected_index(&mut self.snapshot, selected_hash);
+        self.refresh_history_geometry();
+    }
+
+    /// 为当前完整 UI 快照构造精确混合高度 prefix-sum；失败时保留旧快照而不伪造高度。
+    fn refresh_history_geometry(&mut self) {
+        // 数据集身份一旦变化，旧 WindowCommit 即使 checksum 仍有效也不能再解析新快照的
+        // local index；先清空发布闩锁，确保几何构造失败时安全回退 legacy 而不是接受迟到事件。
+        self.published_window = None;
+        self.pending_origin_token = None;
+        let Some(next_dataset_revision) = self.dataset_revision.checked_add(1) else {
+            self.history_geometry = None;
+            return;
+        };
+        let items = self
+            .snapshot
+            .items
+            .iter()
+            .map(|item| HistoryGeometryItem {
+                id: item.id,
+                content_hash: item.content_hash,
+                height: match item.kind {
+                    crate::command::UiClipboardItemKind::Text => HISTORY_CARD_HEIGHT as i64,
+                    crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as i64,
+                },
+            })
+            .collect();
+        match HistoryGeometry::new(items) {
+            Ok(geometry) => {
+                self.dataset_revision = next_dataset_revision;
+                self.history_geometry = Some(geometry);
+            }
+            Err(_) => {
+                // 任何高度非法/溢出都关闭显式模式，legacy 路径仍可显示旧摘要。
+                self.history_geometry = None;
+            }
+        }
+    }
+
+    /// 从当前 prefix-sum 快照构造最多 100 行的唯一 WindowCommit。
+    fn build_window_commit(&mut self) -> Option<WindowCommit> {
+        let geometry = self.history_geometry.as_ref()?;
+        let revision = self.window_revision;
+        let next_revision = revision.checked_add(1)?;
+        let window = geometry
+            .window_for(
+                self.history_viewport_y,
+                self.history_visible_height,
+                THUMBNAIL_ITEM_BUFFER,
+            )
+            .ok()?;
+        let origin_token = if window.viewport_y != self.history_viewport_y {
+            let token = self.next_origin_token.checked_add(1)?;
+            self.next_origin_token = token;
+            Some(token)
+        } else {
+            None
+        };
+        let cards = window
+            .items
+            .iter()
+            .filter_map(|entry| self.snapshot.items.get(entry.absolute_index).cloned())
+            .collect::<Vec<_>>();
+        if cards.len() != window.items.len() {
+            return None;
+        }
+        let offsets = window
+            .items
+            .iter()
+            .map(|entry| WindowOffset {
+                absolute_index: entry.absolute_index as u64,
+                id: entry.id,
+                content_hash: entry.content_hash,
+                top: entry.top,
+                height: entry.height,
+            })
+            .collect::<Vec<_>>();
+        let mut builder =
+            WindowCommitBuilder::new(self.session_nonce?, self.dataset_revision, revision)?;
+        if !builder.set_window(WindowCommitPayload {
+            start: window.start as u64,
+            total_count: window.total_count as u64,
+            total_height: window.total_height,
+            visible_height: window.visible_height,
+            clamped_viewport_y: window.viewport_y,
+            origin_token,
+            cards,
+            offsets,
+        }) || !builder.ready()
+        {
+            return None;
+        }
+        let commit = builder.publish_commit_stamp()?;
+        self.published_window = Some(commit.clone());
+        self.pending_origin_token = commit.origin_token;
+        self.window_revision = next_revision;
+        self.history_viewport_y = commit.clamped_viewport_y;
+        Some(commit)
     }
 
     /// 面板首次显示时把选择置于当前已加载列表第一项；空列表保持无选中项。
@@ -1630,30 +1897,69 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
-    window.on_history_viewport_changed(|viewport_y, visible_height, content_height| {
-        let append_binding_gate = UI_STATE.with(|state| state.borrow().append_binding_gate);
-        let event = if append_binding_gate != AppendBindingGate::Idle {
-            UiEvent::HistoryViewportChangedDuringAppend {
-                append_revision: match append_binding_gate {
-                    AppendBindingGate::ProbePending(revision) => Some(revision),
-                    AppendBindingGate::RevisionExhausted => None,
-                    AppendBindingGate::Idle => unreachable!("空闲状态已由外层分支排除"),
-                },
-                viewport_y: viewport_y.round() as i32,
-                visible_height: visible_height.round() as i32,
-                content_height: content_height.round() as i32,
+    window.on_history_viewport_changed(
+        |viewport_y, visible_height, content_height, origin_token| {
+            let geometry_identity = UI_STATE.with(|state| {
+                let state = state.borrow();
+                state
+                    .history_geometry
+                    .as_ref()
+                    .zip(state.published_window.as_ref())
+                    .map(|(_, commit)| WindowEventIdentity {
+                        session_nonce: commit.session_nonce,
+                        dataset_revision: commit.dataset_revision,
+                        window_revision: commit.window_revision,
+                        commit_revision: commit.commit_revision,
+                        commit_checksum: commit.commit_checksum,
+                    })
+            });
+            let event = if let Some(identity) = geometry_identity {
+                let Some(viewport_y) = quantize_slint_length(viewport_y) else {
+                    return;
+                };
+                let Some(visible_height) = quantize_slint_length(visible_height) else {
+                    return;
+                };
+                let origin_token = if origin_token.is_empty() {
+                    None
+                } else {
+                    match origin_token.parse::<u64>() {
+                        Ok(token) => Some(token),
+                        Err(_) => return,
+                    }
+                };
+                UiEvent::HistoryWindowViewportChanged {
+                    identity,
+                    viewport_y,
+                    visible_height,
+                    origin_token,
+                }
+            } else {
+                let append_binding_gate = UI_STATE.with(|state| state.borrow().append_binding_gate);
+                if append_binding_gate != AppendBindingGate::Idle {
+                    UiEvent::HistoryViewportChangedDuringAppend {
+                        append_revision: match append_binding_gate {
+                            AppendBindingGate::ProbePending(revision) => Some(revision),
+                            AppendBindingGate::RevisionExhausted => None,
+                            AppendBindingGate::Idle => unreachable!("空闲状态已由外层分支排除"),
+                        },
+                        viewport_y: viewport_y.round() as i32,
+                        visible_height: visible_height.round() as i32,
+                        content_height: content_height.round() as i32,
+                    }
+                } else {
+                    UiEvent::HistoryViewportChanged {
+                        viewport_y: viewport_y.round() as i32,
+                        visible_height: visible_height.round() as i32,
+                        content_height: content_height.round() as i32,
+                    }
+                }
+            };
+            if let Err(error) = post_ui_event(event) {
+                eprintln!("历史视口事件无法进入 UI 事件队列：{error}");
             }
-        } else {
-            UiEvent::HistoryViewportChanged {
-                viewport_y: viewport_y.round() as i32,
-                visible_height: visible_height.round() as i32,
-                content_height: content_height.round() as i32,
-            }
-        };
-        if let Err(error) = post_ui_event(event) {
-            eprintln!("历史视口事件无法进入 UI 事件队列：{error}");
-        }
-    });
+        },
+    );
 
     window.on_retry_history_page_requested(|| {
         if let Err(error) = post_ui_event(UiEvent::RetryHistoryPage) {
@@ -1770,6 +2076,14 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 visible_height,
                 ..
             } => Some((*viewport_y, *visible_height)),
+            UiEvent::HistoryWindowViewportChanged {
+                viewport_y,
+                visible_height,
+                ..
+            } => match (i32::try_from(*viewport_y), i32::try_from(*visible_height)) {
+                (Ok(viewport_y), Ok(visible_height)) => Some((viewport_y, visible_height)),
+                _ => None,
+            },
             _ => None,
         };
         if let Some(viewport) = viewport {
@@ -1810,12 +2124,23 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             mut clear_all_error_visible,
             request,
             history_model_refresh,
+            geometry_commit,
         ) = UI_STATE.with(|state| {
             let mut state = state.borrow_mut();
             let action = state.apply(event);
             let history_model_refresh = history_result
                 .map(|result| state.apply_history_page_result(result))
                 .unwrap_or(HistoryModelRefresh::None);
+            let geometry_commit = if state.history_geometry.is_some()
+                && (may_refresh_model
+                    || history_result_event
+                    || viewport.is_some()
+                    || thumbnail_result.is_some())
+            {
+                state.build_window_commit()
+            } else {
+                None
+            };
             (
                 action,
                 state.snapshot.clone(),
@@ -1836,6 +2161,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 state.clear_all_error_visible,
                 state.take_pending_history_request(),
                 history_model_refresh,
+                geometry_commit,
             )
         });
         if let Some(request) = request {
@@ -1933,7 +2259,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         let refresh_model = ((may_refresh_model && !history_result_event)
             || history_model_refresh != HistoryModelRefresh::None
             || thumbnail_applied
-            || thumbnail_range_changed)
+            || thumbnail_range_changed
+            || geometry_commit.is_some())
             && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
@@ -2010,12 +2337,24 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 let retained_viewport_y =
                     (thumbnail_applied || preserve_append_viewport || preserve_thumbnail_viewport)
                         .then(|| window.get_history_viewport_y());
-                set_window_snapshot(
-                    &window,
-                    &snapshot,
-                    pending_pin_mutation.as_ref(),
-                    pending_delete_mutation.as_ref(),
-                );
+                let geometry_applied = geometry_commit.as_ref().is_some_and(|commit| {
+                    apply_window_commit(
+                        &window,
+                        commit,
+                        pending_pin_mutation.as_ref(),
+                        pending_delete_mutation.as_ref(),
+                    )
+                });
+                if !geometry_applied {
+                    // 显式提交的量化或身份校验失败时保留可用 legacy 画面，不能留下空模型。
+                    set_window_snapshot(
+                        &window,
+                        &snapshot,
+                        pending_pin_mutation.as_ref(),
+                        pending_delete_mutation.as_ref(),
+                        false,
+                    );
+                }
                 if let Some(viewport_y) = retained_viewport_y {
                     window.set_history_viewport_y(viewport_y);
                 }
@@ -2213,6 +2552,7 @@ fn event_may_refresh_model(event: &UiEvent) -> bool {
             | UiEvent::HistoryViewportChanged { .. }
             | UiEvent::HistoryViewportChangedDuringAppend { .. }
             | UiEvent::HistoryPostAppendProbe { .. }
+            | UiEvent::HistoryWindowViewportChanged { .. }
             | UiEvent::RetryHistoryPage
             | UiEvent::ClearUnpinnedRequested
             | UiEvent::ClearUnpinnedCancelled
@@ -2513,6 +2853,53 @@ fn selection_limit(snapshot: &UiSnapshot) -> usize {
     snapshot.items.len().min(MAX_LOADED_ITEMS)
 }
 
+/// 将显式窗口中的局部卡片索引解析为完整提交身份；旧窗口或身份不匹配时直接拒绝。
+fn resolve_geometry_card_event(
+    state: &UiState,
+    index: i32,
+    action: WindowCardAction,
+) -> Option<UiEvent> {
+    if !state.panel_visible {
+        return None;
+    }
+    let local_index = usize::try_from(index).ok()?;
+    let window = state.published_window.as_ref()?;
+    if !window.validate() || local_index >= window.offsets.len() {
+        return None;
+    }
+    let offset = window.offsets.get(local_index)?;
+    let item = state.snapshot.items.get(offset.absolute_index as usize)?;
+    if item.id != offset.id || item.content_hash != offset.content_hash {
+        return None;
+    }
+    if matches!(action, WindowCardAction::Copy) && !item.copy_enabled() {
+        return None;
+    }
+    Some(UiEvent::HistoryWindowCardRequested {
+        identity: WindowEventIdentity {
+            session_nonce: window.session_nonce,
+            dataset_revision: window.dataset_revision,
+            window_revision: window.window_revision,
+            commit_revision: window.commit_revision,
+            commit_checksum: window.commit_checksum,
+        },
+        absolute_index: offset.absolute_index,
+        id: offset.id,
+        content_hash: offset.content_hash,
+        action,
+    })
+}
+
+/// 只有会话 nonce、几何元数据和已发布窗口齐全时才启用显式卡片协议；否则回退 legacy。
+fn explicit_window_ready(state: &UiState) -> bool {
+    state.session_nonce.is_some()
+        && state.history_geometry.is_some()
+        && state
+            .published_window
+            .as_ref()
+            .is_some_and(WindowCommit::validate)
+}
+
 /// 将当前可见卡片索引同步解析为代次绑定的稳定身份；空白区和越界索引直接忽略。
 fn resolve_card_selection(index: i32) -> Option<UiEvent> {
     let index = usize::try_from(index).ok()?;
@@ -2520,6 +2907,9 @@ fn resolve_card_selection(index: i32) -> Option<UiEvent> {
         let state = state.borrow();
         if !state.panel_visible || index >= selection_limit(&state.snapshot) {
             return None;
+        }
+        if explicit_window_ready(&state) {
+            return resolve_geometry_card_event(&state, index as i32, WindowCardAction::Select);
         }
         let item = state.snapshot.items.get(index)?;
         Some(UiEvent::SelectItem {
@@ -2537,6 +2927,9 @@ fn resolve_copy_item(index: i32) -> Option<UiEvent> {
         let state = state.borrow();
         if !state.panel_visible || index >= selection_limit(&state.snapshot) {
             return None;
+        }
+        if explicit_window_ready(&state) {
+            return resolve_geometry_card_event(&state, index as i32, WindowCardAction::Copy);
         }
         let item = state.snapshot.items.get(index)?;
         if !item.copy_enabled() {
@@ -2563,6 +2956,16 @@ fn resolve_pin_item(index: i32) -> Option<UiEvent> {
         {
             return None;
         }
+        if explicit_window_ready(&state) {
+            let item = state.snapshot.items.get(index)?;
+            return resolve_geometry_card_event(
+                &state,
+                index as i32,
+                WindowCardAction::Pin {
+                    is_pinned: !item.is_pinned,
+                },
+            );
+        }
         let item = state.snapshot.items.get(index)?;
         Some(UiEvent::PinItem {
             panel_generation: state.panel_generation,
@@ -2586,6 +2989,9 @@ fn resolve_delete_item(index: i32) -> Option<UiEvent> {
         {
             return None;
         }
+        if explicit_window_ready(&state) {
+            return resolve_geometry_card_event(&state, index as i32, WindowCardAction::Delete);
+        }
         let item = state.snapshot.items.get(index)?;
         Some(UiEvent::DeleteItem {
             panel_generation: state.panel_generation,
@@ -2596,58 +3002,202 @@ fn resolve_delete_item(index: i32) -> Option<UiEvent> {
 }
 
 /// 将领域无关的 UI 快照转换为 Slint 卡片模型；完整正文不会进入此转换层。
+fn to_slint_card(
+    item: &UiClipboardItem,
+    pending_pin: Option<&PinMutationRequest>,
+    pending_delete: Option<&DeleteMutationRequest>,
+) -> crate::ClipboardCard {
+    crate::ClipboardCard {
+        preview: SharedString::from(item.preview.as_str()),
+        source: SharedString::from(item.source.as_str()),
+        relative_time: SharedString::from(item.relative_time.as_str()),
+        is_pinned: item.is_pinned,
+        pin_pending: pending_pin.is_some_and(|pending| {
+            pending.id == item.id && pending.content_hash == item.content_hash
+        }),
+        delete_pending: pending_delete.is_some_and(|pending| {
+            pending.id == item.id && pending.content_hash == item.content_hash
+        }),
+        is_image: matches!(item.kind, crate::command::UiClipboardItemKind::Image(_)),
+        copy_enabled: item.copy_enabled(),
+        image_width: match &item.kind {
+            crate::command::UiClipboardItemKind::Image(image) => {
+                i32::try_from(image.width).unwrap_or(i32::MAX)
+            }
+            crate::command::UiClipboardItemKind::Text => 0,
+        },
+        image_height: match &item.kind {
+            crate::command::UiClipboardItemKind::Image(image) => {
+                i32::try_from(image.height).unwrap_or(i32::MAX)
+            }
+            crate::command::UiClipboardItemKind::Text => 0,
+        },
+        thumbnail: UI_THUMBNAIL_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .get(&(item.id, item.content_hash))
+                .cloned()
+                .unwrap_or_default()
+        }),
+        thumbnail_loaded: UI_THUMBNAIL_CACHE
+            .with(|cache| cache.borrow().contains_key(&(item.id, item.content_hash))),
+        thumbnail_failed: UI_THUMBNAIL_FAILED
+            .with(|failed| failed.borrow().contains(&(item.id, item.content_hash))),
+    }
+}
+
+/// 将 Slint length 量化为有限整数像素；NaN/Infinity/越界输入直接丢弃。
+fn quantize_slint_length(value: f32) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let rounded = if value == 0.0 { 0.0 } else { value.round() };
+    if rounded < -(MAX_EXACT_SLINT_INTEGER as f32) || rounded > MAX_EXACT_SLINT_INTEGER as f32 {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
+/// 将非负整数像素安全转换为 Slint length；无法由 f32 精确表示时拒绝提交。
+fn checked_slint_length(value: i64) -> Option<f32> {
+    if !(0..=MAX_EXACT_SLINT_INTEGER).contains(&value) {
+        return None;
+    }
+    let converted = value as f32;
+    if !converted.is_finite() || converted as i64 != value {
+        return None;
+    }
+    Some(converted)
+}
+
+/// 将有符号整数坐标安全转换为 Slint length；显式归一化负零避免回调抖动。
+fn checked_slint_coordinate(value: i64) -> Option<f32> {
+    if !(-MAX_EXACT_SLINT_INTEGER..=MAX_EXACT_SLINT_INTEGER).contains(&value) {
+        return None;
+    }
+    let converted = value as f32;
+    if !converted.is_finite() || converted as i64 != value {
+        return None;
+    }
+    Some(if value == 0 { 0.0 } else { converted })
+}
+
+/// legacy set_cards 路径只绑定完整逻辑摘要，混合几何模式随后由 WindowCommit 替换为窗口模型。
 fn set_window_snapshot(
     window: &AppWindow,
     snapshot: &UiSnapshot,
     pending_pin: Option<&PinMutationRequest>,
     pending_delete: Option<&DeleteMutationRequest>,
+    geometry_mode: bool,
 ) {
     let cards = visible_snapshot_items(snapshot)
-        .map(|item| crate::ClipboardCard {
-            preview: SharedString::from(item.preview.as_str()),
-            source: SharedString::from(item.source.as_str()),
-            relative_time: SharedString::from(item.relative_time.as_str()),
-            is_pinned: item.is_pinned,
-            pin_pending: pending_pin.is_some_and(|pending| {
-                pending.id == item.id && pending.content_hash == item.content_hash
-            }),
-            delete_pending: pending_delete.is_some_and(|pending| {
-                pending.id == item.id && pending.content_hash == item.content_hash
-            }),
-            is_image: matches!(item.kind, crate::command::UiClipboardItemKind::Image(_)),
-            copy_enabled: item.copy_enabled(),
-            image_width: match &item.kind {
-                crate::command::UiClipboardItemKind::Image(image) => {
-                    i32::try_from(image.width).unwrap_or(i32::MAX)
-                }
-                crate::command::UiClipboardItemKind::Text => 0,
-            },
-            image_height: match &item.kind {
-                crate::command::UiClipboardItemKind::Image(image) => {
-                    i32::try_from(image.height).unwrap_or(i32::MAX)
-                }
-                crate::command::UiClipboardItemKind::Text => 0,
-            },
-            thumbnail: UI_THUMBNAIL_CACHE.with(|cache| {
-                cache
-                    .borrow()
-                    .get(&(item.id, item.content_hash))
-                    .cloned()
-                    .unwrap_or_default()
-            }),
-            thumbnail_loaded: UI_THUMBNAIL_CACHE
-                .with(|cache| cache.borrow().contains_key(&(item.id, item.content_hash))),
-            thumbnail_failed: UI_THUMBNAIL_FAILED
-                .with(|failed| failed.borrow().contains(&(item.id, item.content_hash))),
-        })
+        .map(|item| to_slint_card(item, pending_pin, pending_delete))
         .collect::<Vec<_>>();
-    window.set_cards(ModelRc::new(VecModel::from(cards)));
+    if geometry_mode {
+        // 显式模式只允许 bounded WindowCommit 进入 repeater，避免短暂绑定完整模型。
+        window.set_cards(ModelRc::new(VecModel::from(
+            Vec::<crate::ClipboardCard>::new(),
+        )));
+    } else {
+        window.set_geometry_mode(false);
+        window.set_cards(ModelRc::new(VecModel::from(cards)));
+    }
     window.set_selected_index(
         snapshot
             .selected_index
             .and_then(|index| i32::try_from(index).ok())
             .unwrap_or(-1),
     );
+}
+
+/// 将已验证 WindowCommit 的有界 cards/offsets 按顺序写入精确 Flickable 画布。
+fn apply_window_commit(
+    window: &AppWindow,
+    commit: &WindowCommit,
+    pending_pin: Option<&PinMutationRequest>,
+    pending_delete: Option<&DeleteMutationRequest>,
+) -> bool {
+    if !commit.validate() {
+        return false;
+    }
+    let cards = commit
+        .cards
+        .iter()
+        .map(|item| to_slint_card(item, pending_pin, pending_delete))
+        .collect::<Vec<_>>();
+    let Some(offsets) = commit
+        .offsets
+        .iter()
+        .map(|offset| checked_slint_length(offset.top))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(content_height) = checked_slint_length(commit.total_height) else {
+        return false;
+    };
+    let Some(viewport_y) = checked_slint_coordinate(commit.clamped_viewport_y) else {
+        return false;
+    };
+    let Some(window_start) = i32::try_from(commit.start).ok() else {
+        return false;
+    };
+    let Some(window_length) = i32::try_from(commit.length).ok() else {
+        return false;
+    };
+    let Some(logical_count) = i32::try_from(commit.total_count).ok() else {
+        return false;
+    };
+    if !commit.total_height.is_positive() && commit.total_count != 0 {
+        return false;
+    }
+    // 先抑制中间布局回调，再原子替换 cards/offsets/尺寸；最终视口设置后才允许回调携带 token。
+    window.set_geometry_events_suppressed(true);
+    window.set_window_cards(ModelRc::new(VecModel::from(cards)));
+    window.set_window_offsets(ModelRc::new(VecModel::from(offsets)));
+    window.set_window_start(window_start);
+    window.set_window_length(window_length);
+    window.set_history_logical_count(logical_count);
+    window.set_geometry_content_height(content_height);
+    window.set_geometry_mode(true);
+    // 先把一次性来源 token 写入 UI，再设置视口；由 Slint 回调携带该 token 完成确认。
+    if let Some(origin_token) = commit.origin_token {
+        window.set_geometry_origin_token(SharedString::from(origin_token.to_string()));
+    } else {
+        window.set_geometry_origin_token(SharedString::default());
+    }
+    // 显式模式不再让完整 cards 模型进入 ListView，legacy 属性仍保留给旧调用者；此操作也受抑制保护。
+    window.set_cards(ModelRc::new(VecModel::from(
+        Vec::<crate::ClipboardCard>::new(),
+    )));
+    window.set_geometry_events_suppressed(false);
+    window.set_geometry_viewport_y(viewport_y);
+    true
+}
+
+/// 为窄测试和后续调用方登记拥有型几何元数据；不创建任何 Slint 行模型。
+pub fn set_history_geometry_metadata(window: &AppWindow, items: Vec<HistoryGeometryItem>) -> bool {
+    let Ok(geometry) = HistoryGeometry::new(items) else {
+        return false;
+    };
+    let Some(content_height) = checked_slint_length(geometry.total_height()) else {
+        return false;
+    };
+    let Some(logical_count) = i32::try_from(geometry.len()).ok() else {
+        return false;
+    };
+    window.set_geometry_content_height(content_height);
+    window.set_history_logical_count(logical_count);
+    window.set_geometry_mode(true);
+    true
+}
+
+/// 安装已经由 WindowCommitBuilder 校验的 bounded 窗口提交；失败时保留旧窗口。
+pub fn set_window_commit(window: &AppWindow, commit: WindowCommit) -> bool {
+    if !commit.validate() {
+        return false;
+    }
+    apply_window_commit(window, &commit, None, None)
 }
 
 /// 将搜索框、标签和结果状态同步到 Slint；状态文案不携带查询正文之外的内部错误。
@@ -2827,18 +3377,20 @@ mod tests {
     #[cfg(windows)]
     use super::{activation_attempt, ActivationAttempt};
     use super::{
-        apply_thumbnail_result, bind_clear_history_mutation_sender,
-        close_clear_history_mutation_bridge, event_may_refresh_model, perform_show_action,
-        reserve_thumbnail_cache_slot, schedule_thumbnail_requests, selection_item_bounds,
-        selection_viewport_y, settle_post_append_probe_dispatch, thumbnail_retained_range,
-        touch_thumbnail_cache, visible_snapshot_items, AppendBindingGate, HistoryModelRefresh,
-        UiAction, UiState, CLEAR_ALL_CONFIRMATION_PHRASE, HISTORY_BOTTOM_ENTER_THRESHOLD,
-        HISTORY_BOTTOM_EXIT_THRESHOLD, THUMBNAIL_CACHE_CAPACITY, THUMBNAIL_ITEM_BUFFER,
-        UI_FIRST_BATCH_SIZE, UI_HISTORY_MEMORY_CAPACITY,
+        apply_thumbnail_result, bind_clear_history_mutation_sender, checked_slint_coordinate,
+        checked_slint_length, close_clear_history_mutation_bridge, event_may_refresh_model,
+        explicit_window_ready, perform_show_action, quantize_slint_length,
+        reserve_thumbnail_cache_slot, resolve_geometry_card_event, schedule_thumbnail_requests,
+        selection_item_bounds, selection_viewport_y, settle_post_append_probe_dispatch,
+        thumbnail_retained_range, touch_thumbnail_cache, visible_snapshot_items, AppendBindingGate,
+        HistoryModelRefresh, UiAction, UiState, CLEAR_ALL_CONFIRMATION_PHRASE,
+        HISTORY_BOTTOM_ENTER_THRESHOLD, HISTORY_BOTTOM_EXIT_THRESHOLD, MAX_EXACT_SLINT_INTEGER,
+        THUMBNAIL_CACHE_CAPACITY, THUMBNAIL_ITEM_BUFFER, UI_FIRST_BATCH_SIZE,
+        UI_HISTORY_MEMORY_CAPACITY,
     };
     use crate::command::{
         SearchFilter, SearchStatus, UiClipboardItem, UiClipboardItemKind, UiEvent, UiImageSummary,
-        UiSnapshot,
+        UiSnapshot, WindowCardAction, WindowEventIdentity,
     };
     use crate::history_mutation::{
         clear_history_mutation_channel, ClearHistoryMutationFailure, ClearHistoryMutationRequest,
@@ -2951,6 +3503,184 @@ mod tests {
             panic!("成功续页必须登记绑定后探针");
         };
         (state, revision)
+    }
+
+    /// 读取已发布窗口的完整身份；测试事件不能只携带 local index。
+    fn window_identity(window: &crate::command::WindowCommit) -> WindowEventIdentity {
+        WindowEventIdentity {
+            session_nonce: window.session_nonce,
+            dataset_revision: window.dataset_revision,
+            window_revision: window.window_revision,
+            commit_revision: window.commit_revision,
+            commit_checksum: window.commit_checksum,
+        }
+    }
+
+    /// 显式窗口回调只接受当前身份和一次性 origin token，旧提交/重复 token 必须丢弃。
+    #[test]
+    fn 显式视口事件使用一次性来源令牌并隔离迟到回调() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..8).map(test_item).collect(),
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.history_visible_height = 50;
+        state.history_viewport_y = -10_000;
+        let first = state.build_window_commit().expect("应发布首个显式窗口");
+        let first_identity = window_identity(&first);
+        let token = first.origin_token.expect("越界视口必须产生来源令牌");
+        state.apply(UiEvent::HistoryWindowViewportChanged {
+            identity: first_identity,
+            viewport_y: first.clamped_viewport_y,
+            visible_height: first.visible_height,
+            origin_token: Some(token),
+        });
+        assert_eq!(state.pending_origin_token, None);
+        let accepted_viewport = state.history_viewport_y;
+
+        // 同一提交的重复来源回调已经没有 pending token，必须被拒绝。
+        state.apply(UiEvent::HistoryWindowViewportChanged {
+            identity: first_identity,
+            viewport_y: 0,
+            visible_height: first.visible_height,
+            origin_token: Some(token),
+        });
+        assert_eq!(state.history_viewport_y, accepted_viewport);
+
+        // 用户滚动后发布新窗口，旧身份事件不得改变新窗口视口。
+        state.apply(UiEvent::HistoryWindowViewportChanged {
+            identity: first_identity,
+            viewport_y: -106,
+            visible_height: first.visible_height,
+            origin_token: None,
+        });
+        let second = state.build_window_commit().expect("用户滚动后应发布新窗口");
+        assert_ne!(first.commit_checksum, second.commit_checksum);
+        state.apply(UiEvent::HistoryWindowViewportChanged {
+            identity: first_identity,
+            viewport_y: 0,
+            visible_height: first.visible_height,
+            origin_token: None,
+        });
+        assert_eq!(state.history_viewport_y, second.clamped_viewport_y);
+    }
+
+    /// 显式卡片事件验证绝对索引、ID/哈希和提交身份后再执行操作。
+    #[test]
+    fn 显式卡片事件使用窗口身份而非局部索引() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..3).map(test_item).collect(),
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let commit = state.build_window_commit().expect("应发布显式窗口");
+        let offset = commit.offsets[1].clone();
+        let identity = window_identity(&commit);
+
+        assert_eq!(
+            state.apply(UiEvent::HistoryWindowCardRequested {
+                identity,
+                absolute_index: offset.absolute_index,
+                id: offset.id,
+                content_hash: offset.content_hash,
+                action: WindowCardAction::Select,
+            }),
+            UiAction::SelectItem
+        );
+        assert_eq!(state.snapshot.selected_index, Some(1));
+
+        let mut stale = identity;
+        stale.commit_checksum[0] ^= 1;
+        assert_eq!(
+            state.apply(UiEvent::HistoryWindowCardRequested {
+                identity: stale,
+                absolute_index: offset.absolute_index,
+                id: offset.id,
+                content_hash: offset.content_hash,
+                action: WindowCardAction::Select,
+            }),
+            UiAction::None
+        );
+    }
+
+    /// 数据集替换必须先失效旧 WindowCommit，避免几何构造失败或 UI 更新间隙接受迟到卡片。
+    #[test]
+    fn 数据集变更先隔离旧窗口提交() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..3).map(test_item).collect(),
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let _ = state.build_window_commit().expect("首个窗口应发布");
+        assert!(state.published_window.is_some());
+        state.snapshot.items.push(test_item(99));
+        state.refresh_history_geometry();
+        assert!(state.published_window.is_none());
+        assert!(state.pending_origin_token.is_none());
+        assert!(!explicit_window_ready(&state));
+    }
+
+    /// Slint f32 转换必须在连续整数精确范围内；极值、非有限值和负零不能绕过门禁。
+    #[test]
+    fn slint_几何量化在极值和非有限输入时关闭() {
+        assert_eq!(quantize_slint_length(f32::NAN), None);
+        assert_eq!(quantize_slint_length(f32::INFINITY), None);
+        assert_eq!(quantize_slint_length(f32::NEG_INFINITY), None);
+        assert_eq!(quantize_slint_length(-0.0), Some(0));
+        assert_eq!(
+            checked_slint_length(MAX_EXACT_SLINT_INTEGER),
+            Some(16_777_216.0)
+        );
+        assert_eq!(checked_slint_length(MAX_EXACT_SLINT_INTEGER + 1), None);
+        assert_eq!(checked_slint_length(i64::MAX), None);
+        assert_eq!(
+            checked_slint_coordinate(-MAX_EXACT_SLINT_INTEGER),
+            Some(-16_777_216.0)
+        );
+        assert_eq!(checked_slint_coordinate(MAX_EXACT_SLINT_INTEGER + 1), None);
+        assert_eq!(checked_slint_coordinate(i64::MIN), None);
+    }
+
+    /// 窗口滚动到非零起点后，四类卡片操作都必须从 local index 映射到同一绝对身份。
+    #[test]
+    fn 显式卡片回调在非零窗口起点保持四操作身份() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: (0..20).map(test_item).collect(),
+            selected_index: None,
+        }));
+        state.apply(UiEvent::OpenPanel);
+        state.history_visible_height = 50;
+        state.history_viewport_y = -1_800;
+        let commit = state.build_window_commit().expect("应发布中部窗口");
+        assert!(commit.start > 0, "测试必须覆盖非零窗口起点");
+        let expected = commit.offsets[0].clone();
+        for action in [
+            WindowCardAction::Select,
+            WindowCardAction::Copy,
+            WindowCardAction::Pin { is_pinned: true },
+            WindowCardAction::Delete,
+        ] {
+            let event = resolve_geometry_card_event(&state, 0, action)
+                .expect("当前 bounded local index 必须解析");
+            let UiEvent::HistoryWindowCardRequested {
+                absolute_index,
+                id,
+                content_hash,
+                action: actual_action,
+                ..
+            } = event
+            else {
+                panic!("显式窗口必须生成带身份事件");
+            };
+            assert_eq!(absolute_index, expected.absolute_index);
+            assert_eq!(id, expected.id);
+            assert_eq!(content_hash, expected.content_hash);
+            assert_eq!(actual_action, action);
+        }
     }
 
     /// 用固定内容与可见高度构造指定底部距离的真实几何。

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! 此二进制入口负责创建主窗口并启动 Slint 事件循环。
 //!
 //! 当前入口先完成单实例判定，再创建 UI、初始化 SQLite、绑定弱窗口并启动热键、剪贴板

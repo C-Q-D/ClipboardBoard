@@ -3,12 +3,16 @@
 //! 托盘回调只把用户动作投递到 UI 事件队列；`TrayGuard` 独占通知数据，保证
 //! `NIM_DELETE` 先于 message-only HWND 销毁，并对菜单、系统图标和错误路径做闭合处理。
 
+// 资源 ID 由 build.rs 从仓库内受控文本生成；本模块直接使用，避免额外公共导出。
+include!(concat!(env!("OUT_DIR"), "/clipboard_board_resources.rs"));
+
 use super::hotkey::{
     global_hotkey_request_handle, HotkeyError, HotkeyRequestHandle, HotkeyTransactionStatus,
 };
 use super::startup::{StartupCommandSender, StartupResult};
 use crate::app::post_ui_event;
 use crate::command::UiEvent;
+use crate::diagnostics::{self, DiagnosticEvent};
 use crate::privacy::{PauseCommand, PauseCommandSender, PauseStatus};
 use crate::settings::{
     HotkeySettings, HOTKEY_MOD_ALT, HOTKEY_MOD_CONTROL, HOTKEY_MOD_NOREPEAT, HOTKEY_MOD_SHIFT,
@@ -20,6 +24,7 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HWND, POINT};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICONDATAW,
     NOTIFYICON_VERSION_4,
@@ -66,6 +71,13 @@ const TRAY_MENU_STARTUP_DISABLE: usize = 0x500E;
 /// 查询/重试当前用户登录启动状态。
 const TRAY_MENU_STARTUP_RETRY: usize = 0x500F;
 
+/// 托盘图标的加载来源；资源缺失时允许回退系统默认图标，但必须可观察。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IconSource {
+    ApplicationResource,
+    SystemFallback,
+}
+
 /// 托盘菜单返回的纯动作，不携带 HWND 或配置客户端。
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TrayAction {
@@ -99,12 +111,27 @@ impl TrayGuard {
             return Err(HotkeyError::Tray("创建托盘图标时收到空窗口句柄".to_owned()));
         }
 
-        let system_icon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
-        if system_icon.is_null() {
+        let module = unsafe { GetModuleHandleW(null()) };
+        let resource_icon = if module.is_null() {
+            null_mut()
+        } else {
+            // MAKEINTRESOURCEW 的资源 ID 不经过字符串转换，且由 build.rs 与托盘共用来源。
+            unsafe { LoadIconW(module, APP_ICON_RESOURCE_ID as usize as *const u16) }
+        };
+        let source = icon_source(!resource_icon.is_null());
+        let source_icon = match source {
+            IconSource::ApplicationResource => resource_icon,
+            IconSource::SystemFallback => unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+        };
+        if source_icon.is_null() {
             return Err(last_error("LoadIconW"));
         }
-        // LoadIconW 返回系统共享图标，不能销毁；复制一份私有图标后由 TrayGuard 管理。
-        let icon = unsafe { CopyIcon(system_icon) };
+        if source == IconSource::SystemFallback {
+            // 只记录稳定错误码，不把路径或资源名称写入日志；诊断入口本身是 fail-open。
+            diagnostics::emit(DiagnosticEvent::empty().with_error_code(last_error_code()));
+        }
+        // LoadIconW 返回系统/模块共享图标，不能直接销毁；复制一份私有图标后由 TrayGuard 管理。
+        let icon = unsafe { CopyIcon(source_icon) };
         if icon.is_null() {
             return Err(last_error("CopyIcon"));
         }
@@ -581,6 +608,15 @@ fn destroy_icon(icon: HICON) {
     }
 }
 
+/// 资源图标存在时优先使用应用自身图标，否则才允许回退系统图标。
+fn icon_source(resource_available: bool) -> IconSource {
+    if resource_available {
+        IconSource::ApplicationResource
+    } else {
+        IconSource::SystemFallback
+    }
+}
+
 /// 将固定托盘提示复制进 Win32 的 UTF-16 缓冲区并保证 NUL 终止。
 fn set_tip(data: &mut NOTIFYICONDATAW, tip: &str) {
     let mut encoded = tip.encode_utf16();
@@ -614,9 +650,10 @@ mod tests {
     //! 此测试模块验证固定托盘消息和命令值，不依赖桌面 Shell 状态。
 
     use super::{
-        action_for_command, decode_v4_callback, hotkey_action_flags, is_supported_mouse_message,
-        pause_action_flags, status_menu_label, StartupAction, TrayAction, TRAY_CALLBACK_MESSAGE,
-        TRAY_ICON_ID, TRAY_MENU_EXIT, TRAY_MENU_HOTKEY_ALT_V, TRAY_MENU_HOTKEY_CTRL_ALT_C,
+        action_for_command, decode_v4_callback, hotkey_action_flags, icon_source,
+        is_supported_mouse_message, pause_action_flags, status_menu_label, IconSource,
+        StartupAction, TrayAction, APP_ICON_RESOURCE_ID, TRAY_CALLBACK_MESSAGE, TRAY_ICON_ID,
+        TRAY_MENU_EXIT, TRAY_MENU_HOTKEY_ALT_V, TRAY_MENU_HOTKEY_CTRL_ALT_C,
         TRAY_MENU_HOTKEY_CTRL_SHIFT_V, TRAY_MENU_HOTKEY_WIN_SHIFT_V, TRAY_MENU_OPEN,
         TRAY_MENU_PAUSE_FIVE, TRAY_MENU_PAUSE_INDEFINITE, TRAY_MENU_PAUSE_THIRTY, TRAY_MENU_RESUME,
         TRAY_MENU_STARTUP_DISABLE, TRAY_MENU_STARTUP_ENABLE, TRAY_MENU_STARTUP_RETRY,
@@ -637,6 +674,14 @@ mod tests {
         assert_eq!(TRAY_CALLBACK_MESSAGE, WM_APP + 2);
         assert_ne!(TRAY_CALLBACK_MESSAGE, WM_APP + 1);
         assert_eq!(TRAY_ICON_ID, 1);
+    }
+
+    /// 托盘优先使用应用资源；资源缺失时才允许走系统图标兜底。
+    #[test]
+    fn 应用图标资源与回退策略稳定() {
+        assert_eq!(APP_ICON_RESOURCE_ID, 1);
+        assert_eq!(icon_source(true), IconSource::ApplicationResource);
+        assert_eq!(icon_source(false), IconSource::SystemFallback);
     }
 
     /// 仅接受托盘支持的鼠标释放消息，其他 Shell 通知不会打开菜单。

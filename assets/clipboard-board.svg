@@ -1,0 +1,7 @@
+<!-- ClipboardBoard 图标源：黑色底板、白色剪贴板和蓝色卡扣，保持与黑底白字界面一致。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#121212"/>
+  <path d="M72 56h112c13.255 0 24 10.745 24 24v112c0 13.255-10.745 24-24 24H72c-13.255 0-24-10.745-24-24V80c0-13.255 10.745-24 24-24Z" fill="#121212" stroke="#f5f5f5" stroke-width="16"/>
+  <path d="M96 48c0-13.255 10.745-24 24-24h16c13.255 0 24 10.745 24 24v32H96V48Z" fill="#4ebeff" stroke="#f5f5f5" stroke-width="12"/>
+  <path d="M88 112h80M88 144h80M88 176h48" stroke="#f5f5f5" stroke-width="12" stroke-linecap="round"/>
+</svg>

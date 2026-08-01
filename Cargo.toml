@@ -17,6 +17,7 @@ serde_json = "=1.0.151"
 
 [build-dependencies]
 slint-build = "1.16.0"
+winres = "0.1.12"
 
 # 仅用于隔离集成测试，验证 Slint 事件循环的线程投递边界；生产程序不依赖测试后端。
 [dev-dependencies]

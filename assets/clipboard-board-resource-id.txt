@@ -1,0 +1,2 @@
+# Windows 主图标资源 ID；build.rs 生成 Rust 常量并由托盘代码引用，避免编号漂移。
+1

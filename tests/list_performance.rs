@@ -39,17 +39,17 @@ fn geometry_window_contract() {
         .map(|index| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: if index % 2 == 0 { 106 } else { 186 },
+            height: if index % 2 == 0 { 78 } else { 92 },
         })
         .collect::<Vec<_>>();
     assert!(set_history_geometry_metadata(&window, metadata.clone()));
     assert!(window.get_geometry_mode());
     assert_eq!(window.get_history_active_logical_count(), 20_000);
-    assert_eq!(window.get_geometry_content_height(), 2_920_000.0);
+    assert_eq!(window.get_geometry_content_height(), 1_700_000.0);
 
     let geometry = HistoryGeometry::new(metadata).expect("元数据应可计算 prefix");
     let viewport = geometry
-        .window_for(-1_460_000, 500, 10)
+        .window_for(-850_000, 500, 10)
         .expect("窗口应可计算");
     assert!(viewport.len() <= 100);
     let cards = viewport
@@ -97,7 +97,7 @@ fn set_cards_window_separation() {
         .map(|index| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: 106,
+            height: 78,
         })
         .collect::<Vec<_>>();
     assert!(set_history_geometry_metadata(&window, metadata));

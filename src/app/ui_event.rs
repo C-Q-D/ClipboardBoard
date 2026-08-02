@@ -53,12 +53,18 @@ pub const UI_HISTORY_MEMORY_CAPACITY: usize = MAX_LOADED_ITEMS;
 pub const UI_FIRST_BATCH_SIZE: usize = 30;
 /// 文本历史项固定外层高度；必须与 Theme.history-text-row-height 的 78px 保持一致。
 const TEXT_HISTORY_ROW_HEIGHT: i32 = 78;
-/// 图片卡片固定高度；视口调度无需解码正文或测量图片。
-const IMAGE_CARD_HEIGHT: i32 = 186;
-/// 距离底部两张最高图片卡片以内进入续页区，兼容文本与图片混合列表。
-const HISTORY_BOTTOM_ENTER_THRESHOLD: i32 = IMAGE_CARD_HEIGHT * 2;
-/// 离开阈值比进入阈值多一张图片卡片，吸收 Slint 多属性布局回调抖动。
-const HISTORY_BOTTOM_EXIT_THRESHOLD: i32 = IMAGE_CARD_HEIGHT * 3;
+/// 图片历史项固定外层高度；必须与 Theme.history-image-row-height 的 92px 保持一致。
+const IMAGE_HISTORY_ROW_HEIGHT: i32 = 92;
+/// 文本和图片中较高的固定行高；续页阈值必须按最高项计算而不是取三分之二。
+const MAX_HISTORY_ROW_HEIGHT: i32 = if TEXT_HISTORY_ROW_HEIGHT > IMAGE_HISTORY_ROW_HEIGHT {
+    TEXT_HISTORY_ROW_HEIGHT
+} else {
+    IMAGE_HISTORY_ROW_HEIGHT
+};
+/// 距离底部两张最高卡片以内进入续页区，明确为 max(78, 92)×2 = 184。
+const HISTORY_BOTTOM_ENTER_THRESHOLD: i32 = MAX_HISTORY_ROW_HEIGHT * 2;
+/// 离开阈值为 max(78, 92)×3 = 276，吸收 Slint 多属性布局回调抖动。
+const HISTORY_BOTTOM_EXIT_THRESHOLD: i32 = MAX_HISTORY_ROW_HEIGHT * 3;
 /// 视口前后各保留十条卡片；范围按卡片条目计算而不是按像素猜测。
 const THUMBNAIL_ITEM_BUFFER: usize = 10;
 /// UI 纹理和失败占位的硬容量上限；滚动大量图片时仍保持有界。
@@ -1562,7 +1568,9 @@ impl UiState {
                 content_hash: item.content_hash,
                 height: match item.kind {
                     crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT as i64,
-                    crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as i64,
+                    crate::command::UiClipboardItemKind::Image(_) => {
+                        IMAGE_HISTORY_ROW_HEIGHT as i64
+                    }
                 },
             })
             .collect();
@@ -2724,7 +2732,7 @@ fn thumbnail_retained_range(
     for (index, item) in items.iter().enumerate() {
         let item_height = match item.kind {
             crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT,
-            crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT,
+            crate::command::UiClipboardItemKind::Image(_) => IMAGE_HISTORY_ROW_HEIGHT,
         };
         let item_bottom = item_top.saturating_add(item_height);
         if item_bottom > top && item_top < bottom {
@@ -3282,7 +3290,7 @@ fn selection_item_bounds(snapshot: &UiSnapshot, selected_index: usize) -> Option
     for (index, item) in visible_snapshot_items(snapshot).enumerate() {
         let height = match item.kind {
             crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT as f32,
-            crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as f32,
+            crate::command::UiClipboardItemKind::Image(_) => IMAGE_HISTORY_ROW_HEIGHT as f32,
         };
         if index == selected_index {
             return Some((top, top + height));
@@ -4344,17 +4352,17 @@ mod tests {
         assert!(state.take_pending_history_request().is_none());
     }
 
-    /// 混合列表进入与离开阈值必须精确覆盖 371/372/373/558/559 五个边界。
+    /// 混合列表进入与离开阈值必须精确覆盖 183/184/185/275/276/277 六个边界。
     #[test]
     fn 混合卡片底部阈值提前加载() {
-        assert_eq!(HISTORY_BOTTOM_ENTER_THRESHOLD, 372);
-        assert_eq!(HISTORY_BOTTOM_EXIT_THRESHOLD, 558);
-        assert!(UiState::near_bottom_after_distance(false, 371));
-        assert!(UiState::near_bottom_after_distance(false, 372));
-        assert!(!UiState::near_bottom_after_distance(false, 373));
-        assert!(UiState::near_bottom_after_distance(true, 373));
-        assert!(UiState::near_bottom_after_distance(true, 558));
-        assert!(!UiState::near_bottom_after_distance(true, 559));
+        assert_eq!(HISTORY_BOTTOM_ENTER_THRESHOLD, 184);
+        assert_eq!(HISTORY_BOTTOM_EXIT_THRESHOLD, 276);
+        assert!(UiState::near_bottom_after_distance(false, 183));
+        assert!(UiState::near_bottom_after_distance(false, 184));
+        assert!(!UiState::near_bottom_after_distance(false, 185));
+        assert!(UiState::near_bottom_after_distance(true, 185));
+        assert!(UiState::near_bottom_after_distance(true, 276));
+        assert!(!UiState::near_bottom_after_distance(true, 277));
     }
 
     /// 三个布局属性乱序通知和滞回区抖动只能生成一个活动续页请求。
@@ -4374,10 +4382,10 @@ mod tests {
             }),
         ));
 
-        state.apply(viewport_for_distance(559));
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(277));
+        state.apply(viewport_for_distance(184));
         let request = state.take_pending_history_request().unwrap();
-        for distance in [371, 373, 558, 372, 559, 558, 373] {
+        for distance in [183, 185, 275, 184, 277, 276, 185] {
             state.apply(viewport_for_distance(distance));
             assert!(state.take_pending_history_request().is_none());
         }
@@ -4399,13 +4407,13 @@ mod tests {
             state.append_binding_gate,
             AppendBindingGate::ProbePending(revision)
         );
-        state.apply(viewport_for_distance(559));
-        state.apply(viewport_for_distance(371));
+        state.apply(viewport_for_distance(277));
+        state.apply(viewport_for_distance(183));
         assert!(state.take_pending_history_request().is_none());
 
         let probe = UiEvent::HistoryPostAppendProbe {
             append_revision: revision,
-            viewport_y: -(900 - 372),
+            viewport_y: -(900 - 184),
             visible_height: 100,
             content_height: 1_000,
         };
@@ -4434,13 +4442,13 @@ mod tests {
         let (mut state, revision) = state_with_pending_append_probe();
         let stale = UiEvent::HistoryViewportChangedDuringAppend {
             append_revision: Some(revision),
-            viewport_y: -528,
+            viewport_y: -(900 - 184),
             visible_height: 100,
             content_height: 1_000,
         };
         state.apply(UiEvent::HistoryPostAppendProbe {
             append_revision: revision,
-            viewport_y: -(900 - 559),
+            viewport_y: -(900 - 277),
             visible_height: 100,
             content_height: 1_000,
         });
@@ -4450,7 +4458,7 @@ mod tests {
         state.apply(stale);
         state.apply(UiEvent::HistoryPostAppendProbe {
             append_revision: revision,
-            viewport_y: -528,
+            viewport_y: -(900 - 184),
             visible_height: 100,
             content_height: 1_000,
         });
@@ -4492,7 +4500,7 @@ mod tests {
             state.pending_history_request = None;
             state.apply(UiEvent::HistoryPostAppendProbe {
                 append_revision: revision,
-                viewport_y: -528,
+                viewport_y: -(900 - 184),
                 visible_height: 100,
                 content_height: 1_000,
             });
@@ -4535,8 +4543,8 @@ mod tests {
         assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
         assert_eq!(state.snapshot.items.len(), 31);
 
-        state.apply(viewport_for_distance(559));
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(277));
+        state.apply(viewport_for_distance(184));
         assert!(state.take_pending_history_request().is_some());
     }
 
@@ -4548,8 +4556,8 @@ mod tests {
         state.cancel_post_append_probe(revision);
         assert_eq!(state.append_binding_gate, AppendBindingGate::Idle);
         assert_eq!(state.snapshot.items.len(), 31);
-        state.apply(viewport_for_distance(559));
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(277));
+        state.apply(viewport_for_distance(184));
         assert!(state.take_pending_history_request().is_some());
     }
 
@@ -4570,7 +4578,7 @@ mod tests {
             }),
         ));
         state.next_append_revision = u64::MAX;
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(184));
         let next = state.take_pending_history_request().unwrap();
         let refresh = state.apply_history_page_result(page_result(
             &next,
@@ -4596,7 +4604,7 @@ mod tests {
         assert_eq!(state.snapshot.items.len(), 31);
 
         // 模拟模型与视口 setter 同步及延迟产生的乱序回调；下一 UI 闭包前门禁仍有效。
-        for distance in [559, 371, 558, 372] {
+        for distance in [277, 183, 275, 184] {
             state.apply(UiEvent::HistoryViewportChangedDuringAppend {
                 append_revision: None,
                 viewport_y: -(900 - distance),
@@ -4612,15 +4620,15 @@ mod tests {
         // 绑定前冻结的迟到事件仍无效；同区 inside 也不会自动重武装本次 Append。
         state.apply(UiEvent::HistoryViewportChangedDuringAppend {
             append_revision: None,
-            viewport_y: -528,
+            viewport_y: -(900 - 184),
             visible_height: 100,
             content_height: 1_000,
         });
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(184));
         assert!(state.take_pending_history_request().is_none());
 
-        state.apply(viewport_for_distance(559));
-        state.apply(viewport_for_distance(372));
+        state.apply(viewport_for_distance(277));
+        state.apply(viewport_for_distance(184));
         assert!(state.take_pending_history_request().is_some());
     }
 
@@ -4631,7 +4639,7 @@ mod tests {
         assert!(!state.history_next_page_loading);
         state.apply(UiEvent::HistoryPostAppendProbe {
             append_revision: revision,
-            viewport_y: -528,
+            viewport_y: -(900 - 184),
             visible_height: 100,
             content_height: 1_000,
         });
@@ -5837,7 +5845,7 @@ mod tests {
         assert_eq!(selection_viewport_y(78.0, 156.0, 0.0, 0.0, 1000.0), 0.0);
     }
 
-    /// 文本行高必须由生产常量固定为 78px，并在混合选择边界中累加而不动态测量正文。
+    /// 文本行高必须由生产常量固定为 78px；混合图片项使用 92px，不能回退到旧高度。
     #[test]
     fn 文本历史项使用七十八像素几何() {
         let snapshot = UiSnapshot {
@@ -5847,7 +5855,7 @@ mod tests {
 
         assert_eq!(selection_item_bounds(&snapshot, 0), Some((0.0, 78.0)));
         assert_eq!(selection_item_bounds(&snapshot, 1), Some((78.0, 156.0)));
-        assert_eq!(selection_item_bounds(&snapshot, 2), Some((156.0, 342.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((156.0, 248.0)));
     }
 
     /// 图片和文本使用各自固定高度，前序图片不能让后续选择偏移少算。
@@ -5864,7 +5872,26 @@ mod tests {
             selected_index: Some(2),
         };
 
-        assert_eq!(selection_item_bounds(&snapshot, 2), Some((264.0, 342.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((170.0, 248.0)));
+    }
+
+    /// 图片行高必须由生产常量固定为 92px，并与前后文本行形成精确混合边界。
+    #[test]
+    fn 图片历史项使用九十二像素几何() {
+        let snapshot = UiSnapshot {
+            items: vec![
+                test_item(0),
+                test_image_item(1),
+                test_item(2),
+                test_image_item(3),
+            ],
+            selected_index: None,
+        };
+
+        assert_eq!(selection_item_bounds(&snapshot, 1), Some((78.0, 170.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((170.0, 248.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 3), Some((248.0, 340.0)));
+        assert_eq!(thumbnail_retained_range(&snapshot, -78, 92), 0..4);
     }
 
     /// 滚出视口的迟到结果虽然被拒绝，但必须结束在途身份，滚回后才能重新请求。
@@ -5970,9 +5997,10 @@ mod tests {
             selected_index: None,
         };
 
-        // 首张图片从 78px 开始；78..264 的视口只覆盖该图片，缓冲应覆盖 0..12。
-        assert_eq!(thumbnail_retained_range(&snapshot, -78, 186), 0..12);
-        let middle = thumbnail_retained_range(&snapshot, -2_800, 186);
+        // 首张图片从 78px 开始；78..170 的视口只覆盖该图片，缓冲应覆盖 0..12。
+        assert_eq!(thumbnail_retained_range(&snapshot, -78, 92), 0..12);
+        // 32 条交错行的新总高约 2720px；-1400 明确落在中部而非旧高度下的底部。
+        let middle = thumbnail_retained_range(&snapshot, -1_400, 92);
         assert!(middle.start > 0);
         assert!(middle.len() <= THUMBNAIL_ITEM_BUFFER * 2 + 2);
     }
@@ -6009,7 +6037,7 @@ mod tests {
             },
             1,
             0,
-            186,
+            92,
         );
         assert!(changed);
         super::UI_THUMBNAIL_CACHE.with(|cache| {

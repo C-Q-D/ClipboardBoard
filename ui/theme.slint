@@ -31,7 +31,9 @@ export global Theme {
     // 文本行外层固定 78px；共享视觉中的 70px 背景内含选中边框，不能向外撑高。
     in property <length> history-text-row-height: 78px;
     in property <length> history-text-background-height: 70px;
-    in property <length> history-image-row-height: 186px;
+    // 图片行外层固定 92px；84px 背景保留与文本行一致的 8px 视觉间隔。
+    in property <length> history-image-row-height: 92px;
+    in property <length> history-image-background-height: 84px;
 
     // 采用系统字体回退，不把 design 目录中的 WOFF/WOFF2 带入程序。
     in property <string> font-family: "Microsoft YaHei UI";

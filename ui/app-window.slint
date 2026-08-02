@@ -23,7 +23,7 @@ component ThemedText inherits Text {
     font-family: Theme.font-family;
 }
 
-// HistoryCard 只声明 geometry 路径的 78/186 外层行高；内部视觉统一委托给 HistoryRowVisual。
+// HistoryCard 只声明 geometry 路径的 78/92 外层行高；内部视觉统一委托给 HistoryRowVisual。
 component HistoryCard inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;

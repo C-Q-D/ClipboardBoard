@@ -10,7 +10,10 @@ use clipboard_board::command::{
 use clipboard_board::{create_app_window, ClipboardCard};
 use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
 use slint::platform::{PointerEventButton, WindowEvent};
-use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel};
+use slint::{
+    ComponentHandle, Image, LogicalPosition, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString,
+    VecModel,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -59,6 +62,23 @@ fn surface_pixels(
         .count()
 }
 
+/// 统计缩略图状态文字和线性图标的高亮像素，避免依赖字体抗锯齿后的单一颜色。
+fn light_pixels(
+    snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>,
+    x_start: usize,
+    x_end: usize,
+    y_start: usize,
+    y_end: usize,
+) -> usize {
+    (y_start..y_end)
+        .flat_map(|y| (x_start..x_end).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            let [red, green, blue, alpha] = pixel(snapshot, *x, *y);
+            alpha == 255 && red > 80 && green > 80 && blue > 80
+        })
+        .count()
+}
+
 /// 构造单张文本卡片；shell 契约只需要稳定的最小展示数据。
 fn card() -> ClipboardCard {
     ClipboardCard {
@@ -76,6 +96,34 @@ fn card() -> ClipboardCard {
         thumbnail_loaded: false,
         thumbnail_failed: false,
     }
+}
+
+/// 构造图片三态夹具；缩略图句柄只在 loaded=true 时进入组件树，失败态不伪造空图片。
+fn image_card(thumbnail_loaded: bool, thumbnail_failed: bool, thumbnail: Image) -> ClipboardCard {
+    ClipboardCard {
+        preview: SharedString::from("图片摘要"),
+        source: SharedString::from("图片测试来源"),
+        relative_time: SharedString::from("刚刚"),
+        is_pinned: false,
+        pin_pending: false,
+        delete_pending: false,
+        is_image: true,
+        copy_enabled: true,
+        image_width: 1920,
+        image_height: 1080,
+        thumbnail,
+        thumbnail_loaded,
+        thumbnail_failed,
+    }
+}
+
+/// 构造不透明缩略图，确保 loaded 状态的 cover 绘制可以由快照直接证明。
+fn solid_thumbnail() -> Image {
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(4, 4);
+    for pixel in buffer.make_mut_bytes().chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[84, 132, 196, 255]);
+    }
+    Image::from_rgba8(buffer)
 }
 
 /// 空历史保留窗口外框；四个筛选可命中；填充卡片后首项位于左栏历史槽顶部。
@@ -236,4 +284,49 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     click(&geometry, 100.0, 290.0);
     assert_eq!(legacy_selected.borrow().as_slice(), &[0]);
     assert_eq!(geometry_selected.borrow().as_slice(), &[0]);
+
+    // UIR-08：三种图片缩略图状态都必须在固定 92px 行内留下真实可见证据。
+    window.set_selected_index(-1);
+    window.set_cards(ModelRc::new(VecModel::from(vec![image_card(
+        false,
+        false,
+        Image::default(),
+    )])));
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    assert_eq!(window.get_history_viewport_height(), 92.0);
+    let loading_snapshot = window.window().take_snapshot().expect("图片加载中快照失败");
+
+    window.set_cards(ModelRc::new(VecModel::from(vec![image_card(
+        false,
+        true,
+        Image::default(),
+    )])));
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    assert_eq!(window.get_history_viewport_height(), 92.0);
+    let failed_snapshot = window.window().take_snapshot().expect("图片失败快照失败");
+
+    window.set_cards(ModelRc::new(VecModel::from(vec![image_card(
+        true,
+        false,
+        solid_thumbnail(),
+    )])));
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    assert_eq!(window.get_history_viewport_height(), 92.0);
+    let loaded_snapshot = window
+        .window()
+        .take_snapshot()
+        .expect("图片加载成功快照失败");
+
+    assert!(
+        light_pixels(&loading_snapshot, 42, 94, 260, 326) > 20,
+        "加载中占位没有真实绘制"
+    );
+    assert!(
+        light_pixels(&failed_snapshot, 42, 94, 260, 326) > 20,
+        "失败态文案或图标没有真实绘制"
+    );
+    assert!(
+        surface_pixels(&loaded_snapshot, 42, 94, 255, 330, [84, 132, 196, 255]) > 1_000,
+        "已加载缩略图没有在 52×52 盒中真实绘制"
+    );
 }

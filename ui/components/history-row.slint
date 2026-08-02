@@ -2,7 +2,7 @@
 // HistoryRowVisual 只接收受限摘要和局部索引；视口、绝对 offset、窗口化和业务状态仍归父级负责。
 
 import { Theme } from "../theme.slint";
-import { PinFilledIcon, PinOutlineIcon, TextIcon } from "icons.slint";
+import { ImageIcon, PinFilledIcon, PinOutlineIcon, TextIcon } from "icons.slint";
 
 // ClipboardCard 是历史视觉需要的最小展示 DTO；完整正文和原图永远不进入 Slint 组件树。
 export struct ClipboardCard {
@@ -40,7 +40,7 @@ component HistoryRowText inherits Text {
 
 // HistoryRowVisual 复用文本/图片卡片的背景、摘要和当前操作按钮。
 // 它不声明 preferred/min/max height，不持有 ListView、Flickable、viewport 或绝对 offset；
-// 外层 HistoryCard 和 legacy delegate 才是 78/186 行高与定位的唯一几何真相。
+// 外层 HistoryCard 和 legacy delegate 才是 78/92 行高与定位的唯一几何真相。
 export component HistoryRowVisual inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;
@@ -55,7 +55,7 @@ export component HistoryRowVisual inherits Rectangle {
     background: transparent;
 
     card-background := Rectangle {
-        height: card.is_image ? 176px : Theme.history-text-background-height;
+        height: card.is_image ? Theme.history-image-background-height : Theme.history-text-background-height;
         // 背景尺寸只表达卡片内部绘制范围；外层行高由两个父级路径分别固定。
         width: parent.width;
         clip: true;
@@ -111,29 +111,65 @@ export component HistoryRowVisual inherits Rectangle {
         }
 
         if card.is_image: Rectangle {
-            x: 14px; y: 12px; width: parent.width - 172px; height: 112px;
-            background: Theme.window-bg; border-width: 1px; border-color: Theme.border-subtle; border-radius: 6px; clip: true;
+            // 52×52 固定盒只承载受限缩略图或状态占位，不读取原图尺寸来改变行高。
+            x: 14px;
+            y: (parent.height - self.height) / 2;
+            width: 52px;
+            height: 52px;
+            background: Theme.window-bg;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            border-radius: 6px;
+            clip: true;
             Image {
                 visible: card.thumbnail_loaded;
                 width: parent.width; height: parent.height;
                 source: card.thumbnail; image-fit: cover;
             }
-            HistoryRowText {
-                visible: !card.thumbnail_loaded;
-                text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
+            if !card.thumbnail_loaded && !card.thumbnail_failed: HistoryRowText {
+                text: "图片加载中…";
                 color: Theme.text-muted; font-size: Theme.button-font-size;
                 horizontal-alignment: center; vertical-alignment: center;
             }
+            if !card.thumbnail_loaded && card.thumbnail_failed: ImageIcon {
+                size: 16px;
+                icon-color: Theme.text-muted;
+                x: (parent.width - self.width) / 2;
+                y: 7px;
+            }
+            if !card.thumbnail_loaded && card.thumbnail_failed: HistoryRowText {
+                x: 0px; y: 34px; width: parent.width; height: 14px;
+                text: "图片不可用";
+                color: Theme.text-muted; font-size: 10px;
+                horizontal-alignment: center; overflow: clip;
+            }
         }
         if card.is_image: HistoryRowText {
-            x: 14px; y: 132px; width: parent.width - 172px;
+            x: 76px; y: 17px; width: parent.width - 220px; height: 16px;
             text: "图片  " + card.image_width + " × " + card.image_height;
-            color: Theme.text-primary; font-size: Theme.button-font-size;
+            color: Theme.text-primary; font-size: Theme.metadata-font-size;
+            overflow: clip;
         }
-        if card.is_image: HistoryRowText {
-            x: 14px; y: 151px; width: parent.width - 172px;
-            text: card.source + "  ·  " + card.relative_time;
-            color: Theme.text-secondary; font-size: Theme.metadata-font-size;
+        if card.is_image: HorizontalLayout {
+            x: 76px; y: 48px; width: parent.width - 220px; height: 14px;
+            spacing: 4px;
+            // 图片来源过长时只收缩并裁剪来源槽，时间槽仍保持右对齐且不覆盖操作区。
+            HistoryRowText {
+                min-width: 0px;
+                horizontal-stretch: 1;
+                text: card.source;
+                color: Theme.text-secondary;
+                font-size: Theme.metadata-font-size;
+                overflow: clip;
+            }
+            HistoryRowText {
+                min-width: 0px;
+                text: card.relative_time;
+                color: Theme.text-muted;
+                font-size: Theme.metadata-font-size;
+                horizontal-alignment: right;
+                overflow: clip;
+            }
         }
 
         card-touch := TouchArea {

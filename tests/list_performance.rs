@@ -237,8 +237,8 @@ const MIXED_TEXT_SUMMARY_COUNT: usize = 10_000;
 const MIXED_IMAGE_SUMMARY_COUNT: usize = 10_000;
 /// 文本卡片的最终固定高度；必须与生产 Slint delegate 的 78px 外层保持一致。
 const MIXED_TEXT_CARD_HEIGHT_PX: f32 = 78.0;
-/// 图片卡片的最终固定高度；必须与生产 Slint delegate 保持一致。
-const MIXED_IMAGE_CARD_HEIGHT_PX: f32 = 186.0;
+/// 图片卡片的最终固定高度；必须与生产 Slint delegate 的 92px 外层保持一致。
+const MIXED_IMAGE_CARD_HEIGHT_PX: f32 = 92.0;
 /// 混合探针重复呼出样本数；排序后取 P95，降低调度抖动对结论的影响。
 const MIXED_OPEN_SAMPLE_COUNT: usize = 30;
 /// 混合探针滚动采样数；每次都驱动真实 ListView 视口并运行测试后端更新。
@@ -470,7 +470,7 @@ fn measure_mixed_open(
         .map(|(index, card)| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: if card.is_image { 186 } else { 78 },
+            height: if card.is_image { 92 } else { 78 },
         })
         .collect::<Vec<_>>();
     let geometry = HistoryGeometry::new(metadata.clone()).expect("混合 metadata 应可构造");
@@ -701,7 +701,7 @@ fn 测量一万文本与一万图片混合列表() {
         .map(|(index, card)| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: if card.is_image { 186 } else { 78 },
+            height: if card.is_image { 92 } else { 78 },
         })
         .collect::<Vec<_>>();
     let geometry = HistoryGeometry::new(metadata.clone()).expect("混合 prefix 应可构造");

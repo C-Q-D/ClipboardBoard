@@ -3,7 +3,7 @@
 //! 测试后端只在这个独立测试二进制中初始化一次，避免 Slint 全局平台重复初始化。
 
 use clipboard_board::app::{post_ui_event, ui_state_snapshot};
-use clipboard_board::command::{UiClipboardItem, UiEvent, UiSnapshot};
+use clipboard_board::command::{UiClipboardItem, UiClipboardItemKind, UiEvent, UiSnapshot};
 use std::sync::mpsc;
 use std::thread;
 
@@ -31,6 +31,8 @@ fn 后台事件在事件循环线程更新状态() {
                 content_hash: [7; 32],
                 copy_count: 1,
                 is_pinned: false,
+                // 该跨线程夹具只验证事件线程边界，明确使用文本类型以保持 DTO 不变量。
+                kind: UiClipboardItemKind::Text,
             }],
             selected_index: Some(0),
         });

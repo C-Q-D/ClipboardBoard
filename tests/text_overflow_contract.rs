@@ -72,6 +72,9 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
         long_card(),
         short_card(),
     ])));
+    // 右栏复用同一受限摘要，真实软件渲染必须绘制正文而不是继续显示 UIR-05 占位。
+    window.set_selected_card(long_card());
+    window.set_has_selected_card(true);
     window.show().expect("测试窗口应成功显示");
 
     let snapshot = window.window().take_snapshot().expect("软件渲染快照失败");
@@ -106,5 +109,18 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
     assert_eq!(
         light_pixels, 0,
         "长文本在卡片间隔中留下了 {light_pixels} 个浅色像素"
+    );
+
+    // 右栏正文位于分隔线右侧，长摘要的多行内容应在固定预览区内真实出现。
+    let preview_pixels = (190_usize..480)
+        .flat_map(|y| (350_usize..690).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            let offset = y * stride + x * 4;
+            pixels[offset] > 120 && pixels[offset + 1] > 120 && pixels[offset + 2] > 120
+        })
+        .count();
+    assert!(
+        preview_pixels > 80,
+        "右栏受限摘要没有形成真实正文像素，仅发现 {preview_pixels} 个浅色像素"
     );
 }

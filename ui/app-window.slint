@@ -6,6 +6,7 @@ import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TextButton } from "components/controls.slint";
 import { ClipboardCard, HistoryRowVisual } from "components/history-row.slint";
+import { PreviewPane } from "components/preview-pane.slint";
 export { PrimitiveGallery } from "components/controls.slint";
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -780,37 +781,13 @@ export component AppWindow inherits Window {
                 background: Theme.border-subtle;
             }
 
-            // UIR-05 只建立稳定预览占位；不读取 selected-index，也不注册任何回调。
-            Rectangle {
+            // UIR-11 只把受限 selected-card 交给预览组件；操作回调由后续原子接入。
+            PreviewPane {
                 // 左栏 300px 与分隔线 1px 已固定，右栏宽度随 HLayout 客户区剩余量变化。
                 width: parent.width - 300px - 1px;
                 vertical-stretch: 1;
-                background: Theme.surface-bg;
-                border-radius: Theme.control-radius;
-                border-width: 1px;
-                border-color: Theme.border-subtle;
-
-                VerticalLayout {
-                    x: 24px;
-                    y: 24px;
-                    width: parent.width - 48px;
-                    height: parent.height - 48px;
-                    spacing: 8px;
-
-                    ThemedText {
-                        text: "内容预览";
-                        color: Theme.text-primary;
-                        font-size: Theme.section-title-font-size;
-                        font-weight: Theme.font-weight-semibold;
-                    }
-                    ThemedText {
-                        text: "选择左侧内容后在这里预览";
-                        color: Theme.text-secondary;
-                        font-size: Theme.preview-font-size;
-                        wrap: word-wrap;
-                        overflow: clip;
-                    }
-                }
+                card: selected-card;
+                has-selected-card: has-selected-card;
             }
         }
     }

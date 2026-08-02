@@ -1,0 +1,112 @@
+// 此文件只负责右栏摘要预览的布局和滚动，不持有选择事实、稳定身份或后台操作。
+// 文本内容来自 ClipboardCard.preview 的受限摘要；完整正文和图片原图永远不进入组件。
+
+import { Theme } from "../theme.slint";
+import { ClipboardCard } from "history-row.slint";
+
+// 预览文字统一使用主题字体；组件不把来源、时间或正文复制成第二套状态。
+component PreviewText inherits Text {
+    font-family: Theme.font-family;
+}
+
+// PreviewPane 只展示当前 selected-card 的安全摘要；复制、收藏和删除属于后续原子。
+export component PreviewPane inherits Rectangle {
+    // Rust 侧传入已经通过完整快照和稳定身份校验的受限 ClipboardCard 摘要。
+    in property <ClipboardCard> card;
+    // 右栏所有卡片字段都必须受此门禁保护；false 时只显示固定空状态。
+    in property <bool> has-selected-card: false;
+    // 标题和来源元数据共用固定 46px 头部，正文滚动不能改变右栏外层高度。
+    property <length> preview-header-height: 46px;
+
+    // 预览是受限摘要；复制仍由 Rust 按稳定身份读取完整内容，本组件不负责复制。
+
+    background: Theme.surface-bg;
+    border-radius: Theme.control-radius;
+    border-width: 1px;
+    border-color: Theme.border-subtle;
+
+    // 内容内缩与列表栏保持一致；右栏自身负责裁剪，不推动外层窗口高度。
+    Rectangle {
+        x: Theme.content-padding;
+        y: Theme.content-padding;
+        width: parent.width - Theme.content-padding - Theme.content-padding;
+        height: parent.height - Theme.content-padding - Theme.content-padding;
+        background: transparent;
+        clip: true;
+
+        PreviewText {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 22px;
+            text: "内容预览";
+            color: Theme.text-primary;
+            font-size: Theme.section-title-font-size;
+            font-weight: Theme.font-weight-semibold;
+            vertical-alignment: center;
+        }
+
+        if has-selected-card: PreviewText {
+            x: 0px;
+            y: 26px;
+            width: parent.width;
+            height: 16px;
+            text: card.source + " · " + card.relative_time;
+            color: Theme.text-secondary;
+            font-size: Theme.metadata-font-size;
+            overflow: clip;
+        }
+
+        if !has-selected-card: PreviewText {
+            x: 0px;
+            y: preview-header-height;
+            width: parent.width;
+            height: 22px;
+            text: "选择左侧内容后在这里预览";
+            color: Theme.text-secondary;
+            font-size: Theme.preview-font-size;
+            wrap: word-wrap;
+            overflow: clip;
+        }
+
+        if has-selected-card && !card.is_image: Flickable {
+            x: 0px;
+            y: preview-header-height;
+            width: parent.width;
+            height: parent.height - preview-header-height;
+            // viewport-height 与摘要 Text 的实际 preferred-height 同步，长摘要才能滚动。
+            viewport-height: preview-text.preferred-height;
+
+            Rectangle {
+                width: parent.width;
+                height: preview-text.preferred-height;
+                background: transparent;
+
+                preview-text := PreviewText {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: self.preferred-height;
+                    text: card.preview == "" ? "文本内容为空" : card.preview;
+                    color: Theme.text-primary;
+                    font-size: Theme.preview-font-size;
+                    wrap: word-wrap;
+                    overflow: clip;
+                    vertical-alignment: top;
+                }
+            }
+        }
+
+        if has-selected-card && card.is_image: PreviewText {
+            x: 0px;
+            y: preview-header-height;
+            width: parent.width;
+            height: 22px;
+            text: "图片预览将在下一阶段显示";
+            color: Theme.text-secondary;
+            font-size: Theme.preview-font-size;
+            wrap: word-wrap;
+            overflow: clip;
+        }
+    }
+}

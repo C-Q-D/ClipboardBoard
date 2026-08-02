@@ -44,7 +44,7 @@ fn geometry_window_contract() {
         .collect::<Vec<_>>();
     assert!(set_history_geometry_metadata(&window, metadata.clone()));
     assert!(window.get_geometry_mode());
-    assert_eq!(window.get_history_model_length(), 20_000);
+    assert_eq!(window.get_history_active_logical_count(), 20_000);
     assert_eq!(window.get_geometry_content_height(), 2_920_000.0);
 
     let geometry = HistoryGeometry::new(metadata).expect("元数据应可计算 prefix");
@@ -108,7 +108,7 @@ fn set_cards_window_separation() {
     )));
     window.show().expect("测试窗口应显示");
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
-    assert_eq!(window.get_history_model_length(), 20_000);
+    assert_eq!(window.get_history_active_logical_count(), 20_000);
     assert!(
         accesses.borrow().is_empty(),
         "metadata 模式不能触发旧 ListView row_data"
@@ -489,7 +489,7 @@ fn measure_mixed_open(
     // 测试后端 tick 会执行 bounded Flickable 更新；不能只测属性写入。
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
     let elapsed = started_at.elapsed();
-    let item_count = window.get_history_model_length() as usize;
+    let item_count = window.get_history_active_logical_count() as usize;
     let window_start = usize::try_from(window.get_window_start()).unwrap_or(usize::MAX);
     let window_length = usize::try_from(window.get_window_length()).unwrap_or(0);
     let window_model_length = window.get_window_cards().row_count();
@@ -552,7 +552,7 @@ fn 测量两万条固定高度摘要列表() {
         .show()
         .expect("性能探针必须能够显示驻留看板");
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
-    let observed_item_count = retained_window.get_history_model_length() as usize;
+    let observed_item_count = retained_window.get_history_active_logical_count() as usize;
     let initial_accesses = accesses.borrow().clone();
     let mut peak_working_set = working_set_bytes();
 
@@ -723,7 +723,7 @@ fn 测量一万文本与一万图片混合列表() {
         .show()
         .expect("混合性能探针必须能够显示驻留看板");
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
-    let observed_item_count = retained_window.get_history_model_length() as usize;
+    let observed_item_count = retained_window.get_history_active_logical_count() as usize;
     let initial_window_start =
         usize::try_from(retained_window.get_window_start()).unwrap_or(usize::MAX);
     let initial_window_length = usize::try_from(retained_window.get_window_length()).unwrap_or(0);

@@ -20,9 +20,11 @@ fn send_key(window: &clipboard_board::AppWindow, key: Key) {
         .dispatch_event(WindowEvent::KeyReleased { text });
 }
 
-/// 在固定搜索框区域发送一次鼠标点击，使 LineEdit 成为真实的按键目标。
+/// 在顶部工具栏的固定搜索框区域发送一次鼠标点击，使 LineEdit 成为真实的按键目标。
 fn focus_search_input(window: &clipboard_board::AppWindow) {
-    let position = LogicalPosition::new(100.0, 90.0);
+    // shell 内部坐标为 x=168、y=8；叠加窗口 14px 外边距和 shell 14px padding 后，
+    // 该点位于当前 560px 看板的 LineEdit 内，不依赖文本或品牌区域命中。
+    let position = LogicalPosition::new(300.0, 55.0);
     window
         .window()
         .dispatch_event(WindowEvent::PointerMoved { position });

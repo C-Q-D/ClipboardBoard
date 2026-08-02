@@ -296,8 +296,10 @@ export component AppWindow inherits Window {
     in-out property <length> history-viewport-y: 0px;
     // legacy ListView 保留双向别名，使模型替换后的内部 clamp 能同步回统一视口属性。
     in-out property <length> legacy-history-viewport-y <=> history-list.viewport-y;
-    // 暴露实际绑定模型的行数，性能探针据此拒绝“只打印常量但模型变小”的伪证。
-    out property <int> history-model-length: geometry-mode ? history-logical-count : cards.length;
+    // 当前活动路径的完整逻辑数量只用于总数文案，不能被 bounded window 模型替代。
+    out property <int> history-active-logical-count: geometry-mode ? history-logical-count : cards.length;
+    // 暴露实际绑定重复器的行数；geometry 模式必须是有界 window-cards，而不是逻辑总数。
+    out property <int> history-model-length: geometry-mode ? window-cards.length : cards.length;
     out property <length> history-visible-height: geometry-mode ? geometry-history-list.height : history-list.visible-height;
     out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
     // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
@@ -356,27 +358,79 @@ export component AppWindow inherits Window {
                 height: parent.height - Theme.page-inset - Theme.page-inset;
                 spacing: 12px;
 
-                ThemedText {
-                    text: "CLIPBOARD";
-                    color: Theme.text-primary;
-                    font-size: Theme.app-name-font-size;
-                    font-weight: Theme.font-weight-semibold;
-                    letter-spacing: 2px;
-                }
+                // 固定 54px 顶部工具栏只承载品牌、活动历史总数、搜索和静态快捷键提示。
+                toolbar := Rectangle {
+                    height: 54px;
+                    background: transparent;
 
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border-subtle;
-                }
+                    // 复用仓库已有应用图标资源；图片只负责品牌视觉，不进入业务状态。
+                    Image {
+                        x: 0px;
+                        y: 15px;
+                        width: 24px;
+                        height: 24px;
+                        source: @image-url("../assets/clipboard-board.svg");
+                        image-fit: contain;
+                    }
+                    ThemedText {
+                        x: 32px;
+                        y: 7px;
+                        width: 132px;
+                        height: 20px;
+                        text: "ClipboardBoard";
+                        color: Theme.text-primary;
+                        font-size: Theme.section-title-font-size;
+                        font-weight: Theme.font-weight-semibold;
+                    }
+                    ThemedText {
+                        x: 32px;
+                        y: 29px;
+                        width: 120px;
+                        height: 16px;
+                        text: history-active-logical-count + " 条";
+                        color: Theme.text-secondary;
+                        font-size: Theme.metadata-font-size;
+                    }
 
-                // LineEdit 使用标准文本输入控件；防抖和结果代次由 Rust reducer 统一管理。
-                search-input := LineEdit {
-                    font-family: Theme.font-family;
-                    height: 38px;
-                    placeholder-text: "搜索剪贴内容…";
-                    text: search-text;
-                    edited(text) => {
-                        search-text-changed(text);
+                    // LineEdit 仍是唯一用户输入源；防抖、代次和程序回写由 Rust reducer 管理。
+                    search-input := LineEdit {
+                        x: 168px;
+                        y: 8px;
+                        width: parent.width - 252px;
+                        height: 38px;
+                        font-family: Theme.font-family;
+                        placeholder-text: "搜索剪贴内容…";
+                        text: search-text;
+                        edited(text) => {
+                            search-text-changed(text);
+                        }
+                    }
+
+                    // Alt+V 只是静态提示，不注册快捷键，也不设置 TouchArea 或业务回调。
+                    Rectangle {
+                        x: parent.width - 72px;
+                        y: 15px;
+                        width: 60px;
+                        height: 24px;
+                        border-radius: Theme.control-radius;
+                        border-width: 1px;
+                        border-color: Theme.border-subtle;
+                        background: Theme.surface-bg;
+                        ThemedText {
+                            text: "Alt + V";
+                            color: Theme.text-secondary;
+                            font-size: Theme.shortcut-font-size;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // 仅分隔工具栏与内容区；shell 的圆角裁剪仍由外层 Rectangle 负责。
+                    Rectangle {
+                        y: 53px;
+                        width: parent.width;
+                        height: 1px;
+                        background: Theme.border-subtle;
                     }
                 }
 

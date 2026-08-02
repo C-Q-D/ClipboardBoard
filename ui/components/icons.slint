@@ -17,6 +17,23 @@ component IconFrame inherits Rectangle {
     clip: true;
 }
 
+// 搜索图标只表达“可检索”语义；它不读取输入内容，也不持有搜索代次或过滤状态。
+export component SearchIcon inherits IconFrame {
+    // 圆环与折线使用与其他图标相同的 16×16 几何盒，避免引入字体符号的渲染差异。
+    Rectangle {
+        x: 3px;
+        y: 3px;
+        width: 7px;
+        height: 7px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 4px;
+    }
+    Rectangle { x: 9px; y: 9px; width: 1px; height: 3px; background: root.icon-color; }
+    Rectangle { x: 10px; y: 11px; width: 3px; height: 1px; background: root.icon-color; }
+}
+
 // 文本图标：纸张外框与三条摘要线，表达文本内容而不是正文数据。
 export component TextIcon inherits IconFrame {
     Rectangle {

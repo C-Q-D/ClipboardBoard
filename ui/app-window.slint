@@ -5,6 +5,7 @@
 import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TextButton } from "components/controls.slint";
+import { SearchIcon } from "components/icons.slint";
 import { ClipboardCard, HistoryRowVisual } from "components/history-row.slint";
 import { CleanupPanel } from "components/cleanup-panel.slint";
 import { PreviewPane } from "components/preview-pane.slint";
@@ -227,17 +228,27 @@ export component AppWindow inherits Window {
                     height: 54px;
                     background: transparent;
 
-                    // 复用仓库已有应用图标资源；图片只负责品牌视觉，不进入业务状态。
-                    Image {
+                    // 品牌图标放入独立视觉盒，复用现有资源且不把图片句柄带入业务状态。
+                    Rectangle {
                         x: 0px;
-                        y: 15px;
-                        width: 24px;
-                        height: 24px;
-                        source: @image-url("../assets/clipboard-board.svg");
-                        image-fit: contain;
+                        y: 10px;
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border-subtle;
+                        background: Theme.surface-selected;
+                        Image {
+                            x: 6px;
+                            y: 6px;
+                            width: 16px;
+                            height: 16px;
+                            source: @image-url("../assets/clipboard-board.svg");
+                            image-fit: contain;
+                        }
                     }
                     ThemedText {
-                        x: 32px;
+                        x: 38px;
                         y: 7px;
                         width: 132px;
                         height: 20px;
@@ -247,7 +258,7 @@ export component AppWindow inherits Window {
                         font-weight: Theme.font-weight-semibold;
                     }
                     ThemedText {
-                        x: 32px;
+                        x: 38px;
                         y: 29px;
                         width: 120px;
                         height: 16px;
@@ -275,13 +286,21 @@ export component AppWindow inherits Window {
                         background: Theme.surface-bg;
                         clip: true;
 
+                        SearchIcon {
+                            x: 10px;
+                            y: 10px;
+                            size: 16px;
+                            icon-color: Theme.text-muted;
+                        }
+
                         search-input := LineEdit {
-                            x: 1px;
+                            x: 30px;
                             y: 1px;
-                            width: parent.width - 2px;
+                            width: parent.width - 31px;
                             height: parent.height - 2px;
                             font-family: Theme.font-family;
                             placeholder-text: "搜索剪贴内容…";
+                            // std-widgets::LineEdit 的内部文字色由当前平台样式管理；外层主题框、字体和图标负责与本应用表面对齐。
                             text: search-text;
                             edited(text) => {
                                 search-text-changed(text);
@@ -356,9 +375,9 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: 60px;
                                     border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: search-filter == 0 ? Theme.border-selected : Theme.control-border;
-                                    background: search-filter == 0 ? Theme.surface-selected : Theme.surface-bg;
+                                    border-width: search-filter == 0 ? 1px : 0px;
+                                    border-color: search-filter == 0 ? Theme.border-selected : transparent;
+                                    background: search-filter == 0 ? Theme.surface-selected : transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(0); }
                                     }
@@ -376,9 +395,9 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: 60px;
                                     border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: search-filter == 1 ? Theme.border-selected : Theme.control-border;
-                                    background: search-filter == 1 ? Theme.surface-selected : Theme.surface-bg;
+                                    border-width: search-filter == 1 ? 1px : 0px;
+                                    border-color: search-filter == 1 ? Theme.border-selected : transparent;
+                                    background: search-filter == 1 ? Theme.surface-selected : transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(1); }
                                     }
@@ -395,9 +414,9 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: 60px;
                                     border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: search-filter == 2 ? Theme.border-selected : Theme.control-border;
-                                    background: search-filter == 2 ? Theme.surface-selected : Theme.surface-bg;
+                                    border-width: search-filter == 2 ? 1px : 0px;
+                                    border-color: search-filter == 2 ? Theme.border-selected : transparent;
+                                    background: search-filter == 2 ? Theme.surface-selected : transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(2); }
                                     }
@@ -414,9 +433,9 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     width: 60px;
                                     border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: search-filter == 3 ? Theme.border-selected : Theme.control-border;
-                                    background: search-filter == 3 ? Theme.surface-selected : Theme.surface-bg;
+                                    border-width: search-filter == 3 ? 1px : 0px;
+                                    border-color: search-filter == 3 ? Theme.border-selected : transparent;
+                                    background: search-filter == 3 ? Theme.surface-selected : transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(3); }
                                     }
@@ -431,22 +450,6 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                }
-
-                ThemedText {
-                    // 左栏固定 264px；标题槽显式收窄并裁剪，保证异常本地化文案不越过分隔线。
-                    width: 240px;
-                    text: "最近复制";
-                    color: Theme.text-primary;
-                    font-size: Theme.section-title-font-size;
-                    font-weight: Theme.font-weight-semibold;
-                }
-
-                ThemedText {
-                    width: 240px;
-                    text: "内容会在这里按最新复制时间排列";
-                    color: Theme.text-secondary;
-                    font-size: Theme.preview-font-size;
                 }
 
                 // 历史视口是唯一参与 VerticalLayout 伸展的列表槽；空态和搜索状态绝不成为模型项。

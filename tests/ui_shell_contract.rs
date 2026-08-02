@@ -477,9 +477,9 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     geometry.on_card_selection_requested(move |index| {
         geometry_selected_for_callback.borrow_mut().push(index);
     });
-    // 240px 位于两条路径首行共同的内容中心，避开路径外层的 12px sibling 间距。
-    click(&window, 100.0, 240.0);
-    click(&geometry, 100.0, 240.0);
+    // 175px 位于两条路径首行共同的内容中心，避开筛选区与列表之间的 12px 间距。
+    click(&window, 100.0, 175.0);
+    click(&geometry, 100.0, 175.0);
     assert_eq!(legacy_selected.borrow().as_slice(), &[0]);
     assert_eq!(geometry_selected.borrow().as_slice(), &[0]);
 
@@ -516,16 +516,16 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         .expect("图片加载成功快照失败");
 
     assert!(
-        // UIR-15 固定视口后首项起点为 207px；扫描完整 52px 盒，避免把状态误判为未绘制。
-        light_pixels(&loading_snapshot, 42, 94, 220, 286) > 20,
+        // 移除参考图中不存在的列表说明后，首项上移；扫描完整 52px 盒，避免把状态误判为未绘制。
+        light_pixels(&loading_snapshot, 42, 94, 150, 226) > 20,
         "加载中占位没有真实绘制"
     );
     assert!(
-        light_pixels(&failed_snapshot, 42, 94, 220, 286) > 20,
+        light_pixels(&failed_snapshot, 42, 94, 150, 226) > 20,
         "失败态文案或图标没有真实绘制"
     );
     assert!(
-        surface_pixels(&loaded_snapshot, 42, 94, 220, 286, [84, 132, 196, 255]) > 1_000,
+        surface_pixels(&loaded_snapshot, 42, 94, 150, 226, [84, 132, 196, 255]) > 1_000,
         "已加载缩略图没有在 52×52 盒中真实绘制"
     );
 }

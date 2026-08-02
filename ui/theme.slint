@@ -1,0 +1,48 @@
+// ClipboardBoard 的界面令牌唯一来源。
+//
+// 该全局只保存视觉语义，不持有业务状态、交互回调或数据模型；组件必须通过
+// 令牌表达颜色、排版和稳定尺寸，避免同一语义在多个 Slint 文件中发生漂移。
+export global Theme {
+    // 中性深色表面与灰紫选中态；业务组件不得重新声明十六进制颜色。
+    in property <color> window-bg: #09090B;
+    in property <color> shell-bg: #101014;
+    in property <color> surface-bg: #15151A;
+    in property <color> surface-hover: #1E1D25;
+    in property <color> surface-selected: #2B2936;
+    in property <color> border-subtle: #2A2931;
+    in property <color> border-selected: #625C73;
+    in property <color> text-primary: #F2F1F5;
+    in property <color> text-secondary: #AAA7B0;
+    in property <color> text-muted: #77747E;
+    in property <color> accent-bg: #D8D3E4;
+    in property <color> accent-text: #17151B;
+    in property <color> focus-ring: #9086A6;
+    in property <color> danger: #E98989;
+    in property <color> danger-surface: #2A171A;
+    in property <color> warning: #D9A06F;
+
+    // 本轮固定的圆角、间距和交互命中尺寸；几何原子会继续复用这些令牌。
+    in property <length> shell-radius: 14px;
+    in property <length> control-radius: 6px;
+    in property <length> page-inset: 14px;
+    in property <length> content-padding: 12px;
+    in property <length> section-gap: 10px;
+    in property <length> control-hit-size: 36px;
+    in property <length> history-text-row-height: 106px;
+    in property <length> history-image-row-height: 186px;
+
+    // 采用系统字体回退，不把 design 目录中的 WOFF/WOFF2 带入程序。
+    in property <string> font-family: "Microsoft YaHei UI";
+    in property <length> app-name-font-size: 16px;
+    in property <length> section-title-font-size: 14px;
+    in property <length> history-preview-font-size: 13px;
+    in property <length> metadata-font-size: 11px;
+    in property <length> preview-font-size: 14px;
+    in property <length> button-font-size: 12px;
+    in property <length> shortcut-font-size: 11px;
+    in property <length> pending-font-size: 15px;
+    in property <length> icon-font-size: 18px;
+    in property <int> font-weight-regular: 400;
+    in property <int> font-weight-medium: 500;
+    in property <int> font-weight-semibold: 600;
+}

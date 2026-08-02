@@ -12,6 +12,8 @@ use std::process::Command;
 /// 编译应用的根 Slint 界面并生成平台资源；界面语法错误必须在编译期暴露。
 fn main() {
     println!("cargo:rerun-if-changed=ui/app-window.slint");
+    // 主题令牌是 Slint 编译输入；变更后必须重新生成界面代码。
+    println!("cargo:rerun-if-changed=ui/theme.slint");
     println!("cargo:rerun-if-changed=assets/clipboard-board.svg");
     println!("cargo:rerun-if-changed=assets/clipboard-board.ico.hex");
     println!("cargo:rerun-if-changed=assets/clipboard-board-resource-id.txt");

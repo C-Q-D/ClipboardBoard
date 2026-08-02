@@ -21,6 +21,8 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/components/history-row.slint");
     // 右栏文本预览组件是根界面的编译输入；变更后必须重新生成界面代码。
     println!("cargo:rerun-if-changed=ui/components/preview-pane.slint");
+    // 清理历史覆盖层是根界面的编译输入；变更后必须重新生成界面代码。
+    println!("cargo:rerun-if-changed=ui/components/cleanup-panel.slint");
     println!("cargo:rerun-if-changed=assets/clipboard-board.svg");
     println!("cargo:rerun-if-changed=assets/clipboard-board.ico.hex");
     println!("cargo:rerun-if-changed=assets/clipboard-board-resource-id.txt");

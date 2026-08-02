@@ -1,0 +1,241 @@
+// 清理历史确认覆盖层只负责呈现危险操作的状态和命中区，不进入历史列表布局测量。
+// 它复用 AppWindow 现有 clear-* 回调；不持有稳定身份、数据库状态或清理事务协议。
+
+import { LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { TextButton } from "controls.slint";
+
+// 覆盖层专用文字组件统一字体，避免把 AppWindow 内部的 ThemedText 复制成第二套业务组件。
+component CleanupText inherits Text {
+    font-family: Theme.font-family;
+}
+
+// CleanupPanel 是 shell 最后声明的全屏命中层；透明底板也必须拦截底层列表和右栏点击。
+export component CleanupPanel inherits Rectangle {
+    // open 是纯展示状态，不代表 reducer 已接受任何清理请求；初始面取消和提交后可关闭它。
+    in-out property <bool> open: false;
+    in property <bool> clear-unpinned-confirmation-visible: false;
+    in property <bool> clear-unpinned-pending: false;
+    in property <bool> clear-all-confirmation-visible: false;
+    in property <string> clear-all-confirmation-text: "";
+    in property <bool> clear-all-pending: false;
+    in property <bool> history-mutation-pending: false;
+
+    callback open-clear-unpinned-requested();
+    callback cancel-clear-unpinned();
+    callback confirm-clear-unpinned();
+    callback open-clear-all-requested();
+    callback edit-clear-all-confirmation-text(text: string);
+    callback cancel-clear-all();
+    callback confirm-clear-all(text: string);
+
+    background: transparent;
+    clip: true;
+
+    // 透明 TouchArea 不关闭覆盖层，但会消费空白处点击，防止事件穿透到下方业务控件。
+    backdrop := TouchArea {
+        enabled: open;
+        clicked => { }
+    }
+
+    property <length> dialog-height: clear-all-confirmation-visible ? 286px
+        : clear-unpinned-confirmation-visible ? 202px : 170px;
+
+    dialog := Rectangle {
+        x: (parent.width - 360px) / 2;
+        y: (parent.height - dialog-height) / 2;
+        width: 360px;
+        height: dialog-height;
+        border-radius: Theme.shell-radius;
+        border-width: 1px;
+        border-color: Theme.border-subtle;
+        background: Theme.surface-bg;
+
+        CleanupText {
+            x: 20px;
+            y: 16px;
+            width: parent.width - 40px;
+            height: 24px;
+            text: "清理历史";
+            color: Theme.text-primary;
+            font-size: Theme.section-title-font-size;
+            font-weight: Theme.font-weight-semibold;
+        }
+
+        if (!clear-unpinned-confirmation-visible && !clear-all-confirmation-visible): Rectangle {
+            x: 20px;
+            y: 50px;
+            width: parent.width - 40px;
+            height: 104px;
+
+            CleanupText {
+                width: parent.width;
+                height: 20px;
+                text: "选择要清理的历史范围";
+                color: Theme.text-secondary;
+                font-size: Theme.preview-font-size;
+            }
+
+            CleanupText {
+                y: 24px;
+                width: parent.width;
+                height: 18px;
+                text: "清空未收藏不会影响已收藏记录";
+                color: Theme.text-muted;
+                font-size: Theme.button-font-size;
+            }
+
+            TextButton {
+                x: 0px;
+                y: 54px;
+                width: 104px;
+                height: 36px;
+                label: clear-unpinned-pending ? "清理中…" : "清空未收藏";
+                enabled: !history-mutation-pending;
+                pending: clear-unpinned-pending;
+                clicked => {
+                    if (!history-mutation-pending) {
+                        open-clear-unpinned-requested();
+                    }
+                }
+            }
+
+            TextButton {
+                x: 112px;
+                y: 54px;
+                width: 92px;
+                height: 36px;
+                label: clear-all-pending ? "清空中…" : "清空全部";
+                danger: true;
+                enabled: !history-mutation-pending;
+                pending: clear-all-pending;
+                clicked => {
+                    if (!history-mutation-pending) {
+                        open-clear-all-requested();
+                    }
+                }
+            }
+
+            TextButton {
+                x: parent.width - 72px;
+                y: 54px;
+                width: 72px;
+                height: 36px;
+                label: "取消";
+                clicked => { open = false; }
+            }
+        }
+
+        if (clear-unpinned-confirmation-visible): Rectangle {
+            x: 20px;
+            y: 54px;
+            width: parent.width - 40px;
+            height: 126px;
+
+            CleanupText {
+                width: parent.width;
+                height: 22px;
+                text: "将删除所有未收藏记录";
+                color: Theme.text-primary;
+                font-size: Theme.preview-font-size;
+            }
+
+            CleanupText {
+                y: 28px;
+                width: parent.width;
+                height: 18px;
+                text: "清理成功前，列表内容不会提前移除";
+                color: Theme.text-muted;
+                font-size: Theme.button-font-size;
+            }
+
+            TextButton {
+                x: parent.width - 160px;
+                y: 76px;
+                width: 72px;
+                height: 36px;
+                label: "取消";
+                clicked => { cancel-clear-unpinned(); }
+            }
+
+            TextButton {
+                x: parent.width - 80px;
+                y: 76px;
+                width: 80px;
+                height: 36px;
+                label: "确认清空";
+                primary: true;
+                enabled: !history-mutation-pending;
+                clicked => {
+                    if (!history-mutation-pending) {
+                        confirm-clear-unpinned();
+                        open = false;
+                    }
+                }
+            }
+        }
+
+        if (clear-all-confirmation-visible): Rectangle {
+            x: 20px;
+            y: 54px;
+            width: parent.width - 40px;
+            height: 212px;
+
+            CleanupText {
+                width: parent.width;
+                height: 22px;
+                text: "将删除全部记录，包括已收藏记录";
+                color: Theme.danger;
+                font-size: Theme.preview-font-size;
+            }
+
+            CleanupText {
+                y: 30px;
+                width: parent.width;
+                height: 18px;
+                text: "请输入“清空全部”后确认";
+                color: Theme.text-muted;
+                font-size: Theme.button-font-size;
+            }
+
+            LineEdit {
+                x: 0px;
+                y: 60px;
+                width: parent.width;
+                height: 38px;
+                font-family: Theme.font-family;
+                placeholder-text: "输入“清空全部”";
+                text: clear-all-confirmation-text;
+                edited(text) => { edit-clear-all-confirmation-text(text); }
+            }
+
+            TextButton {
+                x: parent.width - 160px;
+                y: 112px;
+                width: 72px;
+                height: 36px;
+                label: "取消";
+                danger: true;
+                clicked => { cancel-clear-all(); }
+            }
+
+            TextButton {
+                x: parent.width - 80px;
+                y: 112px;
+                width: 80px;
+                height: 36px;
+                label: "确认清空";
+                primary: clear-all-confirmation-text == "清空全部";
+                enabled: !history-mutation-pending
+                    && clear-all-confirmation-text == "清空全部";
+                clicked => {
+                    if (!history-mutation-pending
+                        && clear-all-confirmation-text == "清空全部") {
+                        confirm-clear-all(clear-all-confirmation-text);
+                        open = false;
+                    }
+                }
+            }
+        }
+    }
+}

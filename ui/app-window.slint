@@ -6,6 +6,7 @@ import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TextButton } from "components/controls.slint";
 import { ClipboardCard, HistoryRowVisual } from "components/history-row.slint";
+import { CleanupPanel } from "components/cleanup-panel.slint";
 import { PreviewPane } from "components/preview-pane.slint";
 export { PrimitiveGallery } from "components/controls.slint";
 
@@ -138,6 +139,8 @@ export component AppWindow inherits Window {
     in property <bool> clear-all-error-visible: false;
     // 收藏、删除和两种清空共享的视觉互斥；Rust reducer 仍负责最终权限校验。
     in property <bool> history-mutation-pending: false;
+    // 纯展示开关只控制清理覆盖层；Rust 在新面板、隐藏和退出生命周期重置它。
+    in-out property <bool> cleanup-panel-open: false;
     // 性能探针和后续滚轮交互通过此统一视口属性驱动 legacy 或显式 Flickable；默认值保持顶部。
     in-out property <length> history-viewport-y: 0px;
     // legacy ListView 保留双向别名，使模型替换后的内部 clamp 能同步回统一视口属性。
@@ -299,13 +302,9 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
                         spacing: 12px;
 
-                        // 清理确认和失败提示归入筛选区的可变高度容器；默认状态包含 36px 筛选行
-                        // 与 30px 清理行，隐藏确认不会让首张卡片获得整卡空白。
+                        // 筛选区只保留固定 36px 行；清理入口移到底部状态行，确认不再参与列表测量。
                         VerticalLayout {
-                            height: 78px
-                                + (clear-all-confirmation-visible ? 110px
-                                    : clear-unpinned-confirmation-visible ? 56px : 0px)
-                                + ((clear-unpinned-error-visible || clear-all-error-visible) ? 30px : 0px);
+                            height: 36px;
                             spacing: 12px;
 
                             HorizontalLayout {
@@ -381,183 +380,7 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                    // 清理入口独立成第二行，300px 左栏内仍完整保留两个危险操作。
-                    HorizontalLayout {
-                        height: 30px;
-                        spacing: 8px;
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                        }
-
-                        clear-unpinned-button := TextButton {
-                            width: 108px;
-                            label: clear-unpinned-pending ? "清理中…" : "清理未收藏";
-                            pending: clear-unpinned-pending;
-                            enabled: !history-mutation-pending;
-                            clicked => {
-                                if (!history-mutation-pending) {
-                                    clear-unpinned-requested();
-                                }
-                            }
-                        }
-
-                        Rectangle {
-                            width: 92px;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: Theme.danger;
-                            background: Theme.danger-surface;
-                            TouchArea {
-                                enabled: !history-mutation-pending;
-                                clicked => {
-                                    if (!history-mutation-pending) {
-                                        clear-all-requested();
-                                    }
-                                }
-                            }
-                            ThemedText {
-                                text: clear-all-pending ? "清空中…" : "清空全部";
-                                color: clear-all-pending ? Theme.text-muted : Theme.danger;
-                                font-size: Theme.button-font-size;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-
-                    // 两种确认共享一个布局槽，避免隐藏控件改变默认卡片位置。
-                    Rectangle {
-                        visible: clear-unpinned-confirmation-visible || clear-all-confirmation-visible;
-                        height: clear-all-confirmation-visible ? 98px
-                            : clear-unpinned-confirmation-visible ? 44px : 0px;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: clear-all-confirmation-visible ? Theme.danger : Theme.border-subtle;
-                        background: clear-all-confirmation-visible ? Theme.danger-surface : Theme.surface-bg;
-
-                        HorizontalLayout {
-                            visible: clear-unpinned-confirmation-visible;
-                            padding-left: 12px;
-                            padding-right: 8px;
-                            spacing: 8px;
-
-                            ThemedText {
-                                text: "将删除所有未收藏记录";
-                                color: Theme.text-primary;
-                                font-size: Theme.button-font-size;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            Rectangle {
-                                width: 58px;
-                                height: 28px;
-                                border-radius: 5px;
-                                background: Theme.surface-hover;
-                                TouchArea {
-                                    clicked => { clear-unpinned-cancelled(); }
-                                }
-                                ThemedText {
-                                    text: "取消";
-                                    color: Theme.text-secondary;
-                                    font-size: Theme.button-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            Rectangle {
-                                width: 72px;
-                                height: 28px;
-                                border-radius: 5px;
-                                background: Theme.accent-bg;
-                                TouchArea {
-                                    enabled: !history-mutation-pending;
-                                    clicked => {
-                                        if (!history-mutation-pending) {
-                                            clear-unpinned-confirmed();
-                                        }
-                                    }
-                                }
-                                ThemedText {
-                                    text: "确认清空";
-                                    color: Theme.accent-text;
-                                    font-size: Theme.button-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-
-                        VerticalLayout {
-                            visible: clear-all-confirmation-visible;
-                            padding: 10px;
-                            spacing: 8px;
-
-                            ThemedText {
-                                text: "将删除全部记录，包括已收藏记录";
-                                color: Theme.danger;
-                                font-size: Theme.button-font-size;
-                            }
-
-                            HorizontalLayout {
-                                height: 38px;
-                                spacing: 8px;
-
-                                clear-all-input := LineEdit {
-                                    font-family: Theme.font-family;
-                                    horizontal-stretch: 1;
-                                    placeholder-text: "输入“清空全部”";
-                                    text: clear-all-confirmation-text;
-                                    edited(text) => {
-                                        clear-all-confirmation-text-changed(text);
-                                    }
-                                }
-
-                                Rectangle {
-                                    width: 58px;
-                                    border-radius: 5px;
-                                    background: Theme.danger-surface;
-                                    TouchArea {
-                                        clicked => { clear-all-cancelled(); }
-                                    }
-                                    ThemedText {
-                                        text: "取消";
-                                        color: Theme.text-secondary;
-                                        font-size: Theme.button-font-size;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-
-                                Rectangle {
-                                    width: 76px;
-                                    border-radius: 5px;
-                                    background: clear-all-confirmation-text == "清空全部"
-                                        ? Theme.danger : Theme.danger-surface;
-                                    TouchArea {
-                                        enabled: !history-mutation-pending
-                                            && clear-all-confirmation-text == "清空全部";
-                                        clicked => {
-                                            if (!history-mutation-pending
-                                                && clear-all-confirmation-text == "清空全部") {
-                                                clear-all-confirmed(clear-all-confirmation-text);
-                                            }
-                                        }
-                                    }
-                                    ThemedText {
-                                        text: "确认清空";
-                                        color: clear-all-confirmation-text == "清空全部"
-                                            ? Theme.accent-text : Theme.text-muted;
-                                        font-size: Theme.button-font-size;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                }
-            }
-        }
-    }
-}
+                    // 清理确认控件已迁移到 shell 末尾的 CleanupPanel，不再参与左栏布局测量。
 
                     ThemedText {
                         visible: clear-unpinned-error-visible || clear-all-error-visible;
@@ -747,11 +570,31 @@ export component AppWindow inherits Window {
                     background: Theme.border-subtle;
                 }
 
-                ThemedText {
-                    text: "Esc 关闭到托盘";
-                    color: Theme.text-secondary;
-                    font-size: Theme.shortcut-font-size;
-                    font-weight: Theme.font-weight-medium;
+                // 底部状态行只保留一个清理入口；打开后由全屏覆盖层拦截底层操作。
+                HorizontalLayout {
+                    height: 32px;
+                    spacing: 8px;
+
+                    ThemedText {
+                        text: "Esc 关闭到托盘";
+                        color: Theme.text-secondary;
+                        font-size: Theme.shortcut-font-size;
+                        font-weight: Theme.font-weight-medium;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+
+                    TextButton {
+                        width: 84px;
+                        height: 30px;
+                        label: "清理历史";
+                        enabled: !history-mutation-pending;
+                        clicked => {
+                            if (!history-mutation-pending) {
+                                cleanup-panel-open = true;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -777,10 +620,35 @@ export component AppWindow inherits Window {
                 copy-requested() => { selected-copy-requested(); }
                 pin-requested() => { selected-pin-requested(); }
                 delete-requested() => { selected-delete-requested(); }
-            }
+            } // PreviewPane
+        } // body HorizontalLayout
+    } // body Rectangle
+    } // shell 内部 VerticalLayout
+
+    // 覆盖层作为 shell 最后一个子项，独立于布局树并覆盖列表、状态区和右栏。
+    cleanup-panel := CleanupPanel {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        visible: cleanup-panel-open;
+        open <=> cleanup-panel-open;
+        clear-unpinned-confirmation-visible: root.clear-unpinned-confirmation-visible;
+        clear-unpinned-pending: root.clear-unpinned-pending;
+        clear-all-confirmation-visible: root.clear-all-confirmation-visible;
+        clear-all-confirmation-text: root.clear-all-confirmation-text;
+        clear-all-pending: root.clear-all-pending;
+        history-mutation-pending: root.history-mutation-pending;
+        open-clear-unpinned-requested() => { root.clear-unpinned-requested(); }
+        cancel-clear-unpinned() => { root.clear-unpinned-cancelled(); }
+        confirm-clear-unpinned() => { root.clear-unpinned-confirmed(); }
+        open-clear-all-requested() => { root.clear-all-requested(); }
+        edit-clear-all-confirmation-text(text) => {
+            root.clear-all-confirmation-text-changed(text);
         }
+        cancel-clear-all() => { root.clear-all-cancelled(); }
+        confirm-clear-all(text) => { root.clear-all-confirmed(text); }
     }
-            }
-        }
-}
-}
+} // shell
+} // FocusScope
+} // AppWindow

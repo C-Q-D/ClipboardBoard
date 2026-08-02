@@ -2067,6 +2067,16 @@ fn close_clear_history_mutation_bridge() {
     });
 }
 
+/// 清除仅属于当前窗口会话的清理覆盖层开关；它不能跨 Show/Hide/Quit 生命周期残留。
+fn reset_cleanup_panel_open() {
+    UI_WINDOW.with(|target| {
+        let Some(window) = target.borrow().as_ref().and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+        window.set_cleanup_panel_open(false);
+    });
+}
+
 /// 将后台结果排入 Slint 事件循环；项目中所有后台到 UI 的路径都必须调用此函数。
 ///
 /// 该函数只接受拥有型 `UiEvent`，不会同步执行 reducer。返回 `Ok(())` 只代表事件
@@ -2281,6 +2291,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
             && action != UiAction::Reassert;
 
         if action == UiAction::Quit {
+            reset_cleanup_panel_open();
             #[cfg(windows)]
             close_copy_request_gate();
             close_history_query_bridge();
@@ -2322,6 +2333,11 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 }
                 return;
             };
+
+            // 只有新会话 Show 和完整 Hide 才重置纯展示开关；Reassert 不应打断当前会话。
+            if matches!(&action, UiAction::Show | UiAction::Hide) {
+                window.set_cleanup_panel_open(false);
+            }
 
             set_window_search_state(&window, &search_text, search_filter, search_status);
             window.set_startup_status(SharedString::from(startup_status.clone()));

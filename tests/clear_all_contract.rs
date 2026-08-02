@@ -55,16 +55,6 @@ fn 清空全部需要精确文字强确认且处理中禁用入口() {
     window.on_clear_unpinned_requested(move || {
         unpinned_requests_for_callback.set(unpinned_requests_for_callback.get() + 1);
     });
-    let pins = Rc::new(Cell::new(0_u32));
-    let pins_for_callback = Rc::clone(&pins);
-    window.on_pin_item_requested(move |_index| {
-        pins_for_callback.set(pins_for_callback.get() + 1);
-    });
-    let deletes = Rc::new(Cell::new(0_u32));
-    let deletes_for_callback = Rc::clone(&deletes);
-    window.on_delete_item_requested(move |_index| {
-        deletes_for_callback.set(deletes_for_callback.get() + 1);
-    });
     window.set_cards(ModelRc::new(VecModel::from(vec![ClipboardCard {
         preview: SharedString::from("互斥测试"),
         source: SharedString::from("测试来源"),
@@ -72,6 +62,13 @@ fn 清空全部需要精确文字强确认且处理中禁用入口() {
         is_pinned: false,
         pin_pending: false,
         delete_pending: false,
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }])));
 
     window.show().expect("测试窗口应成功显示");
@@ -99,8 +96,6 @@ fn 清空全部需要精确文字强确认且处理中禁用入口() {
     click(&window, 458.0, 260.0);
     click(&window, 410.0, 260.0);
     assert_eq!(unpinned_requests.get(), 0);
-    assert_eq!(pins.get(), 0);
-    assert_eq!(deletes.get(), 0);
     window.set_clear_all_confirmation_visible(true);
     window.set_clear_all_confirmation_text(SharedString::from("清空全部"));
     click(&window, 488.0, 216.0);

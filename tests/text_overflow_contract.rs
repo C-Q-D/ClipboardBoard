@@ -96,10 +96,10 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
         "短首行后的正文没有显示，后续区域只有 {continuation_pixels} 个浅色像素"
     );
 
-    // 720×520 双栏布局中文本外层行高为 78px，首张背景结束后保留 8px 透明间隔；
+    // 720×520 双栏布局中 264px 左栏的文本外层行高为 78px，首张背景结束后保留 8px 透明间隔；
     // 只扫描左栏内的间隔，避免把右侧预览边界纳入文本越界判定。
     let light_pixels = (321_usize..329)
-        .flat_map(|y| (38_usize..328).map(move |x| (x, y)))
+        .flat_map(|y| (38_usize..292).map(move |x| (x, y)))
         .filter(|(x, y)| {
             let offset = y * stride + x * 4;
             pixels[offset] > 120 && pixels[offset + 1] > 120 && pixels[offset + 2] > 120

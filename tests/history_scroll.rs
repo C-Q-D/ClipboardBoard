@@ -73,7 +73,7 @@ fn 混合卡片产生真实内容高度且状态区不改变可见高度() {
 
 /// Append 重新绑定模型后恢复旧视口，不得因首项仍被选中而触发选择滚入。
 #[test]
-fn 追加模型保持视口与复制索引() {
+fn 追加模型保持视口与选择索引() {
     init_test_backend();
     let window = create_app_window().expect("测试组件应成功创建");
     let initial = (0..8)
@@ -93,12 +93,12 @@ fn 追加模型保持视口与复制索引() {
         "未显示测试组件也必须把视口夹紧在合法范围"
     );
 
-    let copied = Rc::new(RefCell::new(Vec::new()));
-    let copied_for_callback = Rc::clone(&copied);
-    window.on_copy_item_requested(move |index| {
-        copied_for_callback.borrow_mut().push(index);
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    let selected_for_callback = Rc::clone(&selected);
+    window.on_card_selection_requested(move |index| {
+        selected_for_callback.borrow_mut().push(index);
     });
-    window.invoke_copy_item_requested(4);
+    window.invoke_card_selection_requested(4);
 
     let mut appended = initial;
     appended.extend([
@@ -120,8 +120,8 @@ fn 追加模型保持视口与复制索引() {
         "模型替换后的 legacy 视口必须保持在合法范围"
     );
     assert_eq!(window.get_selected_index(), 0);
-    window.invoke_copy_item_requested(4);
-    assert_eq!(copied.borrow().as_slice(), &[4, 4]);
+    window.invoke_card_selection_requested(4);
+    assert_eq!(selected.borrow().as_slice(), &[4, 4]);
 }
 
 /// WindowCommit 原子替换期间不得发送空 token；最终 programmatic clamp 只发送一次目标 token。

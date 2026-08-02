@@ -1,15 +1,15 @@
-//! 此集成测试验证删除按钮拥有独立命中区，并在事务 pending 时禁用重复点击。
+//! 此集成测试验证删除操作已经迁移到右栏，并保持事务 pending 禁用契约。
 //!
-//! 测试只观察 Slint 回调索引；稳定身份、事务后移除和旧查询隔离由 UI reducer
-//! 与删除桥的定向单元测试负责。
+//! 测试通过真实鼠标事件先选择第二项，再点击右栏删除；删除回调不携带索引，
+//! 事务身份和成功前保持可见由 UI reducer 与删除桥负责。
 
 use clipboard_board::{create_app_window, ClipboardCard};
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// 在指定逻辑坐标发送一次完整左键点击。
+/// 在指定逻辑坐标发送一次完整左键点击，覆盖真实 TouchArea 命中区。
 fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
     let position = LogicalPosition::new(x, y);
     window
@@ -27,7 +27,7 @@ fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
         });
 }
 
-/// 构造只含摘要和删除视觉状态的测试卡片。
+/// 构造只含摘要的删除卡片；pending 时卡片仍保留，按钮只显示稳定中文状态。
 fn card(label: &str, delete_pending: bool) -> ClipboardCard {
     ClipboardCard {
         preview: SharedString::from(label),
@@ -36,46 +36,61 @@ fn card(label: &str, delete_pending: bool) -> ClipboardCard {
         is_pinned: false,
         pin_pending: false,
         delete_pending,
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 
-/// 普通删除按钮发送对应索引，pending 按钮不发送，且均不触发选择、收藏或复制。
+/// 选择第二项后同步右栏摘要，模拟生产 reducer 对完整快照选中项的投影。
+fn bind_selection_projection(
+    window: &clipboard_board::AppWindow,
+    cards: &[ClipboardCard],
+    selected: Rc<RefCell<Vec<i32>>>,
+) {
+    let weak_window = window.as_weak();
+    let cards = cards.to_vec();
+    window.on_card_selection_requested(move |index| {
+        selected.borrow_mut().push(index);
+        let Some(window) = weak_window.upgrade() else {
+            return;
+        };
+        let Some(card) = cards.get(index as usize) else {
+            return;
+        };
+        window.set_selected_index(index);
+        window.set_selected_card(card.clone());
+        window.set_has_selected_card(true);
+    });
+}
+
+/// 右栏删除命中当前第二项；事务 pending 后重复点击必须被禁用。
 #[test]
-fn 删除按钮命中区独立且处理中禁用重复点击() {
+fn 先选择第二项再点击右栏删除且处理中禁用重复点击() {
     i_slint_backend_testing::init_integration_test_with_mock_time();
     let window = create_app_window().expect("测试窗口应成功创建");
-    window.set_cards(ModelRc::new(VecModel::from(vec![
-        card("可删除", false),
-        card("处理中", true),
-    ])));
+    let cards = vec![card("第一条", false), card("第二条", false)];
+    window.set_cards(ModelRc::new(VecModel::from(cards.clone())));
 
-    let deletes = Rc::new(RefCell::new(Vec::new()));
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    bind_selection_projection(&window, &cards, Rc::clone(&selected));
+    let deletes = Rc::new(Cell::new(0_u32));
     let deletes_for_callback = Rc::clone(&deletes);
-    window.on_delete_item_requested(move |index| {
-        deletes_for_callback.borrow_mut().push(index);
-    });
-    let selections = Rc::new(RefCell::new(Vec::new()));
-    let selections_for_callback = Rc::clone(&selections);
-    window.on_card_selection_requested(move |index| {
-        selections_for_callback.borrow_mut().push(index);
-    });
-    let pins = Rc::new(RefCell::new(Vec::new()));
-    let pins_for_callback = Rc::clone(&pins);
-    window.on_pin_item_requested(move |index| {
-        pins_for_callback.borrow_mut().push(index);
-    });
-    let copies = Rc::new(RefCell::new(Vec::new()));
-    let copies_for_callback = Rc::clone(&copies);
-    window.on_copy_item_requested(move |index| {
-        copies_for_callback.borrow_mut().push(index);
+    window.on_selected_delete_requested(move || {
+        deletes_for_callback.set(deletes_for_callback.get() + 1);
     });
 
     window.show().expect("测试窗口应成功显示");
-    click(&window, 410.0, 260.0);
-    click(&window, 410.0, 366.0);
+    click(&window, 100.0, 328.0);
+    click(&window, 400.0, 465.0);
+    assert_eq!(selected.borrow().as_slice(), &[1]);
+    assert_eq!(deletes.get(), 1);
 
-    assert_eq!(deletes.borrow().as_slice(), &[0]);
-    assert!(selections.borrow().is_empty());
-    assert!(pins.borrow().is_empty());
-    assert!(copies.borrow().is_empty());
+    window.set_selected_card(card("第二条", true));
+    click(&window, 400.0, 465.0);
+    assert_eq!(deletes.get(), 1);
 }

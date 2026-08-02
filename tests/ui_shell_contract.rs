@@ -156,15 +156,15 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     assert_eq!(pixel(&empty_snapshot, 20, 20), [16, 16, 20, 255]);
     assert_eq!(pixel(&empty_snapshot, 700, 500), [16, 16, 20, 255]);
 
-    // 左栏四项筛选位于全局 x=28..308、y=94..130；索引顺序必须原样透传。
+    // 左栏四项筛选位于全局 x=28..292、y=94..130；索引顺序必须原样透传。
     for x in [60.0, 132.0, 204.0, 276.0] {
         click(&window, x, 112.0);
     }
     assert_eq!(filters.borrow().as_slice(), &[0, 1, 2, 3]);
     assert!(!filters.borrow().is_empty(), "筛选契约必须真实执行至少一次");
 
-    // 300px 左栏与右侧占位之间必须有连续 1px 分隔线，不能互相覆盖。
-    let divider_pixels = surface_pixels(&empty_snapshot, 328, 329, 94, 488, [42, 41, 49, 255]);
+    // 264px 左栏与右侧占位之间必须有连续 1px 分隔线，不能互相覆盖。
+    let divider_pixels = surface_pixels(&empty_snapshot, 292, 293, 94, 488, [42, 41, 49, 255]);
     assert!(
         divider_pixels > 300,
         "左右栏分隔线绘制不足：{divider_pixels}"
@@ -176,7 +176,7 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         "右侧预览占位没有形成独立表面：{right_surface_pixels}"
     );
 
-    let empty_card_pixels = surface_pixels(&empty_snapshot, 28, 328, 200, 350, [21, 21, 26, 255]);
+    let empty_card_pixels = surface_pixels(&empty_snapshot, 28, 292, 200, 350, [21, 21, 26, 255]);
     assert_eq!(
         empty_card_pixels, 0,
         "空历史不能用透明卡片或整卡占位，发现 {empty_card_pixels} 个卡片表面像素"
@@ -185,7 +185,7 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     window.set_cards(ModelRc::new(VecModel::from(vec![card()])));
     i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
     let filled_snapshot = window.window().take_snapshot().expect("首项快照失败");
-    let first_card_pixels = surface_pixels(&filled_snapshot, 28, 328, 200, 350, [21, 21, 26, 255]);
+    let first_card_pixels = surface_pixels(&filled_snapshot, 28, 292, 200, 350, [21, 21, 26, 255]);
     assert!(
         first_card_pixels > 1_000,
         "首张真实卡片没有在历史区域顶部形成连续表面，仅发现 {first_card_pixels} 个像素"
@@ -201,7 +201,7 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     let legacy_selected_pixels = surface_pixels(
         &legacy_selected_snapshot,
         28,
-        328,
+        292,
         200,
         400,
         [43, 41, 54, 255],
@@ -247,7 +247,7 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         .take_snapshot()
         .expect("geometry 选中态快照失败");
     let geometry_selected_pixels =
-        surface_pixels(&geometry_snapshot, 28, 328, 200, 400, [43, 41, 54, 255]);
+        surface_pixels(&geometry_snapshot, 28, 292, 200, 400, [43, 41, 54, 255]);
 
     assert!(
         legacy_selected_pixels > 1_000,

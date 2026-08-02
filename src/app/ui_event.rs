@@ -351,6 +351,16 @@ impl Default for UiState {
 }
 
 impl UiState {
+    /// 判断收藏、删除或清空是否已有持久化事务在途；所有相互排斥的用户操作共用该门禁。
+    ///
+    /// 复制虽然不创建 mutation 请求，但它会把稳定身份送入后台队列，因此也必须在
+    /// 其他变更事务期间 fail-closed，避免后台读取与正在提交的历史状态交叉。
+    fn history_mutation_pending(&self) -> bool {
+        self.pending_pin_mutation.is_some()
+            || self.pending_delete_mutation.is_some()
+            || self.pending_clear_history_mutation.is_some()
+    }
+
     /// 在 UI 事件循环线程内应用一个事件并记录线程证据。
     fn apply(&mut self, event: UiEvent) -> UiAction {
         self.apply_at(event, Instant::now())
@@ -591,7 +601,9 @@ impl UiState {
                     self.snapshot.selected_index = Some(absolute_index as usize);
                     match action {
                         WindowCardAction::Select => UiAction::SelectItem,
-                        WindowCardAction::Copy if item.copy_enabled() => {
+                        WindowCardAction::Copy
+                            if item.copy_enabled() && !self.history_mutation_pending() =>
+                        {
                             UiAction::QueueCopy { id, content_hash }
                         }
                         WindowCardAction::Copy => UiAction::None,
@@ -644,7 +656,10 @@ impl UiState {
                 content_hash,
             } => {
                 // 按钮事件与选择事件使用相同身份门禁，但复制还会在后台按存储正文再次复核哈希。
-                if !self.panel_visible || panel_generation != self.panel_generation {
+                if !self.panel_visible
+                    || panel_generation != self.panel_generation
+                    || self.history_mutation_pending()
+                {
                     return UiAction::None;
                 }
                 let Some(index) = self
@@ -1801,33 +1816,33 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
-    window.on_copy_item_requested(|index| {
-        // 按钮点击在 UI 线程同步冻结稳定身份，之后才进入异步 reducer。
-        let Some(event) = resolve_copy_item(index) else {
+    window.on_selected_copy_requested(|| {
+        // 右栏回调不携带索引；UI 线程从完整快照冻结点击瞬间的稳定身份。
+        let Some(event) = resolve_selected_copy() else {
             return;
         };
         if let Err(error) = post_ui_event(event) {
-            eprintln!("显式复制事件无法进入 UI 事件队列：{error}");
+            eprintln!("选中项复制事件无法进入 UI 事件队列：{error}");
         }
     });
 
-    window.on_pin_item_requested(|index| {
-        // 点击瞬间冻结稳定身份和相反的明确状态；后台禁止使用 toggle SQL。
-        let Some(event) = resolve_pin_item(index) else {
+    window.on_selected_pin_requested(|| {
+        // 收藏目标状态在 UI 线程冻结；后台只执行明确的 true/false，不使用 toggle SQL。
+        let Some(event) = resolve_selected_pin() else {
             return;
         };
         if let Err(error) = post_ui_event(event) {
-            eprintln!("收藏事件无法进入 UI 事件队列：{error}");
+            eprintln!("选中项收藏事件无法进入 UI 事件队列：{error}");
         }
     });
 
-    window.on_delete_item_requested(|index| {
-        // 删除按钮只传可见索引；UI 线程同步冻结 ID 与哈希后才允许进入后台。
-        let Some(event) = resolve_delete_item(index) else {
+    window.on_selected_delete_requested(|| {
+        // 删除不依赖 WindowCommit；UI 线程直接冻结完整快照中的稳定 ID 与哈希。
+        let Some(event) = resolve_selected_delete() else {
             return;
         };
         if let Err(error) = post_ui_event(event) {
-            eprintln!("删除事件无法进入 UI 事件队列：{error}");
+            eprintln!("选中项删除事件无法进入 UI 事件队列：{error}");
         }
     });
 
@@ -2958,18 +2973,22 @@ fn resolve_card_selection(index: i32) -> Option<UiEvent> {
     })
 }
 
-/// 将复制按钮索引同步解析为代次绑定的稳定身份；越界或隐藏面板不会产生后台命令。
-fn resolve_copy_item(index: i32) -> Option<UiEvent> {
-    let index = usize::try_from(index).ok()?;
+/// 返回右栏操作允许读取的当前选中项；该边界只看完整快照，不读取 WindowCommit 局部索引。
+///
+/// 所有 mutation 共用同一 pending 门禁，避免收藏、删除和清空事务并发时右栏继续产生
+/// 新命令。返回值只在 UI 线程借用，调用方必须立即把 ID/哈希复制进拥有型 `UiEvent`。
+fn selected_operation_item(state: &UiState) -> Option<&UiClipboardItem> {
+    if !state.panel_visible || state.history_mutation_pending() {
+        return None;
+    }
+    selected_item_from_snapshot(&state.snapshot)
+}
+
+/// 从完整快照冻结选中项复制事件；右栏没有索引，窗口外选中项同样可以安全命中。
+fn resolve_selected_copy() -> Option<UiEvent> {
     UI_STATE.with(|state| {
         let state = state.borrow();
-        if !state.panel_visible || index >= selection_limit(&state.snapshot) {
-            return None;
-        }
-        if explicit_window_ready(&state) {
-            return resolve_geometry_card_event(&state, index as i32, WindowCardAction::Copy);
-        }
-        let item = state.snapshot.items.get(index)?;
+        let item = selected_operation_item(&state)?;
         if !item.copy_enabled() {
             return None;
         }
@@ -2981,30 +3000,11 @@ fn resolve_copy_item(index: i32) -> Option<UiEvent> {
     })
 }
 
-/// 将收藏按钮索引同步解析为稳定身份和明确期望状态；已有请求时不产生第二个事件。
-fn resolve_pin_item(index: i32) -> Option<UiEvent> {
-    let index = usize::try_from(index).ok()?;
+/// 从完整快照冻结选中项收藏事件，并把点击瞬间的相反状态写入事件。
+fn resolve_selected_pin() -> Option<UiEvent> {
     UI_STATE.with(|state| {
         let state = state.borrow();
-        if !state.panel_visible
-            || state.pending_pin_mutation.is_some()
-            || state.pending_delete_mutation.is_some()
-            || state.pending_clear_history_mutation.is_some()
-            || index >= selection_limit(&state.snapshot)
-        {
-            return None;
-        }
-        if explicit_window_ready(&state) {
-            let item = state.snapshot.items.get(index)?;
-            return resolve_geometry_card_event(
-                &state,
-                index as i32,
-                WindowCardAction::Pin {
-                    is_pinned: !item.is_pinned,
-                },
-            );
-        }
-        let item = state.snapshot.items.get(index)?;
+        let item = selected_operation_item(&state)?;
         Some(UiEvent::PinItem {
             panel_generation: state.panel_generation,
             id: item.id,
@@ -3014,23 +3014,11 @@ fn resolve_pin_item(index: i32) -> Option<UiEvent> {
     })
 }
 
-/// 将删除按钮索引同步解析为稳定身份；任一历史 mutation 在途时拒绝新请求。
-fn resolve_delete_item(index: i32) -> Option<UiEvent> {
-    let index = usize::try_from(index).ok()?;
+/// 从完整快照冻结选中项删除事件；删除不依赖选中项是否位于有界 WindowCommit。
+fn resolve_selected_delete() -> Option<UiEvent> {
     UI_STATE.with(|state| {
         let state = state.borrow();
-        if !state.panel_visible
-            || state.pending_pin_mutation.is_some()
-            || state.pending_delete_mutation.is_some()
-            || state.pending_clear_history_mutation.is_some()
-            || index >= selection_limit(&state.snapshot)
-        {
-            return None;
-        }
-        if explicit_window_ready(&state) {
-            return resolve_geometry_card_event(&state, index as i32, WindowCardAction::Delete);
-        }
-        let item = state.snapshot.items.get(index)?;
+        let item = selected_operation_item(&state)?;
         Some(UiEvent::DeleteItem {
             panel_generation: state.panel_generation,
             id: item.id,
@@ -3563,6 +3551,162 @@ mod tests {
         let mut out_of_range = snapshot;
         out_of_range.selected_index = Some(85);
         assert!(super::selected_item_from_snapshot(&out_of_range).is_none());
+    }
+
+    /// 右栏三种操作都必须绕过 bounded WindowCommit，直接冻结完整快照中的窗口外选中身份。
+    #[test]
+    fn 右栏操作冻结窗口外完整快照身份() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: (0..121).map(test_item).collect(),
+                selected_index: Some(120),
+            }));
+            state.apply(UiEvent::OpenPanel);
+            // OpenPanel 可能为首次展示补选首项；这里模拟用户已经选择完整快照的第 120 项。
+            state.snapshot.selected_index = Some(120);
+            state.history_visible_height = 78;
+            state.history_viewport_y = 0;
+            let commit = state
+                .build_window_commit()
+                .expect("窗口外选中测试必须能够发布当前 bounded commit");
+            assert!(commit
+                .offsets
+                .iter()
+                .all(|offset| offset.absolute_index != 120));
+        });
+
+        assert_eq!(
+            super::resolve_selected_copy(),
+            Some(UiEvent::CopyItem {
+                panel_generation: 1,
+                id: 121,
+                content_hash: [120; 32],
+            })
+        );
+        assert_eq!(
+            super::resolve_selected_pin(),
+            Some(UiEvent::PinItem {
+                panel_generation: 1,
+                id: 121,
+                content_hash: [120; 32],
+                is_pinned: true,
+            })
+        );
+        assert_eq!(
+            super::resolve_selected_delete(),
+            Some(UiEvent::DeleteItem {
+                panel_generation: 1,
+                id: 121,
+                content_hash: [120; 32],
+            })
+        );
+    }
+
+    /// 右栏无选择或全局 mutation 在途时必须 fail-closed，不能操作默认 ClipboardCard。
+    #[test]
+    fn 右栏操作无选择和全局事务时安全关闭() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0)],
+                selected_index: None,
+            }));
+            state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = None;
+        });
+        assert!(super::resolve_selected_copy().is_none());
+        assert!(super::resolve_selected_pin().is_none());
+        assert!(super::resolve_selected_delete().is_none());
+
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.snapshot.selected_index = Some(0);
+            let _ = begin_clear(&mut state);
+        });
+        assert!(super::resolve_selected_copy().is_none());
+        assert!(super::resolve_selected_pin().is_none());
+        assert!(super::resolve_selected_delete().is_none());
+    }
+
+    /// 右栏事件冻结后即使 WindowCommit 被替换，重排仍按 ID/哈希命中，身份变化则拒绝。
+    #[test]
+    fn 右栏冻结事件隔离窗口替换和身份变化() {
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![test_item(0), test_item(1)],
+                selected_index: Some(1),
+            }));
+            state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = Some(1);
+        });
+        let frozen_copy = super::resolve_selected_copy().expect("必须冻结选中复制事件");
+
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.snapshot.items.reverse();
+            state.snapshot.selected_index = Some(0);
+            state.refresh_history_geometry();
+            let _replacement = state
+                .build_window_commit()
+                .expect("重排后必须能够替换 WindowCommit");
+            assert_eq!(
+                state.apply(frozen_copy),
+                UiAction::QueueCopy {
+                    id: 2,
+                    content_hash: [1; 32],
+                }
+            );
+            assert_eq!(state.snapshot.selected_index, Some(0));
+        });
+
+        super::UI_STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            *state = UiState::default();
+            let mut changed = test_item(1);
+            changed.content_hash = [9; 32];
+            state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+                items: vec![changed],
+                selected_index: Some(0),
+            }));
+            state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = Some(0);
+            assert_eq!(
+                state.apply(UiEvent::CopyItem {
+                    panel_generation: 1,
+                    id: 2,
+                    content_hash: [1; 32],
+                }),
+                UiAction::None
+            );
+            assert_eq!(state.snapshot.selected_index, Some(0));
+        });
+    }
+
+    /// 已冻结的复制事件在收藏、删除或清空事务在途时必须由 reducer 再次拒绝。
+    #[test]
+    fn 右栏复制在历史变更事务期间安全关闭() {
+        let mut state = UiState::default();
+        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
+            items: vec![test_item(0)],
+            selected_index: Some(0),
+        }));
+        state.apply(UiEvent::OpenPanel);
+        let generation = state.panel_generation;
+        let _clear_request = begin_clear(&mut state);
+
+        assert_eq!(
+            state.apply(UiEvent::CopyItem {
+                panel_generation: generation,
+                id: 1,
+                content_hash: [0; 32],
+            }),
+            UiAction::None
+        );
     }
 
     /// 将测试摘要包装成带存储修订号的持久化捕获事件。
@@ -5680,7 +5824,7 @@ mod tests {
         assert!(state.panel_visible);
     }
 
-    /// 图片复制必须通过 resolver 和 reducer 生成同一稳定 ID/哈希命令。
+    /// 图片复制必须通过选中项 resolver 和 reducer 生成同一稳定 ID/哈希命令。
     #[test]
     fn 图片卡片进入复制队列() {
         let mut image = test_item(0);
@@ -5717,12 +5861,13 @@ mod tests {
             *global = UiState::default();
             global.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
                 items: vec![image],
-                selected_index: None,
+                selected_index: Some(0),
             }));
             global.apply(UiEvent::OpenPanel);
+            global.snapshot.selected_index = Some(0);
         });
         assert!(matches!(
-            super::resolve_copy_item(0),
+            super::resolve_selected_copy(),
             Some(UiEvent::CopyItem {
                 id,
                 content_hash,
@@ -5783,29 +5928,28 @@ mod tests {
         }
     }
 
-    /// 复制按钮索引必须在排队前同步冻结为代次、ID 和哈希。
+    /// 右栏复制回调必须在排队前从完整快照同步冻结代次、ID 和哈希。
     #[test]
-    fn 复制按钮索引同步解析为稳定身份() {
+    fn 选中复制回调同步解析为稳定身份() {
         super::UI_STATE.with(|slot| {
             let mut state = slot.borrow_mut();
             *state = UiState::default();
             state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
                 items: vec![test_item(0), test_item(1)],
-                selected_index: None,
+                selected_index: Some(1),
             }));
             state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = Some(1);
         });
 
         assert_eq!(
-            super::resolve_copy_item(1),
+            super::resolve_selected_copy(),
             Some(UiEvent::CopyItem {
                 panel_generation: 1,
                 id: 2,
                 content_hash: [1; 32],
             })
         );
-        assert_eq!(super::resolve_copy_item(-1), None);
-        assert_eq!(super::resolve_copy_item(2), None);
     }
 
     /// 快照中存在首批以后的合法旧索引时，恢复逻辑必须保留该选择。
@@ -6579,34 +6723,33 @@ mod tests {
         assert!(!state.snapshot.items.iter().any(|item| item.id == target.id));
     }
 
-    /// 删除按钮索引必须在排队前同步冻结 ID、哈希和当前面板代次。
+    /// 右栏删除回调必须在排队前从完整快照同步冻结 ID、哈希和当前面板代次。
     #[test]
-    fn 删除按钮索引同步解析为稳定身份() {
+    fn 选中删除回调同步解析为稳定身份() {
         super::UI_STATE.with(|slot| {
             let mut state = slot.borrow_mut();
             *state = UiState::default();
             state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
                 items: vec![test_item(0), test_item(1)],
-                selected_index: None,
+                selected_index: Some(1),
             }));
             state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = Some(1);
         });
 
         assert_eq!(
-            super::resolve_delete_item(1),
+            super::resolve_selected_delete(),
             Some(UiEvent::DeleteItem {
                 panel_generation: 1,
                 id: 2,
                 content_hash: [1; 32],
             })
         );
-        assert_eq!(super::resolve_delete_item(-1), None);
-        assert_eq!(super::resolve_delete_item(2), None);
     }
 
-    /// 收藏按钮索引必须在排队前同步冻结身份和相反的明确状态。
+    /// 右栏收藏回调必须在排队前同步冻结身份和相反的明确状态。
     #[test]
-    fn 收藏按钮索引同步解析为稳定期望状态() {
+    fn 选中收藏回调同步解析为稳定期望状态() {
         super::UI_STATE.with(|slot| {
             let mut state = slot.borrow_mut();
             *state = UiState::default();
@@ -6614,13 +6757,14 @@ mod tests {
             pinned.is_pinned = true;
             state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
                 items: vec![test_item(0), pinned],
-                selected_index: None,
+                selected_index: Some(1),
             }));
             state.apply(UiEvent::OpenPanel);
+            state.snapshot.selected_index = Some(1);
         });
 
         assert_eq!(
-            super::resolve_pin_item(1),
+            super::resolve_selected_pin(),
             Some(UiEvent::PinItem {
                 panel_generation: 1,
                 id: 2,
@@ -6628,7 +6772,5 @@ mod tests {
                 is_pinned: false,
             })
         );
-        assert_eq!(super::resolve_pin_item(-1), None);
-        assert_eq!(super::resolve_pin_item(2), None);
     }
 }

@@ -68,7 +68,7 @@ fn 内部焦点遵守面板级键盘契约() {
 
     let copy_count = Rc::new(Cell::new(0_u32));
     let copy_count_for_callback = Rc::clone(&copy_count);
-    window.on_copy_item_requested(move |_| {
+    window.on_selected_copy_requested(move || {
         copy_count_for_callback.set(copy_count_for_callback.get() + 1);
     });
 

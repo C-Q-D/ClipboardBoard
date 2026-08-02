@@ -52,11 +52,10 @@ fn card(label: &str) -> ClipboardCard {
 fn 卡片点击产生可见索引且空白区无动作() {
     i_slint_backend_testing::init_integration_test_with_mock_time();
     let window = create_app_window().expect("测试窗口应成功创建");
-    window.set_cards(ModelRc::new(VecModel::from(vec![
-        card("第一条"),
-        card("第二条"),
-        card("第三条"),
-    ])));
+    let cards = (0..8)
+        .map(|index| card(&format!("第{index}条")))
+        .collect::<Vec<_>>();
+    window.set_cards(ModelRc::new(VecModel::from(cards)));
 
     let selected = Rc::new(RefCell::new(Vec::new()));
     let selected_for_callback = Rc::clone(&selected);
@@ -75,9 +74,11 @@ fn 卡片点击产生可见索引且空白区无动作() {
     // 视口不足以同时显示第三项时，沿用生产 setter 滚动一个文本行高后再点击末项；
     // 测试仍验证真实 TouchArea 产生的稳定索引，而不是直接调用选择回调。
     window.set_history_viewport_y(-78.0);
-    click(&window, 100.0, 410.0);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    click(&window, 100.0, 350.0);
     assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
-    click(&window, 280.0, 250.0);
+    // 最终左栏宽度为 264px；x=310 已在分隔线右侧，不应伪造历史行选择。
+    click(&window, 310.0, 250.0);
 
     assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
 }

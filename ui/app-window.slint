@@ -29,11 +29,7 @@ component HistoryCard inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;
     in property <bool> selected: false;
-    in property <bool> mutation-pending: false;
     callback card-selected(index: int);
-    callback card-copied(index: int);
-    callback card-pinned(index: int);
-    callback card-deleted(index: int);
 
     // 显式固定 layout info，避免 ListView 把内部 TouchArea 的默认首选高度叠加到行高。
     preferred-height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
@@ -47,11 +43,7 @@ component HistoryCard inherits Rectangle {
         card: card;
         card-index: card-index;
         selected: selected;
-        mutation-pending: mutation-pending;
         row-selected(index) => { card-selected(index); }
-        row-copied(index) => { card-copied(index); }
-        row-pinned(index) => { card-pinned(index); }
-        row-deleted(index) => { card-deleted(index); }
     }
 }
 
@@ -61,12 +53,12 @@ export component AppWindow inherits Window {
     callback panel-dismiss-requested();
     // 点击卡片只把当前可见索引交给 Rust；Rust 必须在 UI 线程同步解析稳定记录身份。
     callback card-selection-requested(index: int);
-    // 复制按钮只发送当前可见索引；正文读取和系统剪贴板写回只能在后台执行。
-    callback copy-item-requested(index: int);
-    // 收藏按钮只提交当前索引，Rust 同步解析稳定身份并生成明确期望状态。
-    callback pin-item-requested(index: int);
-    // 删除按钮只提交当前索引，Rust 必须等待 SQLite 成功后才移除卡片。
-    callback delete-item-requested(index: int);
+    // 右栏复制只表达用户意图，不携带索引；Rust 从完整快照冻结稳定身份后再进入后台。
+    callback selected-copy-requested();
+    // 右栏收藏只表达用户意图；明确的 is_pinned 由 UI 线程按点击瞬间状态冻结。
+    callback selected-pin-requested();
+    // 右栏删除只表达用户意图；事务成功前卡片和右栏预览保持可见。
+    callback selected-delete-requested();
     // 清理入口只打开确认区，不得直接访问存储。
     callback clear-unpinned-requested();
     // 取消确认只关闭确认区，不产生后台请求。
@@ -288,7 +280,8 @@ export component AppWindow inherits Window {
                 Rectangle {
                     // 先让外层 VerticalLayout 分配真实剩余高度，再由内部 HLayout 负责横向分栏；
                     // 这样右侧占位不会退化为仅按文字计算的底部小块。
-                    height: parent.height;
+                    // 这里显式扣除固定工具栏和布局间距，避免 parent.height 反向参与 layoutinfo 形成绑定环。
+                    height: parent.height - 54px - 12px;
                     vertical-stretch: 1;
                     background: transparent;
 
@@ -297,11 +290,11 @@ export component AppWindow inherits Window {
                         height: parent.height;
                         spacing: 0px;
 
-                    // 左栏暂定 300px；其内部列表和状态区共享同一个真实伸展高度。
+                    // UIR-13 收口为最终 264px；其内部列表和状态区共享同一个真实伸展高度。
                     VerticalLayout {
-                        preferred-width: 300px;
-                        min-width: 300px;
-                        max-width: 300px;
+                        preferred-width: 264px;
+                        min-width: 264px;
+                        max-width: 264px;
                         horizontal-stretch: 0;
                         vertical-stretch: 1;
                         spacing: 12px;
@@ -625,11 +618,7 @@ export component AppWindow inherits Window {
                             card: card;
                             card-index: index;
                             selected: index == selected-index;
-                            mutation-pending: history-mutation-pending;
                             row-selected(index) => { card-selection-requested(index); }
-                            row-copied(index) => { copy-item-requested(index); }
-                            row-pinned(index) => { pin-item-requested(index); }
-                            row-deleted(index) => { delete-item-requested(index); }
                         }
                     }
                 }
@@ -670,12 +659,8 @@ export component AppWindow inherits Window {
                             card: card;
                             card-index: index;
                             selected: window-start + index == selected-index;
-                            mutation-pending: history-mutation-pending;
-                            // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份。
+                            // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份；行内只允许选择。
                             card-selected(index) => { card-selection-requested(index); }
-                            card-copied(index) => { copy-item-requested(index); }
-                            card-pinned(index) => { pin-item-requested(index); }
-                            card-deleted(index) => { delete-item-requested(index); }
                         }
                     }
                 }
@@ -781,13 +766,17 @@ export component AppWindow inherits Window {
                 background: Theme.border-subtle;
             }
 
-            // UIR-11 只把受限 selected-card 交给预览组件；操作回调由后续原子接入。
-            PreviewPane {
-                // 左栏 300px 与分隔线 1px 已固定，右栏宽度随 HLayout 客户区剩余量变化。
-                width: parent.width - 300px - 1px;
+            // UIR-13 将稳定身份操作集中到右栏；历史行只负责选择。
+            preview-pane := PreviewPane {
+                // 左栏最终 264px 与分隔线 1px 已固定，右栏宽度随 HLayout 客户区剩余量变化。
+                width: parent.width - 264px - 1px;
                 vertical-stretch: 1;
                 card: selected-card;
                 has-selected-card: has-selected-card;
+                history-mutation-pending: history-mutation-pending;
+                copy-requested() => { selected-copy-requested(); }
+                pin-requested() => { selected-pin-requested(); }
+                delete-requested() => { selected-delete-requested(); }
             }
         }
     }

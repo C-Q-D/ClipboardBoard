@@ -1,15 +1,15 @@
-//! 此集成测试验证收藏按钮具有独立鼠标命中区，并在 pending 时禁用重复点击。
+//! 此集成测试验证收藏操作已经迁移到右栏，并保持 pending 禁用契约。
 //!
-//! 测试只观察 Slint 回调索引；稳定身份、事务提交后更新和迟到结果隔离由
-//! `ui_event` 与 `history_mutation` 的定向单元测试负责。
+//! 测试通过真实鼠标事件先选择第二项，再点击右栏“取消收藏”；回调不携带索引，
+//! 收藏目标的明确 `is_pinned` 由 UI 线程从完整快照冻结。
 
 use clipboard_board::{create_app_window, ClipboardCard};
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// 在指定逻辑坐标发送一次完整左键点击。
+/// 在指定逻辑坐标发送一次完整左键点击，确保命中真实控件而非直接调用回调。
 fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
     let position = LogicalPosition::new(x, y);
     window
@@ -27,7 +27,7 @@ fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
         });
 }
 
-/// 构造只含摘要和收藏视觉状态的测试卡片。
+/// 构造只包含摘要的收藏卡片；pending 状态由 Rust mutation 结果同步，不在按钮中切换。
 fn card(label: &str, is_pinned: bool, pin_pending: bool) -> ClipboardCard {
     ClipboardCard {
         preview: SharedString::from(label),
@@ -36,7 +36,6 @@ fn card(label: &str, is_pinned: bool, pin_pending: bool) -> ClipboardCard {
         is_pinned,
         pin_pending,
         delete_pending: false,
-        // 收藏命中区测试不依赖图片和复制行为，但必须填满当前 UI DTO 的安全默认值。
         is_image: false,
         copy_enabled: true,
         image_width: 0,
@@ -47,54 +46,51 @@ fn card(label: &str, is_pinned: bool, pin_pending: bool) -> ClipboardCard {
     }
 }
 
-/// 普通收藏按钮发送对应索引，pending 按钮不发送，且两者都不触发选择或复制。
+/// 选择第二项后同步投影，模拟生产 reducer 对完整快照选中项的单向绑定。
+fn bind_selection_projection(
+    window: &clipboard_board::AppWindow,
+    cards: &[ClipboardCard],
+    selected: Rc<RefCell<Vec<i32>>>,
+) {
+    let weak_window = window.as_weak();
+    let cards = cards.to_vec();
+    window.on_card_selection_requested(move |index| {
+        selected.borrow_mut().push(index);
+        let Some(window) = weak_window.upgrade() else {
+            return;
+        };
+        let Some(card) = cards.get(index as usize) else {
+            return;
+        };
+        window.set_selected_index(index);
+        window.set_selected_card(card.clone());
+        window.set_has_selected_card(true);
+    });
+}
+
+/// 右栏收藏命中当前第二项；pending 后重复点击必须被真实 TouchArea 禁止。
 #[test]
-fn 收藏按钮命中区独立且处理中禁用重复点击() {
+fn 先选择第二项再点击右栏收藏且处理中禁用重复点击() {
     i_slint_backend_testing::init_integration_test_with_mock_time();
     let window = create_app_window().expect("测试窗口应成功创建");
-    window.set_cards(ModelRc::new(VecModel::from(vec![
-        card("可收藏", false, false),
-        card("处理中", true, true),
-    ])));
+    let cards = vec![card("第一条", false, false), card("第二条", true, false)];
+    window.set_cards(ModelRc::new(VecModel::from(cards.clone())));
 
-    let pins = Rc::new(RefCell::new(Vec::new()));
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    bind_selection_projection(&window, &cards, Rc::clone(&selected));
+    let pins = Rc::new(Cell::new(0_u32));
     let pins_for_callback = Rc::clone(&pins);
-    window.on_pin_item_requested(move |index| {
-        pins_for_callback.borrow_mut().push(index);
-    });
-    let selections = Rc::new(RefCell::new(Vec::new()));
-    let selections_for_callback = Rc::clone(&selections);
-    window.on_card_selection_requested(move |index| {
-        selections_for_callback.borrow_mut().push(index);
-    });
-    let copies = Rc::new(RefCell::new(Vec::new()));
-    let copies_for_callback = Rc::clone(&copies);
-    window.on_copy_item_requested(move |index| {
-        copies_for_callback.borrow_mut().push(index);
+    window.on_selected_pin_requested(move || {
+        pins_for_callback.set(pins_for_callback.get() + 1);
     });
 
     window.show().expect("测试窗口应成功显示");
-    // 当前 560px 看板的 legacy 命中区需要从真实事件结果校正：首条非 pending
-    // 收藏命中点为 x=458，第二条 pending 命中点为 x=430；两行高度相差 106px。
-    const PIN_BUTTON_X: f32 = 458.0;
-    const PENDING_PIN_BUTTON_X: f32 = 430.0;
-    click(&window, PIN_BUTTON_X, 260.0);
-    click(&window, PENDING_PIN_BUTTON_X, 366.0);
+    click(&window, 100.0, 328.0);
+    click(&window, 332.0, 465.0);
+    assert_eq!(selected.borrow().as_slice(), &[1]);
+    assert_eq!(pins.get(), 1);
 
-    assert_eq!(
-        pins.borrow().as_slice(),
-        &[0],
-        "收藏回调记录：{:?}",
-        pins.borrow()
-    );
-    assert!(
-        selections.borrow().is_empty(),
-        "选择回调记录：{:?}",
-        selections.borrow()
-    );
-    assert!(
-        copies.borrow().is_empty(),
-        "复制回调记录：{:?}",
-        copies.borrow()
-    );
+    window.set_selected_card(card("第二条", true, true));
+    click(&window, 332.0, 465.0);
+    assert_eq!(pins.get(), 1);
 }

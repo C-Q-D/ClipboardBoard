@@ -161,6 +161,8 @@ export component AppWindow inherits Window {
     // 暴露实际绑定重复器的行数；geometry 模式必须是有界 window-cards，而不是逻辑总数。
     out property <int> history-model-length: geometry-mode ? window-cards.length : cards.length;
     out property <length> history-visible-height: geometry-mode ? geometry-history-list.height : history-list.visible-height;
+    // 暴露两条历史路径实际占用的内容宽度；内容必须比左栏外框少一个滚动条槽位。
+    out property <length> history-content-width: geometry-mode ? geometry-history-list.width : history-list.width;
     // 测试接缝只暴露 legacy 分支的实际布局高度，用于证明显式模式不会被隐藏 ListView 占位。
     out property <length> history-legacy-visible-height: history-list.visible-height;
     out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
@@ -459,7 +461,8 @@ export component AppWindow inherits Window {
                         visible: !geometry-mode;
                         x: 0px;
                         y: 0px;
-                        width: parent.width;
+                        // 可滚动内容为右侧主题滚动条预留 8px，避免卡片边框和时间槽被 thumb 覆盖。
+                        width: parent.width - Theme.scrollbar-width;
                         // 隐藏路径必须显式归零，history-legacy-visible-height 才不会成为第二个几何来源。
                         height: geometry-mode ? 0px : parent.height;
                         changed viewport-y => {
@@ -500,10 +503,11 @@ export component AppWindow inherits Window {
                         visible: geometry-mode;
                         x: 0px;
                         y: 0px;
-                        width: parent.width;
+                        // geometry 路径与 legacy 路径共享同一滚动条槽位，内容画布不能延伸到 thumb 下方。
+                        width: parent.width - Theme.scrollbar-width;
                         height: parent.height;
                         // 列表只允许纵向滚动；宽度始终跟随视口，长来源由行内槽位裁剪。
-                        viewport-width: parent.width;
+                        viewport-width: self.width;
                         // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
                         viewport-height: geometry-content-height;
                         changed viewport-y => {
@@ -548,7 +552,7 @@ export component AppWindow inherits Window {
                                 || history-active-logical-count == 0);
                         x: 0px;
                         y: 0px;
-                        width: parent.width;
+                        width: parent.width - Theme.scrollbar-width;
                         height: parent.height;
                         background: transparent;
 

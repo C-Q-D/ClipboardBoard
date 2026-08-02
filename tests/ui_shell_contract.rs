@@ -159,6 +159,20 @@ fn card() -> ClipboardCard {
     }
 }
 
+/// 构造显式几何滚动回归所需的最小文本摘要；测试不携带正文或外部资源。
+fn geometry_item(id: u64) -> UiClipboardItem {
+    UiClipboardItem {
+        id,
+        preview: format!("几何滚动卡片 {id}"),
+        source: "滚动回归测试".to_owned(),
+        relative_time: "刚刚".to_owned(),
+        content_hash: [id as u8; 32],
+        copy_count: 0,
+        is_pinned: false,
+        kind: UiClipboardItemKind::Text,
+    }
+}
+
 /// 构造图片三态夹具；缩略图句柄只在 loaded=true 时进入组件树，失败态不伪造空图片。
 fn image_card(thumbnail_loaded: bool, thumbnail_failed: bool, thumbnail: Image) -> ClipboardCard {
     ClipboardCard {
@@ -208,6 +222,11 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
 
     assert_eq!(empty_snapshot.width(), 720);
     assert_eq!(empty_snapshot.height(), 520);
+    assert_eq!(
+        window.get_history_content_width(),
+        256.0,
+        "legacy 历史内容必须为右侧 8px 滚动条预留槽位"
+    );
 
     // #09090B 是窗口外背景；#101014 是 shell 内表面，采样点避开边框和文字。
     for (x, y) in [(0, 0), (719, 0), (0, 519), (719, 519)] {
@@ -371,9 +390,81 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     assert_eq!(geometry.get_history_model_length(), 1);
     assert!(geometry.get_history_visible_height() > 0.0);
     assert_eq!(
+        geometry.get_history_content_width(),
+        256.0,
+        "geometry 历史内容必须为右侧 8px 滚动条预留槽位"
+    );
+    assert_eq!(
         geometry.get_history_legacy_visible_height(),
         0.0,
         "geometry 模式隐藏的 legacy ListView 不能占用高度"
+    );
+
+    // 几何路径必须覆盖真实拖拽释放；单卡提交没有滚动范围，不能证明释放后视口仍保持。
+    let geometry_scroll_cards = (0..8).map(geometry_item).collect::<Vec<_>>();
+    let geometry_scroll_offsets = (0..8)
+        .map(|index| WindowOffset {
+            absolute_index: index,
+            id: index,
+            content_hash: [index as u8; 32],
+            top: index as i64 * 78,
+            height: 78,
+        })
+        .collect::<Vec<_>>();
+    let mut geometry_scroll_builder =
+        WindowCommitBuilder::new(13, 1, 1).expect("滚动回归 nonce 必须非零");
+    assert!(geometry_scroll_builder.set_window(WindowCommitPayload {
+        start: 0,
+        total_count: 8,
+        total_height: 8 * 78,
+        visible_height: 246,
+        clamped_viewport_y: 0,
+        origin_token: None,
+        cards: geometry_scroll_cards,
+        offsets: geometry_scroll_offsets,
+    }));
+    assert!(geometry_scroll_builder.ready());
+    let geometry_scroll_commit = geometry_scroll_builder
+        .publish_commit_stamp()
+        .expect("滚动回归窗口提交应发布");
+    let geometry_scroll = create_app_window().expect("几何滚动回归窗口应成功创建");
+    assert!(set_window_commit(&geometry_scroll, geometry_scroll_commit));
+    geometry_scroll
+        .show()
+        .expect("几何滚动回归窗口应成功显示");
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    let geometry_scroll_snapshot = geometry_scroll
+        .window()
+        .take_snapshot()
+        .expect("几何滚动回归快照失败");
+    let geometry_thumb_start = (200_usize..488)
+        .flat_map(|y| (276_usize..292).map(move |x| (x, y)))
+        .find(|(x, y)| {
+            let [red, green, blue, _] = pixel(&geometry_scroll_snapshot, *x, *y);
+            [red, green, blue] == theme_color("scrollbar-thumb")
+        })
+        .expect("几何历史滚动条 thumb 应有真实像素");
+    drag(
+        &geometry_scroll,
+        LogicalPosition::new(
+            geometry_thumb_start.0 as f32,
+            geometry_thumb_start.1 as f32 + 10.0,
+        ),
+        LogicalPosition::new(
+            geometry_thumb_start.0 as f32,
+            geometry_thumb_start.1 as f32 + 50.0,
+        ),
+    );
+    let viewport_after_release = geometry_scroll.get_history_viewport_y();
+    assert!(
+        viewport_after_release < 0.0,
+        "几何路径释放滚动条后视口不应回到顶部，实际值：{viewport_after_release}"
+    );
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    assert_eq!(
+        geometry_scroll.get_history_viewport_y(),
+        viewport_after_release,
+        "几何路径释放后的迟到布局回调不能把视口重新写回顶部"
     );
 
     let legacy_selected = Rc::new(RefCell::new(Vec::new()));

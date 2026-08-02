@@ -2410,11 +2410,13 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                 pending_pin_mutation.as_ref(),
                 pending_delete_mutation.as_ref(),
             );
-            if refresh_model
-                && !thumbnail_applied
-                && !preserve_append_viewport
-                && !preserve_thumbnail_viewport
-            {
+            if should_ensure_selection_visible(
+                refresh_model,
+                viewport.is_some(),
+                thumbnail_applied,
+                preserve_append_viewport,
+                preserve_thumbnail_viewport,
+            ) {
                 ensure_selection_visible(&window, &snapshot);
             }
             if append_revision.is_some() {
@@ -3366,6 +3368,21 @@ fn ensure_selection_visible(window: &AppWindow, snapshot: &UiSnapshot) {
     window.set_history_viewport_y(target);
 }
 
+/// 判断是否需要执行选中项可见性对齐；用户视口事件必须保留用户刚提交的滚动位置。
+fn should_ensure_selection_visible(
+    refresh_model: bool,
+    has_viewport_event: bool,
+    thumbnail_applied: bool,
+    preserve_append_viewport: bool,
+    preserve_thumbnail_viewport: bool,
+) -> bool {
+    refresh_model
+        && !has_viewport_event
+        && !thumbnail_applied
+        && !preserve_append_viewport
+        && !preserve_thumbnail_viewport
+}
+
 /// 为当前搜索代次安排一次 120 ms 防抖事件；计时器回调只投递事件，不直接触碰 reducer。
 fn schedule_search_debounce(generation: u64) {
     slint::Timer::single_shot(crate::search::DEFAULT_SEARCH_DEBOUNCE, move || {
@@ -3567,6 +3584,14 @@ mod tests {
         let mut out_of_range = snapshot;
         out_of_range.selected_index = Some(85);
         assert!(super::selected_item_from_snapshot(&out_of_range).is_none());
+    }
+
+    /// 用户滚动触发模型窗口重算时，不能再次执行首项可见性对齐而把视口拉回顶部。
+    #[test]
+    fn 用户滚动事件不能重新执行选中可见性对齐() {
+        assert!(!super::should_ensure_selection_visible(
+            true, true, false, false, false
+        ));
     }
 
     /// 右栏三种操作都必须绕过 bounded WindowCommit，直接冻结完整快照中的窗口外选中身份。

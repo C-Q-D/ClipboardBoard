@@ -2,6 +2,7 @@
 // 文本内容来自 ClipboardCard.preview 的受限摘要；完整正文和图片原图永远不进入组件。
 
 import { Theme } from "../theme.slint";
+import { ImageIcon } from "icons.slint";
 import { ClipboardCard } from "history-row.slint";
 
 // 预览文字统一使用主题字体；组件不把来源、时间或正文复制成第二套状态。
@@ -97,15 +98,75 @@ export component PreviewPane inherits Rectangle {
             }
         }
 
-        if has-selected-card && card.is_image: PreviewText {
+        if has-selected-card && card.is_image: Rectangle {
             x: 0px;
             y: preview-header-height;
             width: parent.width;
-            height: 22px;
-            text: "图片预览将在下一阶段显示";
+            height: parent.height - preview-header-height - 24px;
+            background: Theme.window-bg;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            border-radius: Theme.control-radius;
+            clip: true;
+
+            // 右栏图片只使用受限 thumbnail，并保持完整比例；绝不读取原图或使用 cover。
+            Image {
+                visible: card.thumbnail_loaded;
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: parent.height - 16px;
+                source: card.thumbnail;
+                image-fit: contain;
+            }
+
+            if !card.thumbnail_loaded && !card.thumbnail_failed: ImageIcon {
+                size: 24px;
+                icon-color: Theme.text-muted;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2 - 12px;
+            }
+            if !card.thumbnail_loaded && !card.thumbnail_failed: PreviewText {
+                x: 0px;
+                y: (parent.height - self.height) / 2 + 18px;
+                width: parent.width;
+                height: 18px;
+                text: "图片加载中…";
+                color: Theme.text-muted;
+                font-size: Theme.preview-font-size;
+                horizontal-alignment: center;
+                overflow: clip;
+            }
+            if !card.thumbnail_loaded && card.thumbnail_failed: ImageIcon {
+                size: 24px;
+                icon-color: Theme.text-muted;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2 - 12px;
+            }
+            if !card.thumbnail_loaded && card.thumbnail_failed: PreviewText {
+                x: 0px;
+                y: (parent.height - self.height) / 2 + 18px;
+                width: parent.width;
+                height: 18px;
+                text: "图片不可用";
+                color: Theme.text-muted;
+                font-size: Theme.preview-font-size;
+                horizontal-alignment: center;
+                overflow: clip;
+            }
+        }
+
+        if has-selected-card && card.is_image: PreviewText {
+            x: 0px;
+            y: parent.height - 18px;
+            width: parent.width;
+            height: 18px;
+            text: card.image_width > 0 && card.image_height > 0
+                ? card.image_width + " × " + card.image_height
+                : "尺寸未知";
             color: Theme.text-secondary;
-            font-size: Theme.preview-font-size;
-            wrap: word-wrap;
+            font-size: Theme.metadata-font-size;
+            horizontal-alignment: center;
             overflow: clip;
         }
     }

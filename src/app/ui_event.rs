@@ -2100,6 +2100,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 鼠标选择事件只改变 reducer 索引，不能重建 VecModel；否则每次点击都会让
         // ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = event_may_refresh_model(&event);
+        // 选择事件不重建列表，但会改变右栏图片的 active identity，因此必须单独触发缩略图调度。
+        let selection_event = matches!(&event, UiEvent::SelectItem { .. });
         let history_result_event = matches!(&event, UiEvent::HistoryQueryWake);
         let (
             action,
@@ -2238,7 +2240,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         // 克隆会在范围变化时一起被替换为空图片，范围外纹理不会继续被 Slint 持有。
         let thumbnail_range_changed = if action != UiAction::Quit
             && panel_visible_after_event()
-            && (may_refresh_model || viewport.is_some())
+            && (may_refresh_model || viewport.is_some() || selection_event)
         {
             let (viewport_y, visible_height) =
                 UI_THUMBNAIL_VIEWPORT.with(|current| *current.borrow());
@@ -2259,7 +2261,7 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         let refresh_model = ((may_refresh_model && !history_result_event)
             || history_model_refresh != HistoryModelRefresh::None
             || thumbnail_applied
-            || thumbnail_range_changed
+            || (thumbnail_range_changed && !selection_event)
             || geometry_commit.is_some())
             && action != UiAction::Reassert;
 
@@ -2719,6 +2721,55 @@ fn thumbnail_retained_range(
     start..end
 }
 
+/// 从完整快照冻结当前选中图片的稳定身份和缩略图路径；不从 selected-card 文案反查。
+fn selected_thumbnail_request(
+    snapshot: &UiSnapshot,
+) -> Option<(u64, [u8; 32], std::path::PathBuf)> {
+    let item = selected_item_from_snapshot(snapshot)?;
+    let crate::command::UiClipboardItemKind::Image(image) = &item.kind else {
+        return None;
+    };
+    Some((item.id, item.content_hash, image.thumbnail_path.clone()))
+}
+
+/// 只为当前 active identity 排入一次缩略图请求；缓存命中、失败或在途时均不重复提交。
+fn request_thumbnail_if_needed(
+    panel_generation: u64,
+    id: u64,
+    content_hash: [u8; 32],
+    path: std::path::PathBuf,
+) {
+    let identity = (id, content_hash);
+    let cache_hit = UI_THUMBNAIL_CACHE.with(|cache| cache.borrow().contains_key(&identity));
+    let failed_hit = UI_THUMBNAIL_FAILED.with(|failed| failed.borrow().contains(&identity));
+    if cache_hit || failed_hit {
+        touch_thumbnail_cache(identity);
+        return;
+    }
+    let request_key = (panel_generation, id, content_hash);
+    let already_requested =
+        UI_THUMBNAIL_REQUESTED.with(|requested| requested.borrow().contains(&request_key));
+    if already_requested {
+        return;
+    }
+    let request = ThumbnailLoadRequest {
+        panel_generation,
+        id,
+        content_hash,
+        path,
+    };
+    let submitted = UI_THUMBNAIL_LOADER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|sender| sender.try_submit(request).is_ok())
+    });
+    if submitted {
+        UI_THUMBNAIL_REQUESTED.with(|requested| {
+            requested.borrow_mut().insert(request_key);
+        });
+    }
+}
+
 /// 按当前保留范围提交缩略图请求，并返回是否需要重建卡片模型。
 fn schedule_thumbnail_requests(
     snapshot: &UiSnapshot,
@@ -2742,6 +2793,8 @@ fn schedule_thumbnail_requests(
     }
     let items = visible_snapshot_items(snapshot).collect::<Vec<_>>();
     let retained_range = thumbnail_retained_range(snapshot, viewport_y, visible_height);
+    // 当前选中图片即使位于 bounded 可视窗口之外，也必须占用一个 active identity。
+    let selected_image = selected_thumbnail_request(snapshot);
     let active = items
         .iter()
         .enumerate()
@@ -2750,6 +2803,11 @@ fn schedule_thumbnail_requests(
                 && matches!(item.kind, crate::command::UiClipboardItemKind::Image(_))
         })
         .map(|(_, item)| (item.id, item.content_hash))
+        .chain(
+            selected_image
+                .as_ref()
+                .map(|(id, content_hash, _)| (*id, *content_hash)),
+        )
         .collect::<HashSet<_>>();
     let range_changed = UI_THUMBNAIL_VISIBLE.with(|visible| {
         let mut visible = visible.borrow_mut();
@@ -2776,34 +2834,10 @@ fn schedule_thumbnail_requests(
         }) else {
             continue;
         };
-        let identity = (item.id, item.content_hash);
-        let cache_hit = UI_THUMBNAIL_CACHE.with(|cache| cache.borrow().contains_key(&identity));
-        let failed_hit = UI_THUMBNAIL_FAILED.with(|failed| failed.borrow().contains(&identity));
-        if cache_hit || failed_hit {
-            touch_thumbnail_cache(identity);
-            continue;
-        }
-        let request_key = (panel_generation, item.id, item.content_hash);
-        let already_requested =
-            UI_THUMBNAIL_REQUESTED.with(|requested| requested.borrow().contains(&request_key));
-        if !already_requested {
-            let request = ThumbnailLoadRequest {
-                panel_generation,
-                id: item.id,
-                content_hash: item.content_hash,
-                path,
-            };
-            let submitted = UI_THUMBNAIL_LOADER.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .is_some_and(|sender| sender.try_submit(request).is_ok())
-            });
-            if submitted {
-                UI_THUMBNAIL_REQUESTED.with(|requested| {
-                    requested.borrow_mut().insert(request_key);
-                });
-            }
-        }
+        request_thumbnail_if_needed(panel_generation, item.id, item.content_hash, path);
+    }
+    if let Some((id, content_hash, path)) = selected_image {
+        request_thumbnail_if_needed(panel_generation, id, content_hash, path);
     }
     range_changed || cache_pruned
 }
@@ -3430,9 +3464,9 @@ mod tests {
     #[cfg(windows)]
     use super::{activation_attempt, ActivationAttempt};
     use super::{
-        apply_thumbnail_result, bind_clear_history_mutation_sender, checked_slint_coordinate,
-        checked_slint_length, close_clear_history_mutation_bridge, event_may_refresh_model,
-        explicit_window_ready, perform_show_action, quantize_slint_length,
+        apply_thumbnail_result, bind_clear_history_mutation_sender, bind_thumbnail_loader_sender,
+        checked_slint_coordinate, checked_slint_length, close_clear_history_mutation_bridge,
+        event_may_refresh_model, explicit_window_ready, perform_show_action, quantize_slint_length,
         reserve_thumbnail_cache_slot, resolve_geometry_card_event, schedule_thumbnail_requests,
         selection_item_bounds, selection_viewport_y, settle_post_append_probe_dispatch,
         thumbnail_retained_range, touch_thumbnail_cache, visible_snapshot_items, AppendBindingGate,
@@ -3452,7 +3486,7 @@ mod tests {
         PinMutationResult,
     };
     use crate::history_query::{HistoryPageResult, HistoryQueryFailure, UiHistoryPage};
-    use crate::thumbnail_loader::{ThumbnailLoadFailure, ThumbnailLoadResult};
+    use crate::thumbnail_loader::{ThumbnailLoadFailure, ThumbnailLoadResult, ThumbnailLoader};
     use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
     use std::time::{Duration, Instant};
 
@@ -5920,6 +5954,57 @@ mod tests {
         super::UI_THUMBNAIL_VISIBLE.with(|visible| {
             assert!(visible.borrow().is_empty());
         });
+    }
+
+    /// 窗口外选中图片也必须加入 active 集合并排入一次稳定身份请求，不能只依赖可视范围。
+    #[test]
+    fn 选中图片离开窗口仍加入缩略图活动集() {
+        super::UI_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            *state = UiState::default();
+            state.apply(UiEvent::OpenPanel);
+        });
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+        super::UI_THUMBNAIL_REQUESTED.with(|requested| requested.borrow_mut().clear());
+
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let loader = ThumbnailLoader::start(move |result| result_sender.send(result).is_ok())
+            .expect("启动选中图片缩略图测试 worker 失败");
+        bind_thumbnail_loader_sender(loader.sender());
+
+        let items = (0..32).map(test_image_item).collect::<Vec<_>>();
+        let selected = items[31].clone();
+        let selected_identity = (selected.id, selected.content_hash);
+        let selected_request_key = (1, selected.id, selected.content_hash);
+        let snapshot = UiSnapshot {
+            items,
+            selected_index: Some(31),
+        };
+
+        assert!(schedule_thumbnail_requests(&snapshot, 1, 0, 92));
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| {
+            assert!(visible.borrow().contains(&selected_identity));
+        });
+        super::UI_THUMBNAIL_REQUESTED.with(|requested| {
+            assert!(requested.borrow().contains(&selected_request_key));
+        });
+
+        let mut received_selected = false;
+        for _ in 0..32 {
+            let result = result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("选中图片请求应到达缩略图 worker");
+            if (result.id, result.content_hash) == selected_identity {
+                received_selected = true;
+                break;
+            }
+        }
+        assert!(received_selected, "窗口外选中图片没有排入 loader");
+
+        super::UI_THUMBNAIL_LOADER.with(|slot| slot.borrow_mut().take());
+        loader.stop().expect("停止选中图片缩略图测试 worker 失败");
+        super::UI_THUMBNAIL_VISIBLE.with(|visible| visible.borrow_mut().clear());
+        super::UI_THUMBNAIL_REQUESTED.with(|requested| requested.borrow_mut().clear());
     }
 
     /// 缓存满载时按 LRU 逐项淘汰，不能整表清空造成同屏图片闪回。

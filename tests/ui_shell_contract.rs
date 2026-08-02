@@ -62,6 +62,32 @@ fn surface_pixels(
         .count()
 }
 
+/// 只统计被同色邻域包围的连续表面像素，排除空态文案抗锯齿偶然混出的单点颜色。
+fn solid_surface_pixels(
+    snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>,
+    x_start: usize,
+    x_end: usize,
+    y_start: usize,
+    y_end: usize,
+    expected: [u8; 4],
+) -> usize {
+    (y_start.saturating_add(1)..y_end.saturating_sub(1))
+        .flat_map(|y| (x_start.saturating_add(1)..x_end.saturating_sub(1)).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            pixel(snapshot, *x, *y) == expected
+                && (-1_i32..=1).all(|dy| {
+                    (-1_i32..=1).all(|dx| {
+                        pixel(
+                            snapshot,
+                            (*x as i32 + dx) as usize,
+                            (*y as i32 + dy) as usize,
+                        ) == expected
+                    })
+                })
+        })
+        .count()
+}
+
 /// 统计缩略图状态文字和线性图标的高亮像素，避免依赖字体抗锯齿后的单一颜色。
 fn light_pixels(
     snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>,
@@ -176,7 +202,8 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         "右侧预览占位没有形成独立表面：{right_surface_pixels}"
     );
 
-    let empty_card_pixels = surface_pixels(&empty_snapshot, 28, 292, 200, 350, [21, 21, 26, 255]);
+    let empty_card_pixels =
+        solid_surface_pixels(&empty_snapshot, 28, 292, 200, 350, [21, 21, 26, 255]);
     assert_eq!(
         empty_card_pixels, 0,
         "空历史不能用透明卡片或整卡占位，发现 {empty_card_pixels} 个卡片表面像素"
@@ -279,9 +306,9 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     geometry.on_card_selection_requested(move |index| {
         geometry_selected_for_callback.borrow_mut().push(index);
     });
-    // 290px 位于两条路径首行共同的内容中心，避开路径外层的 12px sibling 间距。
-    click(&window, 100.0, 290.0);
-    click(&geometry, 100.0, 290.0);
+    // 240px 位于两条路径首行共同的内容中心，避开路径外层的 12px sibling 间距。
+    click(&window, 100.0, 240.0);
+    click(&geometry, 100.0, 240.0);
     assert_eq!(legacy_selected.borrow().as_slice(), &[0]);
     assert_eq!(geometry_selected.borrow().as_slice(), &[0]);
 
@@ -318,15 +345,16 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         .expect("图片加载成功快照失败");
 
     assert!(
-        light_pixels(&loading_snapshot, 42, 94, 260, 326) > 20,
+        // UIR-15 固定视口后首项起点为 207px；扫描完整 52px 盒，避免把状态误判为未绘制。
+        light_pixels(&loading_snapshot, 42, 94, 220, 286) > 20,
         "加载中占位没有真实绘制"
     );
     assert!(
-        light_pixels(&failed_snapshot, 42, 94, 260, 326) > 20,
+        light_pixels(&failed_snapshot, 42, 94, 220, 286) > 20,
         "失败态文案或图标没有真实绘制"
     );
     assert!(
-        surface_pixels(&loaded_snapshot, 42, 94, 255, 330, [84, 132, 196, 255]) > 1_000,
+        surface_pixels(&loaded_snapshot, 42, 94, 220, 286, [84, 132, 196, 255]) > 1_000,
         "已加载缩略图没有在 52×52 盒中真实绘制"
     );
 }

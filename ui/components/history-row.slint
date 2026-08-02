@@ -123,9 +123,15 @@ export component HistoryRowVisual inherits Rectangle {
                 source: card.thumbnail; image-fit: cover;
             }
             if !card.thumbnail_loaded && !card.thumbnail_failed: HistoryRowText {
+                // 加载文案必须显式占满 52×52 缩略图盒，不能依赖 Text 的 preferred 尺寸漂移出裁剪区。
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
                 text: "图片加载中…";
                 color: Theme.text-muted; font-size: Theme.button-font-size;
                 horizontal-alignment: center; vertical-alignment: center;
+                overflow: clip;
             }
             if !card.thumbnail_loaded && card.thumbnail_failed: ImageIcon {
                 size: 16px;

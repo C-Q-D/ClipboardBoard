@@ -141,6 +141,13 @@ export component AppWindow inherits Window {
     in property <bool> history-mutation-pending: false;
     // 纯展示开关只控制清理覆盖层；Rust 在新面板、隐藏和退出生命周期重置它。
     in-out property <bool> cleanup-panel-open: false;
+    // 状态优先级只在 UI 派生，不复制 Rust reducer 状态：mutation 高于分页，分页高于搜索。
+    property <bool> mutation-status-active:
+        history-mutation-pending
+        || pin-error-visible
+        || delete-error-visible
+        || clear-unpinned-error-visible
+        || clear-all-error-visible;
     // 性能探针和后续滚轮交互通过此统一视口属性驱动 legacy 或显式 Flickable；默认值保持顶部。
     in-out property <length> history-viewport-y: 0px;
     // legacy ListView 保留双向别名，使模型替换后的内部 clamp 能同步回统一视口属性。
@@ -232,9 +239,15 @@ export component AppWindow inherits Window {
                         y: 29px;
                         width: 120px;
                         height: 16px;
-                        text: history-active-logical-count + " 条";
-                        color: Theme.text-secondary;
+                        // 启动反馈固定在工具栏内，不能另插入 VerticalLayout 行推动历史列表。
+                        // 单行 clip 保证底层错误详情不会撑开窗口或泄露到其他区域。
+                        text: startup-status == ""
+                            ? history-active-logical-count + " 条"
+                            : startup-status;
+                        color: startup-status == "" ? Theme.text-secondary : Theme.warning;
                         font-size: Theme.metadata-font-size;
+                        vertical-alignment: center;
+                        overflow: clip;
                     }
 
                     // LineEdit 仍是唯一用户输入源；防抖、代次和程序回写由 Rust reducer 管理。
@@ -380,15 +393,6 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                    // 清理确认控件已迁移到 shell 末尾的 CleanupPanel，不再参与左栏布局测量。
-
-                    ThemedText {
-                        visible: clear-unpinned-error-visible || clear-all-error-visible;
-                        height: (clear-unpinned-error-visible || clear-all-error-visible) ? 18px : 0px;
-                        text: clear-all-error-visible ? "清空全部失败，请重试" : "清空失败，请重试";
-                        color: Theme.danger;
-                        font-size: Theme.button-font-size;
-                    }
                 }
 
                 ThemedText {
@@ -404,165 +408,161 @@ export component AppWindow inherits Window {
                     font-size: Theme.preview-font-size;
                 }
 
-                // metadata 未提供时仍保留旧固定高度 ListView，兼容 ATOM-14R 和旧 set_cards 调用。
-                history-list := ListView {
-                    visible: !geometry-mode;
-                    // 两条列表位于同一个 VerticalLayout；隐藏分支必须释放伸展槽，
-                    // 否则旧 ListView 仍会占用一整块高度，把显式列表和首条卡片整体下移。
-                    vertical-stretch: geometry-mode ? 0 : 1;
-                    min-height: geometry-mode ? 0px : 0px;
-                    preferred-height: geometry-mode ? 0px : 0px;
-                    max-height: geometry-mode ? 0px : 100000px;
-                    changed viewport-y => {
-                        // legacy 列表隐藏或重排时只释放布局槽，不得把无效视口写回几何列表。
-                        if (!geometry-mode) {
-                            history-viewport-y = self.viewport-y;
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    changed visible-height => {
-                        if (!geometry-mode) {
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    changed viewport-height => {
-                        if (!geometry-mode) {
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    for card[index] in legacy-cards: Rectangle {
-                        // legacy 根项必须直接声明固定高度；共享视觉组件不能成为 ListView 的几何真相。
-                        height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
-                        background: transparent;
+                // 历史视口是唯一参与 VerticalLayout 伸展的列表槽；空态和搜索状态绝不成为模型项。
+                history-content-area := Rectangle {
+                    vertical-stretch: 1;
+                    min-height: 0px;
+                    background: transparent;
+                    clip: true;
 
-                        history-row := HistoryRowVisual {
-                            width: parent.width;
-                            height: parent.height;
-                            card: card;
-                            card-index: index;
-                            selected: index == selected-index;
-                            row-selected(index) => { card-selection-requested(index); }
-                        }
-                    }
-                }
-
-                // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
-                geometry-history-list := Flickable {
-                    visible: geometry-mode;
-                    // 与 legacy ListView 互斥分配伸展空间，避免两者在隐藏状态下同时占位。
-                    vertical-stretch: geometry-mode ? 1 : 0;
-                    min-height: geometry-mode ? 0px : 0px;
-                    preferred-height: geometry-mode ? 0px : 0px;
-                    max-height: geometry-mode ? 100000px : 0px;
-                    // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
-                    viewport-height: geometry-content-height;
-                    changed viewport-y => {
-                        if (geometry-mode && !geometry-events-suppressed) {
-                            history-viewport-y = self.viewport-y;
-                            let token = geometry-origin-token;
-                            geometry-origin-token = "";
-                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, token);
-                        }
-                    }
-                    changed height => {
-                        if (geometry-mode && !geometry-events-suppressed) {
-                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
-                        }
-                    }
-                    Rectangle {
+                    // metadata 未提供时仍保留旧固定高度 ListView，兼容旧 set_cards 调用。
+                    history-list := ListView {
+                        visible: !geometry-mode;
+                        x: 0px;
+                        y: 0px;
                         width: parent.width;
-                        height: geometry-content-height;
-                        for card[index] in window-cards: HistoryCard {
-                            x: 0px;
-                            // 绝对定位父容器不会使用 preferred-height，必须显式声明行高，
-                            // 否则 HistoryCard delegate 的实际高度为零而完全不可见。
-                            y: window-offsets[index];
-                            height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
-                            width: parent.width;
-                            card: card;
-                            card-index: index;
-                            selected: window-start + index == selected-index;
-                            // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份；行内只允许选择。
-                            card-selected(index) => { card-selection-requested(index); }
+                        // 隐藏路径必须显式归零，history-legacy-visible-height 才不会成为第二个几何来源。
+                        height: geometry-mode ? 0px : parent.height;
+                        changed viewport-y => {
+                            // legacy 列表隐藏或重排时只释放布局槽，不得把无效视口写回几何列表。
+                            if (!geometry-mode) {
+                                history-viewport-y = self.viewport-y;
+                                history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                            }
                         }
-                    }
-                }
+                        changed visible-height => {
+                            if (!geometry-mode) {
+                                history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                            }
+                        }
+                        changed viewport-height => {
+                            if (!geometry-mode) {
+                                history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                            }
+                        }
+                        for card[index] in legacy-cards: Rectangle {
+                            // legacy 根项必须直接声明固定高度；共享视觉组件不能成为 ListView 的几何真相。
+                            height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
+                            background: transparent;
 
-                // 分页状态区始终占据固定高度，加载/失败切换不能改变列表可见高度。
-                Rectangle {
-                    height: 32px;
-                    border-radius: 6px;
-                    background: history-retry-required
-                        ? retry-touch.has-hover ? Theme.surface-hover : Theme.surface-bg
-                        : transparent;
-
-                    ThemedText {
-                        text: history-retry-required
-                            ? "加载失败，点击重试"
-                            : history-next-page-loading ? "正在加载更多…" : "";
-                        color: history-retry-required ? Theme.warning : Theme.text-secondary;
-                        font-size: Theme.history-preview-font-size;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    retry-touch := TouchArea {
-                        enabled: history-retry-required;
-                        clicked => {
-                            if (history-retry-required) {
-                                retry-history-page-requested();
+                            history-row := HistoryRowVisual {
+                                width: parent.width;
+                                height: parent.height;
+                                card: card;
+                                card-index: index;
+                                selected: index == selected-index;
+                                row-selected(index) => { card-selection-requested(index); }
                             }
                         }
                     }
-                }
 
-                if pin-error-visible: ThemedText {
-                    text: "收藏更新失败，请重试";
-                    color: Theme.warning;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
+                    // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
+                    geometry-history-list := Flickable {
+                        visible: geometry-mode;
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
+                        viewport-height: geometry-content-height;
+                        changed viewport-y => {
+                            if (geometry-mode && !geometry-events-suppressed) {
+                                history-viewport-y = self.viewport-y;
+                                let token = geometry-origin-token;
+                                geometry-origin-token = "";
+                                history-viewport-changed(self.viewport-y, self.height, geometry-content-height, token);
+                            }
+                        }
+                        changed height => {
+                            if (geometry-mode && !geometry-events-suppressed) {
+                                history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
+                            }
+                        }
+                        Rectangle {
+                            width: parent.width;
+                            height: geometry-content-height;
+                            for card[index] in window-cards: HistoryCard {
+                                x: 0px;
+                                // 绝对定位父容器不会使用 preferred-height，必须显式声明行高，
+                                // 否则 HistoryCard delegate 的实际高度为零而完全不可见。
+                                y: window-offsets[index];
+                                height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
+                                width: parent.width;
+                                card: card;
+                                card-index: index;
+                                selected: window-start + index == selected-index;
+                                // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份；行内只允许选择。
+                                card-selected(index) => { card-selection-requested(index); }
+                            }
+                        }
+                    }
 
-                if delete-error-visible: ThemedText {
-                    text: "删除失败，请重试";
-                    color: Theme.warning;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
+                    // 空态和搜索反馈只覆盖视口，不改写 history-active-logical-count 或模型高度。
+                    history-status-overlay := Rectangle {
+                        visible: !mutation-status-active
+                            && !history-retry-required
+                            && !history-next-page-loading
+                            && (search-status == "loading"
+                                || search-status == "error"
+                                || history-active-logical-count == 0);
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        background: transparent;
 
-                if search-status == "loading": ThemedText {
-                    text: "搜索中…";
-                    color: Theme.text-secondary;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
+                        if search-status == "loading": ThemedText {
+                            x: 12px;
+                            y: (parent.height - 36px) / 2;
+                            width: parent.width - 24px;
+                            height: 36px;
+                            text: "搜索中…";
+                            color: Theme.text-secondary;
+                            font-size: Theme.history-preview-font-size;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: clip;
+                        }
 
-                if cards.length == 0 && search-status == "idle": ThemedText {
-                    text: "复制一段文本，最新内容会出现在这里";
-                    color: Theme.text-muted;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
+                        if search-status == "error": ThemedText {
+                            x: 12px;
+                            y: (parent.height - 36px) / 2;
+                            width: parent.width - 24px;
+                            height: 36px;
+                            text: "搜索暂不可用，请稍后重试";
+                            color: Theme.warning;
+                            font-size: Theme.history-preview-font-size;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: clip;
+                        }
 
-                if cards.length == 0 && search-status == "empty": ThemedText {
-                    text: "没有匹配的剪贴内容";
-                    color: Theme.text-muted;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
+                        if history-active-logical-count == 0 && search-status == "idle": ThemedText {
+                            x: 12px;
+                            y: (parent.height - 36px) / 2;
+                            width: parent.width - 24px;
+                            height: 36px;
+                            text: "复制一段文本，最新内容会出现在这里";
+                            color: Theme.text-muted;
+                            font-size: Theme.history-preview-font-size;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: clip;
+                        }
 
-                if search-status == "error": ThemedText {
-                    text: "搜索暂不可用，请稍后重试";
-                    color: Theme.warning;
-                    font-size: Theme.history-preview-font-size;
-                    horizontal-alignment: center;
-                }
-
-                if startup-status != "": ThemedText {
-                    text: startup-status;
-                    color: Theme.warning;
-                    font-size: Theme.button-font-size;
-                    horizontal-alignment: center;
+                        if history-active-logical-count == 0 && search-status == "empty": ThemedText {
+                            x: 12px;
+                            y: (parent.height - 36px) / 2;
+                            width: parent.width - 24px;
+                            height: 36px;
+                            text: "没有匹配的剪贴内容";
+                            color: Theme.text-muted;
+                            font-size: Theme.history-preview-font-size;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: clip;
+                        }
+                    }
                 }
 
                 Rectangle {
@@ -571,20 +571,51 @@ export component AppWindow inherits Window {
                 }
 
                 // 底部状态行只保留一个清理入口；打开后由全屏覆盖层拦截底层操作。
-                HorizontalLayout {
-                    height: 32px;
-                    spacing: 8px;
+                // 底部状态行固定 34px；分页反馈与普通快捷键共用一个位置，避免状态堆叠。
+                status-row := Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    background: mutation-status-active && !history-mutation-pending
+                        ? Theme.danger-surface
+                        : history-retry-required
+                        ? retry-touch.has-hover ? Theme.surface-hover : Theme.surface-bg
+                        : transparent;
 
                     ThemedText {
-                        text: "Esc 关闭到托盘";
-                        color: Theme.text-secondary;
+                        x: 0px;
+                        y: 0px;
+                        width: mutation-status-active || history-retry-required
+                            ? parent.width
+                            : parent.width - 92px;
+                        height: parent.height;
+                        text: mutation-status-active
+                            ? history-mutation-pending ? "正在保存更改…" : "操作失败，请重试"
+                            : history-retry-required
+                            ? "加载失败，点击重试"
+                            : history-next-page-loading ? "正在加载更多…" : "Esc 关闭到托盘";
+                        color: mutation-status-active
+                            ? history-mutation-pending ? Theme.text-secondary : Theme.danger
+                            : history-retry-required ? Theme.warning : Theme.text-secondary;
                         font-size: Theme.shortcut-font-size;
                         font-weight: Theme.font-weight-medium;
-                        horizontal-stretch: 1;
+                        horizontal-alignment: mutation-status-active || history-retry-required ? center : left;
                         vertical-alignment: center;
+                        overflow: clip;
                     }
 
-                    TextButton {
+                    retry-touch := TouchArea {
+                        visible: history-retry-required && !mutation-status-active;
+                        enabled: history-retry-required && !mutation-status-active;
+                        clicked => {
+                            if (history-retry-required) {
+                                retry-history-page-requested();
+                            }
+                        }
+                    }
+
+                    if !history-retry-required && !mutation-status-active: TextButton {
+                        x: parent.width - 84px;
+                        y: 2px;
                         width: 84px;
                         height: 30px;
                         label: "清理历史";
@@ -617,6 +648,10 @@ export component AppWindow inherits Window {
                 card: selected-card;
                 has-selected-card: has-selected-card;
                 history-mutation-pending: history-mutation-pending;
+                pin-error-visible: root.pin-error-visible;
+                delete-error-visible: root.delete-error-visible;
+                clear-unpinned-error-visible: root.clear-unpinned-error-visible;
+                clear-all-error-visible: root.clear-all-error-visible;
                 copy-requested() => { selected-copy-requested(); }
                 pin-requested() => { selected-pin-requested(); }
                 delete-requested() => { selected-delete-requested(); }

@@ -23,6 +23,20 @@ export component PreviewPane inherits Rectangle {
     property <length> preview-action-bar-height: 54px;
     // 全局 mutation pending 由 Rust reducer 提供；此处只负责稳定禁用与文案。
     in property <bool> history-mutation-pending: false;
+    // 四类失败状态共享一个固定槽；错误详情不进入界面，且优先级只在此处收敛。
+    in property <bool> pin-error-visible: false;
+    in property <bool> delete-error-visible: false;
+    in property <bool> clear-unpinned-error-visible: false;
+    in property <bool> clear-all-error-visible: false;
+    // 状态槽始终保留固定高度，避免错误出现时挤压正文或操作栏。
+    property <length> preview-status-slot-height: 20px;
+    property <string> mutation-status-text:
+        clear-all-error-visible ? "清空全部失败，请重试"
+        : clear-unpinned-error-visible ? "清空失败，请重试"
+        : pin-error-visible ? "收藏更新失败，请重试"
+        : delete-error-visible ? "删除失败，请重试"
+        : history-mutation-pending ? "正在保存更改…"
+        : "";
     callback copy-requested();
     callback pin-requested();
     callback delete-requested();
@@ -70,19 +84,21 @@ export component PreviewPane inherits Rectangle {
             x: 0px;
             y: preview-header-height;
             width: parent.width;
-            height: parent.height - preview-header-height - preview-action-bar-height;
+            height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height;
             text: "选择左侧内容后在这里预览";
             color: Theme.text-secondary;
             font-size: Theme.preview-font-size;
             wrap: word-wrap;
             overflow: clip;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
 
         if has-selected-card && !card.is_image: Flickable {
             x: 0px;
             y: preview-header-height;
             width: parent.width;
-            height: parent.height - preview-header-height - preview-action-bar-height;
+            height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height;
             // viewport-height 与摘要 Text 的实际 preferred-height 同步，长摘要才能滚动。
             viewport-height: preview-text.preferred-height;
 
@@ -110,7 +126,7 @@ export component PreviewPane inherits Rectangle {
             x: 0px;
             y: preview-header-height;
             width: parent.width;
-            height: parent.height - preview-header-height - preview-action-bar-height - 24px;
+            height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height - 24px;
             background: Theme.window-bg;
             border-width: 1px;
             border-color: Theme.border-subtle;
@@ -166,7 +182,7 @@ export component PreviewPane inherits Rectangle {
 
         if has-selected-card && card.is_image: PreviewText {
             x: 0px;
-            y: parent.height - preview-action-bar-height - 18px;
+            y: parent.height - preview-action-bar-height - preview-status-slot-height - 18px;
             width: parent.width;
             height: 18px;
             text: card.image_width > 0 && card.image_height > 0
@@ -176,6 +192,30 @@ export component PreviewPane inherits Rectangle {
             font-size: Theme.metadata-font-size;
             horizontal-alignment: center;
             overflow: clip;
+        }
+
+        // mutation 状态固定在操作栏上方；空闲时仍保留同样的透明槽位。
+        Rectangle {
+            x: 0px;
+            y: parent.height - preview-action-bar-height - preview-status-slot-height;
+            width: parent.width;
+            height: preview-status-slot-height;
+            background: transparent;
+
+            PreviewText {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                text: mutation-status-text;
+                color: clear-all-error-visible || clear-unpinned-error-visible
+                    ? Theme.danger
+                    : Theme.warning;
+                font-size: Theme.metadata-font-size;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: clip;
+            }
         }
 
         // 操作栏是右栏唯一的业务命中区；历史行的整行 TouchArea 不会与它重叠。

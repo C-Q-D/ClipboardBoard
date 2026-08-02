@@ -124,8 +124,8 @@ const FIRST_BATCH_COUNT: usize = 30;
 const OPEN_SAMPLE_COUNT: usize = 30;
 /// ATOM-14R 长滚动探针的视口跳转次数；每次都直接设置真实 legacy ListView 视口位置。
 const LONG_SCROLL_SAMPLE_COUNT: usize = 200;
-/// ListView delegate 的固定高度；必须与 `ui/app-window.slint` 的 96px 卡片加 10px 间隔一致。
-const DELEGATE_HEIGHT_PX: f32 = 106.0;
+/// ListView delegate 的文本固定高度；必须与 Slint 的 78px 外层和 70px 背景契约一致。
+const DELEGATE_HEIGHT_PX: f32 = 78.0;
 /// 单次视口刷新允许访问的最大行数，用于证明重复器没有退化为全量实例化。
 const MAX_VISIBLE_ROWS: usize = 100;
 /// 允许少量连续落在同一复用窗口的样本没有新的 row_data 请求，但不能让大多数样本失去证据。
@@ -235,8 +235,8 @@ fn working_set_bytes() -> u64 {
 const MIXED_TEXT_SUMMARY_COUNT: usize = 10_000;
 /// ATOM-43 的混合摘要图片数量；数量必须与脚本硬门禁保持一致。
 const MIXED_IMAGE_SUMMARY_COUNT: usize = 10_000;
-/// 文本卡片的最终固定高度；必须与生产 Slint delegate 保持一致。
-const MIXED_TEXT_CARD_HEIGHT_PX: f32 = 106.0;
+/// 文本卡片的最终固定高度；必须与生产 Slint delegate 的 78px 外层保持一致。
+const MIXED_TEXT_CARD_HEIGHT_PX: f32 = 78.0;
 /// 图片卡片的最终固定高度；必须与生产 Slint delegate 保持一致。
 const MIXED_IMAGE_CARD_HEIGHT_PX: f32 = 186.0;
 /// 混合探针重复呼出样本数；排序后取 P95，降低调度抖动对结论的影响。
@@ -470,7 +470,7 @@ fn measure_mixed_open(
         .map(|(index, card)| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: if card.is_image { 186 } else { 106 },
+            height: if card.is_image { 186 } else { 78 },
         })
         .collect::<Vec<_>>();
     let geometry = HistoryGeometry::new(metadata.clone()).expect("混合 metadata 应可构造");
@@ -701,7 +701,7 @@ fn 测量一万文本与一万图片混合列表() {
         .map(|(index, card)| HistoryGeometryItem {
             id: index as u64 + 1,
             content_hash: [index as u8; 32],
-            height: if card.is_image { 186 } else { 106 },
+            height: if card.is_image { 186 } else { 78 },
         })
         .collect::<Vec<_>>();
     let geometry = HistoryGeometry::new(metadata.clone()).expect("混合 prefix 应可构造");

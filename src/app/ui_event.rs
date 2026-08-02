@@ -51,8 +51,8 @@ use slint::PhysicalPosition;
 pub const UI_HISTORY_MEMORY_CAPACITY: usize = MAX_LOADED_ITEMS;
 /// SQLite 首页固定批量。
 pub const UI_FIRST_BATCH_SIZE: usize = 30;
-/// 文本卡片固定高度；选择和缩略图视口计算与 Slint 代理保持一致。
-const HISTORY_CARD_HEIGHT: i32 = 106;
+/// 文本历史项固定外层高度；必须与 Theme.history-text-row-height 的 78px 保持一致。
+const TEXT_HISTORY_ROW_HEIGHT: i32 = 78;
 /// 图片卡片固定高度；视口调度无需解码正文或测量图片。
 const IMAGE_CARD_HEIGHT: i32 = 186;
 /// 距离底部两张最高图片卡片以内进入续页区，兼容文本与图片混合列表。
@@ -1561,7 +1561,7 @@ impl UiState {
                 id: item.id,
                 content_hash: item.content_hash,
                 height: match item.kind {
-                    crate::command::UiClipboardItemKind::Text => HISTORY_CARD_HEIGHT as i64,
+                    crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT as i64,
                     crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as i64,
                 },
             })
@@ -2723,7 +2723,7 @@ fn thumbnail_retained_range(
     let mut last_visible = None;
     for (index, item) in items.iter().enumerate() {
         let item_height = match item.kind {
-            crate::command::UiClipboardItemKind::Text => HISTORY_CARD_HEIGHT,
+            crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT,
             crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT,
         };
         let item_bottom = item_top.saturating_add(item_height);
@@ -3281,7 +3281,7 @@ fn selection_item_bounds(snapshot: &UiSnapshot, selected_index: usize) -> Option
     let mut top = 0_f32;
     for (index, item) in visible_snapshot_items(snapshot).enumerate() {
         let height = match item.kind {
-            crate::command::UiClipboardItemKind::Text => HISTORY_CARD_HEIGHT as f32,
+            crate::command::UiClipboardItemKind::Text => TEXT_HISTORY_ROW_HEIGHT as f32,
             crate::command::UiClipboardItemKind::Image(_) => IMAGE_CARD_HEIGHT as f32,
         };
         if index == selected_index {
@@ -5821,20 +5821,33 @@ mod tests {
     /// 选中项进入视口上方、下方和内容边界时，偏移必须使用负向 viewport-y 并夹紧。
     #[test]
     fn 选中项视口定位使用固定卡片高度() {
-        assert_eq!(selection_viewport_y(0.0, 106.0, 0.0, 212.0, 1000.0), 0.0);
+        assert_eq!(selection_viewport_y(0.0, 78.0, 0.0, 212.0, 1000.0), 0.0);
         assert_eq!(
-            selection_viewport_y(424.0, 530.0, 0.0, 212.0, 1000.0),
-            -318.0
+            selection_viewport_y(424.0, 502.0, 0.0, 212.0, 1000.0),
+            -290.0
         );
         assert_eq!(
-            selection_viewport_y(3074.0, 3180.0, 0.0, 212.0, 3180.0),
-            -2968.0
+            selection_viewport_y(3074.0, 3152.0, 0.0, 212.0, 3152.0),
+            -2940.0
         );
         assert_eq!(
-            selection_viewport_y(106.0, 212.0, -318.0, 212.0, 1000.0),
-            -106.0
+            selection_viewport_y(78.0, 156.0, -318.0, 212.0, 1000.0),
+            -78.0
         );
-        assert_eq!(selection_viewport_y(106.0, 212.0, 0.0, 0.0, 1000.0), 0.0);
+        assert_eq!(selection_viewport_y(78.0, 156.0, 0.0, 0.0, 1000.0), 0.0);
+    }
+
+    /// 文本行高必须由生产常量固定为 78px，并在混合选择边界中累加而不动态测量正文。
+    #[test]
+    fn 文本历史项使用七十八像素几何() {
+        let snapshot = UiSnapshot {
+            items: vec![test_item(0), test_item(1), test_image_item(2)],
+            selected_index: None,
+        };
+
+        assert_eq!(selection_item_bounds(&snapshot, 0), Some((0.0, 78.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 1), Some((78.0, 156.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((156.0, 342.0)));
     }
 
     /// 图片和文本使用各自固定高度，前序图片不能让后续选择偏移少算。
@@ -5851,7 +5864,7 @@ mod tests {
             selected_index: Some(2),
         };
 
-        assert_eq!(selection_item_bounds(&snapshot, 2), Some((292.0, 398.0)));
+        assert_eq!(selection_item_bounds(&snapshot, 2), Some((264.0, 342.0)));
     }
 
     /// 滚出视口的迟到结果虽然被拒绝，但必须结束在途身份，滚回后才能重新请求。
@@ -5957,8 +5970,8 @@ mod tests {
             selected_index: None,
         };
 
-        // 首张图片从 106px 开始；106..292 的视口只覆盖该图片，缓冲应覆盖 0..12。
-        assert_eq!(thumbnail_retained_range(&snapshot, -106, 186), 0..12);
+        // 首张图片从 78px 开始；78..264 的视口只覆盖该图片，缓冲应覆盖 0..12。
+        assert_eq!(thumbnail_retained_range(&snapshot, -78, 186), 0..12);
         let middle = thumbnail_retained_range(&snapshot, -2_800, 186);
         assert!(middle.start > 0);
         assert!(middle.len() <= THUMBNAIL_ITEM_BUFFER * 2 + 2);

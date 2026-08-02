@@ -2,7 +2,7 @@
 // HistoryRowVisual 只接收受限摘要和局部索引；视口、绝对 offset、窗口化和业务状态仍归父级负责。
 
 import { Theme } from "../theme.slint";
-import { PinFilledIcon, PinOutlineIcon } from "icons.slint";
+import { PinFilledIcon, PinOutlineIcon, TextIcon } from "icons.slint";
 
 // ClipboardCard 是历史视觉需要的最小展示 DTO；完整正文和原图永远不进入 Slint 组件树。
 export struct ClipboardCard {
@@ -40,7 +40,7 @@ component HistoryRowText inherits Text {
 
 // HistoryRowVisual 复用文本/图片卡片的背景、摘要和当前操作按钮。
 // 它不声明 preferred/min/max height，不持有 ListView、Flickable、viewport 或绝对 offset；
-// 外层 HistoryCard 和 legacy delegate 才是 106/186 行高与定位的唯一几何真相。
+// 外层 HistoryCard 和 legacy delegate 才是 78/186 行高与定位的唯一几何真相。
 export component HistoryRowVisual inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;
@@ -55,7 +55,7 @@ export component HistoryRowVisual inherits Rectangle {
     background: transparent;
 
     card-background := Rectangle {
-        height: card.is_image ? 176px : 96px;
+        height: card.is_image ? 176px : Theme.history-text-background-height;
         // 背景尺寸只表达卡片内部绘制范围；外层行高由两个父级路径分别固定。
         width: parent.width;
         clip: true;
@@ -66,31 +66,47 @@ export component HistoryRowVisual inherits Rectangle {
         border-color: selected ? Theme.border-selected : Theme.border-subtle;
         border-radius: 10px;
 
-        VerticalLayout {
-            visible: !card.is_image;
-            width: parent.width - 144px;
-            height: parent.height;
-            padding: 14px;
-            spacing: 8px;
+        if !card.is_image: TextIcon {
+            size: 16px;
+            icon-color: selected ? Theme.text-primary : Theme.text-secondary;
+            x: 14px;
+            y: (parent.height - self.height) / 2;
+        }
+
+        if !card.is_image: HistoryRowText {
+            x: 38px;
+            y: 8px;
+            width: parent.width - 182px;
+            height: 32px;
+            text: card.preview;
+            color: Theme.text-primary;
+            font-size: Theme.history-preview-font-size;
+            wrap: word-wrap;
+            overflow: clip;
+        }
+
+        if !card.is_image: HorizontalLayout {
+            x: 38px;
+            y: 49px;
+            width: parent.width - 182px;
+            height: 14px;
+            spacing: 4px;
+            // source 允许收缩并裁剪；relative_time 保留独立布局槽，不能被来源文案覆盖。
             HistoryRowText {
-                text: card.preview;
-                height: 46px;
-                vertical-stretch: 0;
-                color: Theme.text-primary;
-                font-size: Theme.history-preview-font-size;
-                wrap: word-wrap;
+                min-width: 0px;
+                horizontal-stretch: 1;
                 overflow: clip;
+                text: card.source;
+                color: Theme.text-secondary;
+                font-size: Theme.metadata-font-size;
             }
-            HorizontalLayout {
-                spacing: 8px;
-                HistoryRowText { text: card.source; color: Theme.text-secondary; font-size: Theme.metadata-font-size; }
-                HistoryRowText {
-                    text: card.relative_time;
-                    color: Theme.text-muted;
-                    font-size: Theme.metadata-font-size;
-                    horizontal-alignment: right;
-                    horizontal-stretch: 1;
-                }
+            HistoryRowText {
+                min-width: 0px;
+                text: card.relative_time;
+                color: Theme.text-muted;
+                font-size: Theme.metadata-font-size;
+                horizontal-alignment: right;
+                overflow: clip;
             }
         }
 

@@ -46,7 +46,7 @@ fn update_layout() {
     i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
 }
 
-/// 文本 106px 与图片 186px 必须由真实 ListView 累加为混合内容高度。
+/// 文本 78px 与图片 186px 必须由真实 ListView 累加为混合内容高度。
 #[test]
 fn 混合卡片产生真实内容高度且状态区不改变可见高度() {
     init_test_backend();
@@ -58,7 +58,7 @@ fn 混合卡片产生真实内容高度且状态区不改变可见高度() {
     update_layout();
 
     assert_eq!(window.get_history_model_length(), 2);
-    assert_eq!(window.get_history_viewport_height(), 292.0);
+    assert_eq!(window.get_history_viewport_height(), 264.0);
     let idle_height = window.get_history_visible_height();
     assert!(idle_height > 0.0);
 
@@ -145,9 +145,9 @@ fn 显式窗口提交只发送一次来源令牌() {
     assert!(builder.set_window(WindowCommitPayload {
         start: 0,
         total_count: 1,
-        total_height: 106,
+        total_height: 78,
         visible_height: 50,
-        clamped_viewport_y: -56,
+        clamped_viewport_y: -28,
         origin_token: Some(7),
         cards: vec![item],
         offsets: vec![WindowOffset {
@@ -155,7 +155,7 @@ fn 显式窗口提交只发送一次来源令牌() {
             id: 1,
             content_hash: [1; 32],
             top: 0,
-            height: 106,
+            height: 78,
         }],
     }));
     assert!(builder.ready());

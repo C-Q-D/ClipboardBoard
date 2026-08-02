@@ -23,7 +23,7 @@ component ThemedText inherits Text {
     font-family: Theme.font-family;
 }
 
-// HistoryCard 只声明 geometry 路径的 106/186 外层行高；内部视觉统一委托给 HistoryRowVisual。
+// HistoryCard 只声明 geometry 路径的 78/186 外层行高；内部视觉统一委托给 HistoryRowVisual。
 component HistoryCard inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;
@@ -35,7 +35,7 @@ component HistoryCard inherits Rectangle {
     callback card-deleted(index: int);
 
     // 显式固定 layout info，避免 ListView 把内部 TouchArea 的默认首选高度叠加到行高。
-    preferred-height: card.is_image ? 186px : 106px;
+    preferred-height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
     min-height: self.preferred-height;
     max-height: self.preferred-height;
     background: transparent;
@@ -620,7 +620,7 @@ export component AppWindow inherits Window {
                     }
                     for card[index] in legacy-cards: Rectangle {
                         // legacy 根项必须直接声明固定高度；共享视觉组件不能成为 ListView 的几何真相。
-                        height: card.is_image ? 186px : 106px;
+                        height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
                         background: transparent;
 
                         history-row := HistoryRowVisual {
@@ -669,7 +669,7 @@ export component AppWindow inherits Window {
                             // 绝对定位父容器不会使用 preferred-height，必须显式声明行高，
                             // 否则 HistoryCard delegate 的实际高度为零而完全不可见。
                             y: window-offsets[index];
-                            height: card.is_image ? 186px : 106px;
+                            height: card.is_image ? Theme.history-image-row-height : Theme.history-text-row-height;
                             width: parent.width;
                             card: card;
                             card-index: index;

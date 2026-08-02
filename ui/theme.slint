@@ -28,7 +28,9 @@ export global Theme {
     in property <length> content-padding: 12px;
     in property <length> section-gap: 10px;
     in property <length> control-hit-size: 36px;
-    in property <length> history-text-row-height: 106px;
+    // 文本行外层固定 78px；共享视觉中的 70px 背景内含选中边框，不能向外撑高。
+    in property <length> history-text-row-height: 78px;
+    in property <length> history-text-background-height: 70px;
     in property <length> history-image-row-height: 186px;
 
     // 采用系统字体回退，不把 design 目录中的 WOFF/WOFF2 带入程序。

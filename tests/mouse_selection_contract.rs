@@ -65,17 +65,17 @@ fn 卡片点击产生可见索引且空白区无动作() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    // 720×520 双栏布局中左栏历史列表从约 242px 开始，每张代理高度为 106px。
+    // 720×520 双栏布局中左栏历史列表从约 242px 开始，每张文本代理外层高度为 78px。
     click(&window, 100.0, 250.0);
-    click(&window, 100.0, 356.0);
-    // 第一张卡片背景后的 10px 透明间隔和左栏右侧预留操作区都不属于选择点击区。
-    click(&window, 100.0, 349.0);
+    click(&window, 100.0, 328.0);
+    // 第一张卡片背景后的 8px 透明间隔和左栏右侧预留操作区都不属于选择点击区。
+    click(&window, 100.0, 321.0);
     assert_eq!(selected.borrow().as_slice(), &[0, 1]);
 
     // 视口不足以同时显示第三项时，沿用生产 setter 滚动一个文本行高后再点击末项；
     // 测试仍验证真实 TouchArea 产生的稳定索引，而不是直接调用选择回调。
-    window.set_history_viewport_y(-106.0);
-    click(&window, 100.0, 370.0);
+    window.set_history_viewport_y(-78.0);
+    click(&window, 100.0, 410.0);
     assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
     click(&window, 280.0, 250.0);
 

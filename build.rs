@@ -17,6 +17,8 @@ fn main() {
     // 基础图标和按钮是 Slint 编译输入；变更后必须重新生成界面代码。
     println!("cargo:rerun-if-changed=ui/components/icons.slint");
     println!("cargo:rerun-if-changed=ui/components/controls.slint");
+    // 历史项共享视觉组件是根界面的编译输入；变更后必须重新生成界面代码。
+    println!("cargo:rerun-if-changed=ui/components/history-row.slint");
     println!("cargo:rerun-if-changed=assets/clipboard-board.svg");
     println!("cargo:rerun-if-changed=assets/clipboard-board.ico.hex");
     println!("cargo:rerun-if-changed=assets/clipboard-board-resource-id.txt");

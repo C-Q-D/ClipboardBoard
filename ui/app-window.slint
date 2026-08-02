@@ -5,37 +5,8 @@
 import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TextButton } from "components/controls.slint";
-import { PinFilledIcon, PinOutlineIcon } from "components/icons.slint";
+import { ClipboardCard, HistoryRowVisual } from "components/history-row.slint";
 export { PrimitiveGallery } from "components/controls.slint";
-
-// ClipboardCard 是 UI 卡片的最小展示 DTO，只允许摘要、来源和相对时间进入组件树。
-export struct ClipboardCard {
-    // 已按领域规则截断的预览文本，不是完整剪贴板正文。
-    preview: string,
-    // 来源程序的安全展示名称；缺失时由 Rust 侧提供稳定回退文案。
-    source: string,
-    // 由应用状态层格式化的相对时间文本。
-    relative_time: string,
-    // 数据库已经提交的最终收藏状态；pending 期间保持旧值。
-    is_pinned: bool,
-    // 当前卡片是否正在等待收藏事务结果，用于禁用重复点击。
-    pin_pending: bool,
-    // 当前卡片是否正在等待删除事务结果；pending 期间卡片仍然可见。
-    delete_pending: bool,
-    // 图片卡片在缩略图接入前显示稳定占位；文本卡片保持原布局。
-    is_image: bool,
-    // 文本和图片卡片都通过稳定 ID/哈希请求后台复制，不在 UI 层携带正文或原图。
-    copy_enabled: bool,
-    // 图片原始尺寸仅用于摘要文案，不参与卡片动态测量。
-    image_width: int,
-    image_height: int,
-    // 后台缩略图在 UI 线程转换后的受限图片；未完成时保持默认空图片。
-    thumbnail: image,
-    // 显式状态用于区分空图片与加载中占位，不在 Slint 内推断图片内容。
-    thumbnail_loaded: bool,
-    // 文件缺失或损坏时显示稳定失败占位。
-    thumbnail_failed: bool,
-}
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
 // visible-* 属性是编译器进行固定高度布局和虚拟化所需的契约，不能删除或改名。
@@ -52,7 +23,7 @@ component ThemedText inherits Text {
     font-family: Theme.font-family;
 }
 
-// HistoryCard 复用文本/图片卡片视觉和操作按钮；geometry 模式只替换其绝对定位父容器。
+// HistoryCard 只声明 geometry 路径的 106/186 外层行高；内部视觉统一委托给 HistoryRowVisual。
 component HistoryCard inherits Rectangle {
     in property <ClipboardCard> card;
     in property <int> card-index: -1;
@@ -69,136 +40,17 @@ component HistoryCard inherits Rectangle {
     max-height: self.preferred-height;
     background: transparent;
 
-    card-background := Rectangle {
-        height: card.is_image ? 176px : 96px;
-        // 根 HistoryCard 已声明真实行高；背景子树不应再把自身布局首选高度向外累加。
-        preferred-height: 0px;
+    history-row := HistoryRowVisual {
         width: parent.width;
-        clip: true;
-        background: selected
-            ? Theme.surface-selected
-            : card-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-        border-width: selected ? 2px : 1px;
-        border-color: selected ? Theme.border-selected : Theme.border-subtle;
-        border-radius: 10px;
-
-        VerticalLayout {
-            visible: !card.is_image;
-            width: parent.width - 144px;
-            height: parent.height;
-            padding: 14px;
-            spacing: 8px;
-            ThemedText {
-                text: card.preview;
-                height: 46px;
-                vertical-stretch: 0;
-                color: Theme.text-primary;
-                font-size: Theme.history-preview-font-size;
-                wrap: word-wrap;
-                overflow: clip;
-            }
-            HorizontalLayout {
-                spacing: 8px;
-                ThemedText { text: card.source; color: Theme.text-secondary; font-size: Theme.metadata-font-size; }
-                ThemedText {
-                    text: card.relative_time;
-                    color: Theme.text-muted;
-                    font-size: Theme.metadata-font-size;
-                    horizontal-alignment: right;
-                    horizontal-stretch: 1;
-                }
-            }
-        }
-
-        if card.is_image: Rectangle {
-            x: 14px; y: 12px; width: parent.width - 172px; height: 112px;
-            background: Theme.window-bg; border-width: 1px; border-color: Theme.border-subtle; border-radius: 6px; clip: true;
-            Image {
-                visible: card.thumbnail_loaded;
-                width: parent.width; height: parent.height;
-                source: card.thumbnail; image-fit: cover;
-            }
-            ThemedText {
-                visible: !card.thumbnail_loaded;
-                text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
-                color: Theme.text-muted; font-size: Theme.button-font-size;
-                horizontal-alignment: center; vertical-alignment: center;
-            }
-        }
-        if card.is_image: ThemedText {
-            x: 14px; y: 132px; width: parent.width - 172px;
-            text: "图片  " + card.image_width + " × " + card.image_height;
-            color: Theme.text-primary; font-size: Theme.button-font-size;
-        }
-        if card.is_image: ThemedText {
-            x: 14px; y: 151px; width: parent.width - 172px;
-            text: card.source + "  ·  " + card.relative_time;
-            color: Theme.text-secondary; font-size: Theme.metadata-font-size;
-        }
-
-        card-touch := TouchArea {
-            width: parent.width - 144px;
-            clicked => { card-selected(card-index); }
-        }
-
-        delete-button := Rectangle {
-            x: parent.width - 138px; y: (parent.height - self.height) / 2;
-            width: 36px; height: 36px; border-radius: 6px;
-            background: delete-touch.pressed ? Theme.accent-bg : delete-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-            border-width: 1px; border-color: Theme.border-subtle;
-            ThemedText {
-                text: card.delete_pending ? "…" : "删";
-                color: delete-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                font-size: card.delete_pending ? Theme.pending-font-size : Theme.button-font-size;
-                horizontal-alignment: center; vertical-alignment: center;
-            }
-            delete-touch := TouchArea {
-                enabled: !mutation-pending && !card.delete_pending;
-                clicked => { if (!mutation-pending && !card.delete_pending) { card-deleted(card-index); } }
-            }
-        }
-        pin-button := Rectangle {
-            x: parent.width - 94px; y: (parent.height - self.height) / 2;
-            width: 36px; height: 36px; border-radius: 6px;
-            background: pin-touch.pressed ? Theme.accent-bg : pin-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-            border-width: 1px; border-color: card.is_pinned ? Theme.border-selected : Theme.border-subtle;
-            if card.pin_pending: ThemedText {
-                text: "…";
-                color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                font-size: Theme.pending-font-size;
-                horizontal-alignment: center; vertical-alignment: center;
-            }
-            if !card.pin_pending && card.is_pinned: PinFilledIcon {
-                size: 16px;
-                icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-            }
-            if !card.pin_pending && !card.is_pinned: PinOutlineIcon {
-                size: 16px;
-                icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-            }
-            pin-touch := TouchArea {
-                enabled: !mutation-pending && !card.pin_pending;
-                clicked => { if (!mutation-pending && !card.pin_pending) { card-pinned(card-index); } }
-            }
-        }
-        copy-button := Rectangle {
-            x: parent.width - 50px; y: (parent.height - self.height) / 2;
-            width: 44px; height: 36px; border-radius: 6px;
-            background: copy-touch.pressed ? Theme.accent-bg : copy-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-            border-width: 1px; border-color: Theme.border-subtle;
-            ThemedText {
-                text: "复制"; color: copy-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                font-size: Theme.button-font-size; horizontal-alignment: center; vertical-alignment: center;
-            }
-            copy-touch := TouchArea {
-                enabled: card.copy_enabled;
-                clicked => { if (card.copy_enabled) { card-copied(card-index); } }
-            }
-        }
+        height: parent.height;
+        card: card;
+        card-index: card-index;
+        selected: selected;
+        mutation-pending: mutation-pending;
+        row-selected(index) => { card-selected(index); }
+        row-copied(index) => { card-copied(index); }
+        row-pinned(index) => { card-pinned(index); }
+        row-deleted(index) => { card-deleted(index); }
     }
 }
 
@@ -301,6 +153,8 @@ export component AppWindow inherits Window {
     // 暴露实际绑定重复器的行数；geometry 模式必须是有界 window-cards，而不是逻辑总数。
     out property <int> history-model-length: geometry-mode ? window-cards.length : cards.length;
     out property <length> history-visible-height: geometry-mode ? geometry-history-list.height : history-list.visible-height;
+    // 测试接缝只暴露 legacy 分支的实际布局高度，用于证明显式模式不会被隐藏 ListView 占位。
+    out property <length> history-legacy-visible-height: history-list.visible-height;
     out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
     // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
     changed history-viewport-y => {
@@ -765,195 +619,21 @@ export component AppWindow inherits Window {
                         }
                     }
                     for card[index] in legacy-cards: Rectangle {
-                        // legacy repeater 项必须直接声明固定高度；不要把 HistoryCard 作为根组件，
-                        // 否则组件内部布局信息会被 ListView 当成额外行高。
+                        // legacy 根项必须直接声明固定高度；共享视觉组件不能成为 ListView 的几何真相。
                         height: card.is_image ? 186px : 106px;
                         background: transparent;
 
-                        card-background := Rectangle {
-                            height: card.is_image ? 176px : 96px;
+                        history-row := HistoryRowVisual {
                             width: parent.width;
-                            clip: true;
-                            background: index == selected-index
-                                ? Theme.surface-selected
-                                : card-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-                            border-width: index == selected-index ? 2px : 1px;
-                            border-color: index == selected-index ? Theme.border-selected : Theme.border-subtle;
-                            border-radius: 10px;
-
-                            VerticalLayout {
-                                visible: !card.is_image;
-                                width: parent.width - 144px;
-                                height: parent.height;
-                                padding: 14px;
-                                spacing: 8px;
-
-                                ThemedText {
-                                    text: card.preview;
-                                    height: 46px;
-                                    vertical-stretch: 0;
-                                    color: Theme.text-primary;
-                                    font-size: Theme.history-preview-font-size;
-                                    wrap: word-wrap;
-                                    overflow: clip;
-                                }
-
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    ThemedText { text: card.source; color: Theme.text-secondary; font-size: Theme.metadata-font-size; }
-                                    ThemedText {
-                                        text: card.relative_time;
-                                        color: Theme.text-muted;
-                                        font-size: Theme.metadata-font-size;
-                                        horizontal-alignment: right;
-                                        horizontal-stretch: 1;
-                                    }
-                                }
-                            }
-
-                            if card.is_image: Rectangle {
-                                x: 14px;
-                                y: 12px;
-                                width: parent.width - 172px;
-                                height: 112px;
-                                background: Theme.window-bg;
-                                border-width: 1px;
-                                border-color: Theme.border-subtle;
-                                border-radius: 6px;
-                                clip: true;
-                                Image {
-                                    visible: card.thumbnail_loaded;
-                                    width: parent.width;
-                                    height: parent.height;
-                                    source: card.thumbnail;
-                                    image-fit: cover;
-                                }
-                                ThemedText {
-                                    visible: !card.thumbnail_loaded;
-                                    text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
-                                    color: Theme.text-muted;
-                                    font-size: Theme.button-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            if card.is_image: ThemedText {
-                                x: 14px;
-                                y: 132px;
-                                width: parent.width - 172px;
-                                text: "图片  " + card.image_width + " × " + card.image_height;
-                                color: Theme.text-primary;
-                                font-size: Theme.button-font-size;
-                            }
-
-                            if card.is_image: ThemedText {
-                                x: 14px;
-                                y: 151px;
-                                width: parent.width - 172px;
-                                text: card.source + "  ·  " + card.relative_time;
-                                color: Theme.text-secondary;
-                                font-size: Theme.metadata-font-size;
-                            }
-
-                            card-touch := TouchArea {
-                                width: parent.width - 144px;
-                                clicked => { card-selection-requested(index); }
-                            }
-
-                            delete-button := Rectangle {
-                                x: parent.width - 138px;
-                                y: (parent.height - self.height) / 2;
-                                width: 36px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: delete-touch.pressed
-                                    ? Theme.accent-bg
-                                    : delete-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-                                border-width: 1px;
-                                border-color: Theme.border-subtle;
-                                ThemedText {
-                                    text: card.delete_pending ? "…" : "删";
-                                    color: delete-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    font-size: card.delete_pending ? Theme.pending-font-size : Theme.button-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                delete-touch := TouchArea {
-                                    enabled: !history-mutation-pending && !card.delete_pending;
-                                    clicked => {
-                                        if (!history-mutation-pending && !card.delete_pending) {
-                                            delete-item-requested(index);
-                                        }
-                                    }
-                                }
-                            }
-
-                            pin-button := Rectangle {
-                                x: parent.width - 94px;
-                                y: (parent.height - self.height) / 2;
-                                width: 36px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: pin-touch.pressed
-                                    ? Theme.accent-bg
-                                    : pin-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-                                border-width: 1px;
-                                border-color: card.is_pinned ? Theme.border-selected : Theme.border-subtle;
-                                if card.pin_pending: ThemedText {
-                                    text: "…";
-                                    color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    font-size: Theme.pending-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                if !card.pin_pending && card.is_pinned: PinFilledIcon {
-                                    size: 16px;
-                                    icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                                if !card.pin_pending && !card.is_pinned: PinOutlineIcon {
-                                    size: 16px;
-                                    icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                }
-                                pin-touch := TouchArea {
-                                    enabled: !history-mutation-pending && !card.pin_pending;
-                                    clicked => {
-                                        if (!history-mutation-pending && !card.pin_pending) {
-                                            pin-item-requested(index);
-                                        }
-                                    }
-                                }
-                            }
-
-                            copy-button := Rectangle {
-                                x: parent.width - 50px;
-                                y: (parent.height - self.height) / 2;
-                                width: 44px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: copy-touch.pressed
-                                    ? Theme.accent-bg
-                                    : copy-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-                                border-width: 1px;
-                                border-color: Theme.border-subtle;
-                                ThemedText {
-                                    text: "复制";
-                                    color: copy-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    font-size: Theme.button-font-size;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                copy-touch := TouchArea {
-                                    enabled: card.copy_enabled;
-                                    clicked => {
-                                        if (card.copy_enabled) { copy-item-requested(index); }
-                                    }
-                                }
-                            }
+                            height: parent.height;
+                            card: card;
+                            card-index: index;
+                            selected: index == selected-index;
+                            mutation-pending: history-mutation-pending;
+                            row-selected(index) => { card-selection-requested(index); }
+                            row-copied(index) => { copy-item-requested(index); }
+                            row-pinned(index) => { pin-item-requested(index); }
+                            row-deleted(index) => { delete-item-requested(index); }
                         }
                     }
                 }

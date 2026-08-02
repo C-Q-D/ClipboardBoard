@@ -3,6 +3,10 @@
 //! 测试只采样窗口背景、shell 表面和真实卡片绘制，不读取源码字符串，也不访问剪贴板、
 //! 数据库或默认应用目录；卡片只使用受限摘要和安全默认字段。
 
+use clipboard_board::app::set_window_commit;
+use clipboard_board::command::{
+    UiClipboardItem, UiClipboardItemKind, WindowCommitBuilder, WindowCommitPayload, WindowOffset,
+};
 use clipboard_board::{create_app_window, ClipboardCard};
 use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
 use slint::platform::{PointerEventButton, WindowEvent};
@@ -138,4 +142,98 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         first_card_pixels > 1_000,
         "首张真实卡片没有在历史区域顶部形成连续表面，仅发现 {first_card_pixels} 个像素"
     );
+
+    // UIR-06：legacy 模型与显式 WindowCommit 使用同一摘要、同一选中态和同一点击命中区。
+    window.set_selected_index(0);
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    let legacy_selected_snapshot = window
+        .window()
+        .take_snapshot()
+        .expect("legacy 选中态快照失败");
+    let legacy_selected_pixels = surface_pixels(
+        &legacy_selected_snapshot,
+        28,
+        328,
+        200,
+        400,
+        [43, 41, 54, 255],
+    );
+
+    let item = UiClipboardItem {
+        id: 1,
+        preview: "首条真实卡片".to_owned(),
+        source: "shell 测试".to_owned(),
+        relative_time: "刚刚".to_owned(),
+        content_hash: [3; 32],
+        copy_count: 0,
+        is_pinned: false,
+        kind: UiClipboardItemKind::Text,
+    };
+    let mut builder = WindowCommitBuilder::new(12, 1, 1).expect("测试 nonce 必须非零");
+    assert!(builder.set_window(WindowCommitPayload {
+        start: 0,
+        total_count: 1,
+        total_height: 106,
+        visible_height: 246,
+        clamped_viewport_y: 0,
+        origin_token: Some(9),
+        cards: vec![item],
+        offsets: vec![WindowOffset {
+            absolute_index: 0,
+            id: 1,
+            content_hash: [3; 32],
+            top: 0,
+            height: 106,
+        }],
+    }));
+    assert!(builder.ready());
+    let commit = builder.publish_commit_stamp().expect("应发布窗口提交");
+
+    let geometry = create_app_window().expect("geometry 测试窗口应成功创建");
+    geometry.set_selected_index(0);
+    assert!(set_window_commit(&geometry, commit));
+    geometry.show().expect("geometry 测试窗口应成功显示");
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    let geometry_snapshot = geometry
+        .window()
+        .take_snapshot()
+        .expect("geometry 选中态快照失败");
+    let geometry_selected_pixels =
+        surface_pixels(&geometry_snapshot, 28, 328, 200, 400, [43, 41, 54, 255]);
+
+    assert!(
+        legacy_selected_pixels > 1_000,
+        "legacy 选中表面像素不足：{legacy_selected_pixels}"
+    );
+    assert!(
+        geometry_selected_pixels > 1_000,
+        "geometry 选中表面像素不足：{geometry_selected_pixels}"
+    );
+    assert_eq!(
+        legacy_selected_pixels, geometry_selected_pixels,
+        "双路径共享视觉的选中表面像素必须一致"
+    );
+    assert_eq!(geometry.get_history_model_length(), 1);
+    assert!(geometry.get_history_visible_height() > 0.0);
+    assert_eq!(
+        geometry.get_history_legacy_visible_height(),
+        0.0,
+        "geometry 模式隐藏的 legacy ListView 不能占用高度"
+    );
+
+    let legacy_selected = Rc::new(RefCell::new(Vec::new()));
+    let legacy_selected_for_callback = Rc::clone(&legacy_selected);
+    window.on_card_selection_requested(move |index| {
+        legacy_selected_for_callback.borrow_mut().push(index);
+    });
+    let geometry_selected = Rc::new(RefCell::new(Vec::new()));
+    let geometry_selected_for_callback = Rc::clone(&geometry_selected);
+    geometry.on_card_selection_requested(move |index| {
+        geometry_selected_for_callback.borrow_mut().push(index);
+    });
+    // 290px 位于两条路径首行共同的内容中心，避开路径外层的 12px sibling 间距。
+    click(&window, 100.0, 290.0);
+    click(&geometry, 100.0, 290.0);
+    assert_eq!(legacy_selected.borrow().as_slice(), &[0]);
+    assert_eq!(geometry_selected.borrow().as_slice(), &[0]);
 }

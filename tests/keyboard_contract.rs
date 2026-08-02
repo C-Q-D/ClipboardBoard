@@ -1,7 +1,7 @@
 //! 此集成测试验证面板级键盘捕获先于搜索框等内部控件执行。
 //!
 //! 测试验证 WCB-INT-01 的键盘契约，以及 WCB-INT-03 的失焦驻留和原生关闭拒绝；
-//! 不涉及窗口置顶、鼠标卡片或后续分页行为。
+//! 上下键不得改变当前选择，Enter 组合不得触发复制，Esc 仍负责关闭面板。
 
 use clipboard_board::{app::bind_app_window, create_app_window};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
@@ -53,7 +53,7 @@ fn send_text(window: &clipboard_board::AppWindow, text: &str) {
     }
 }
 
-/// 验证搜索框持有焦点时，Esc 与上下键仍由面板处理，所有 Enter 组合均无动作。
+/// 验证搜索框持有焦点时，Esc 与 Enter 仍由面板处理；上下键不再改变选择。
 #[test]
 fn 内部焦点遵守面板级键盘契约() {
     i_slint_backend_testing::init_integration_test_with_mock_time();
@@ -66,10 +66,10 @@ fn 内部焦点遵守面板级键盘契约() {
         dismiss_count_for_callback.set(dismiss_count_for_callback.get() + 1);
     });
 
-    let selection_moves = Rc::new(RefCell::new(Vec::new()));
-    let selection_moves_for_callback = Rc::clone(&selection_moves);
-    window.on_selection_move_requested(move |delta| {
-        selection_moves_for_callback.borrow_mut().push(delta);
+    let copy_count = Rc::new(Cell::new(0_u32));
+    let copy_count_for_callback = Rc::clone(&copy_count);
+    window.on_copy_item_requested(move |_| {
+        copy_count_for_callback.set(copy_count_for_callback.get() + 1);
     });
 
     let edited_text = Rc::new(RefCell::new(String::new()));
@@ -78,6 +78,8 @@ fn 内部焦点遵守面板级键盘契约() {
         *edited_text_for_callback.borrow_mut() = text.to_string();
     });
 
+    // 用可观察的窗口属性固定一个当前鼠标选择结果；箭头键只能交回焦点控件，不能改写它。
+    window.set_selected_index(1);
     window.show().expect("测试窗口应成功显示");
     window
         .window()
@@ -92,9 +94,22 @@ fn 内部焦点遵守面板级键盘契约() {
 
     send_key(&window, Key::Return);
     let control: SharedString = Key::Control.into();
+    let shift: SharedString = Key::Shift.into();
     let enter: SharedString = Key::Return.into();
     window.window().dispatch_event(WindowEvent::KeyPressed {
         text: control.clone(),
+    });
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: enter.clone(),
+    });
+    window.window().dispatch_event(WindowEvent::KeyReleased {
+        text: enter.clone(),
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyReleased { text: control });
+    window.window().dispatch_event(WindowEvent::KeyPressed {
+        text: shift.clone(),
     });
     window.window().dispatch_event(WindowEvent::KeyPressed {
         text: enter.clone(),
@@ -104,14 +119,15 @@ fn 内部焦点遵守面板级键盘契约() {
         .dispatch_event(WindowEvent::KeyReleased { text: enter });
     window
         .window()
-        .dispatch_event(WindowEvent::KeyReleased { text: control });
+        .dispatch_event(WindowEvent::KeyReleased { text: shift });
     assert_eq!(dismiss_count.get(), 0);
-    assert!(selection_moves.borrow().is_empty());
+    assert_eq!(copy_count.get(), 0);
     assert_eq!(edited_text.borrow().as_str(), "x");
 
     send_key(&window, Key::UpArrow);
     send_key(&window, Key::DownArrow);
-    assert_eq!(selection_moves.borrow().as_slice(), &[-1, 1]);
+    assert_eq!(window.get_selected_index(), 1);
+    assert_eq!(edited_text.borrow().as_str(), "x");
 
     send_key(&window, Key::Escape);
     assert_eq!(dismiss_count.get(), 1);

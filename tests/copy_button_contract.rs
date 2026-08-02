@@ -47,6 +47,14 @@ fn card(label: &str) -> ClipboardCard {
         is_pinned: false,
         pin_pending: false,
         delete_pending: false,
+        // 复制按钮契约只覆盖文本卡片；图片字段使用安全默认值，不把原图带入测试窗口。
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 
@@ -77,8 +85,9 @@ fn 复制按钮命中区独立且面板按键契约不变() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    click(&window, 508.0, 260.0);
-    click(&window, 508.0, 366.0);
+    // 文本行已固定为 78px；点击两个按钮的垂直中心，避免使用旧 106px 行高边界。
+    click(&window, 280.0, 280.0);
+    click(&window, 280.0, 358.0);
     assert_eq!(copies.borrow().as_slice(), &[0, 1]);
     assert!(selections.borrow().is_empty());
 

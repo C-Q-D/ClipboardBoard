@@ -58,8 +58,6 @@ component HistoryCard inherits Rectangle {
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次确保只有当前会话的 Esc 可以隐藏。
     callback panel-dismiss-requested();
-    // 上下键只发出方向请求，选择状态和边界夹紧由 Rust UI reducer 统一处理。
-    callback selection-move-requested(delta: int);
     // 点击卡片只把当前可见索引交给 Rust；Rust 必须在 UI 线程同步解析稳定记录身份。
     callback card-selection-requested(index: int);
     // 复制按钮只发送当前可见索引；正文读取和系统剪贴板写回只能在后台执行。
@@ -118,7 +116,7 @@ export component AppWindow inherits Window {
     in property <bool> geometry-events-suppressed: false;
     in property <int> window-start: 0;
     in property <int> window-length: 0;
-    // 鼠标与键盘共用同一选中索引；负数表示当前没有选中卡片。
+    // 鼠标选择与快照恢复共用同一选中索引；负数表示当前没有选中卡片。
     in property <int> selected-index: -1;
     // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
     in-out property <string> search-text: "";
@@ -172,17 +170,11 @@ export component AppWindow inherits Window {
     }
 
     panel-focus := FocusScope {
-        // 捕获阶段先于搜索框等内部控件执行，确保 Esc 和选择键不会因子控件消费而失效。
-        // 所有 Enter 组合都在这里静默消费；复制只允许由后续卡片按钮显式触发。
+        // 捕获阶段先于搜索框等内部控件执行，确保 Esc 与 Enter 不会因子控件消费而失效。
+        // 上下键拒绝后交回当前焦点控件；它们不再进入业务事件，复制只允许由卡片按钮触发。
         capture-key-pressed(event) => {
             if (event.text == Key.Escape) {
                 panel-dismiss-requested();
-                accept
-            } else if (event.text == Key.UpArrow) {
-                selection-move-requested(-1);
-                accept
-            } else if (event.text == Key.DownArrow) {
-                selection-move-requested(1);
                 accept
             } else if (event.text == Key.Return) {
                 accept
@@ -767,7 +759,7 @@ export component AppWindow inherits Window {
                 }
 
                 ThemedText {
-                    text: "↑↓ 选择    Esc 关闭";
+                    text: "Esc 关闭到托盘";
                     color: Theme.text-secondary;
                     font-size: Theme.shortcut-font-size;
                     font-weight: Theme.font-weight-medium;

@@ -652,8 +652,6 @@ pub enum UiEvent {
     },
     /// 用户点击固定失败提示后显式重试当前游标。
     RetryHistoryPage,
-    /// 请求 UI reducer 按方向移动当前首批卡片的选中索引；只允许来自 UI 线程键盘回调。
-    MoveSelection { delta: i32 },
     /// 请求选中一次点击时解析出的稳定记录身份；异步应用时必须重新校验面板代次和内容身份。
     SelectItem {
         /// 点击发生时的面板打开代次，旧会话事件必须被拒绝。

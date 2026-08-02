@@ -81,8 +81,6 @@ enum UiAction {
     Show,
     /// 面板已经可见时重新显示并申请激活，不创建新会话或重置任何状态。
     Reassert,
-    /// 选择索引已变化，需要在 UI 线程调整当前卡片视口。
-    ScrollSelection,
     /// 鼠标已经选择一张当前卡片，只同步选中视觉，不改变列表视口。
     SelectItem,
     /// 请求将按钮身份对应的记录排入后台复制邮箱；不隐藏面板也不重建模型。
@@ -617,14 +615,6 @@ impl UiState {
                     self.request_next_history_page();
                 }
                 UiAction::None
-            }
-            UiEvent::MoveSelection { delta } => {
-                // 面板隐藏后拒绝迟到的键盘事件，避免旧事件改变下一轮打开时的选择状态。
-                if !self.panel_visible {
-                    return UiAction::None;
-                }
-                self.move_selection(delta);
-                UiAction::ScrollSelection
             }
             UiEvent::SelectItem {
                 panel_generation,
@@ -1663,29 +1653,6 @@ impl UiState {
         );
     }
 
-    /// 在当前窗口已构造的首批范围内按一步移动选择，边界处保持原索引。
-    fn move_selection(&mut self, delta: i32) {
-        let limit = selection_limit(&self.snapshot);
-        if limit == 0 {
-            self.snapshot.selected_index = None;
-            return;
-        }
-
-        let current = self
-            .snapshot
-            .selected_index
-            .unwrap_or(0)
-            .min(limit.saturating_sub(1));
-        let next = if delta < 0 {
-            current.saturating_sub(1)
-        } else if delta > 0 {
-            current.saturating_add(1).min(limit.saturating_sub(1))
-        } else {
-            current
-        };
-        self.snapshot.selected_index = Some(next);
-    }
-
     /// 返回当前打开代次，回调据此生成不会误伤新面板的关闭事件。
     fn panel_generation(&self) -> u64 {
         self.panel_generation
@@ -1823,12 +1790,6 @@ pub fn bind_app_window(window: &AppWindow) {
     window
         .window()
         .on_close_requested(|| CloseRequestResponse::KeepWindowShown);
-
-    window.on_selection_move_requested(|delta| {
-        if let Err(error) = post_ui_event(UiEvent::MoveSelection { delta }) {
-            eprintln!("键盘选择事件无法进入 UI 事件队列：{error}");
-        }
-    });
 
     window.on_card_selection_requested(|index| {
         // Slint 回调与 UI reducer 位于同一线程；在事件排队前立刻把易变索引解析成稳定身份。
@@ -2136,8 +2097,8 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
         } else {
             None
         };
-        // 选择事件只改变 reducer 索引和视口，不能重建 VecModel；否则每次上下键都会
-        // 让 ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
+        // 鼠标选择事件只改变 reducer 索引，不能重建 VecModel；否则每次点击都会让
+        // ListView 重新创建卡片，破坏滚动连续性并把模型生命周期混入选择逻辑。
         let may_refresh_model = event_may_refresh_model(&event);
         let history_result_event = matches!(&event, UiEvent::HistoryQueryWake);
         let (
@@ -2410,11 +2371,10 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     .and_then(|index| i32::try_from(index).ok())
                     .unwrap_or(-1),
             );
-            if (refresh_model
+            if refresh_model
                 && !thumbnail_applied
                 && !preserve_append_viewport
-                && !preserve_thumbnail_viewport)
-                || action == UiAction::ScrollSelection
+                && !preserve_thumbnail_viewport
             {
                 ensure_selection_visible(&window, &snapshot);
             }
@@ -2486,7 +2446,6 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                         eprintln!("无法隐藏剪贴板看板：{error}");
                     }
                 }
-                UiAction::ScrollSelection => {}
                 UiAction::SelectItem => {}
                 UiAction::QueueCopy { .. } => {}
                 UiAction::QueuePin(_) => {}
@@ -2585,8 +2544,7 @@ fn schedule_post_append_probe(window: slint::Weak<AppWindow>, append_revision: u
 fn event_may_refresh_model(event: &UiEvent) -> bool {
     !matches!(
         event,
-        UiEvent::MoveSelection { .. }
-            | UiEvent::ThumbnailLoaded(_)
+        UiEvent::ThumbnailLoaded(_)
             | UiEvent::SelectItem { .. }
             | UiEvent::CopyItem { .. }
             | UiEvent::HistoryViewportChanged { .. }
@@ -4863,19 +4821,16 @@ mod tests {
         );
     }
 
-    /// 第 31 条以后的卡片仍可被鼠标选择、键盘到达并生成稳定复制动作。
+    /// 第 31 条以后的卡片仍可由稳定身份直接选择并生成复制动作。
     #[test]
     fn 跨页卡片保持完整选择和复制能力() {
         let mut state = UiState::default();
         state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
             items: (0..85).map(test_item).collect(),
-            selected_index: Some(0),
+            selected_index: Some(84),
         }));
         state.apply(UiEvent::OpenPanel);
         let generation = state.panel_generation();
-        for _ in 0..84 {
-            state.apply(UiEvent::MoveSelection { delta: 1 });
-        }
         assert_eq!(state.snapshot.selected_index, Some(84));
         assert_eq!(
             state.apply(UiEvent::CopyItem {
@@ -5016,11 +4971,10 @@ mod tests {
         let mut state = UiState::default();
         state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
             items: vec![test_item(0), test_item(1)],
-            selected_index: None,
+            selected_index: Some(1),
         }));
         state.apply(UiEvent::OpenPanel);
         let _ = state.take_pending_history_request();
-        state.apply(UiEvent::MoveSelection { delta: 1 });
         state.apply_at(UiEvent::SearchTextChanged("条目".to_owned()), start);
         let before = state.snapshot();
 
@@ -5301,7 +5255,7 @@ mod tests {
         assert_eq!(state.snapshot.selected_index, Some(0));
     }
 
-    /// 鼠标点击携带的稳定身份必须选中对应卡片，并与键盘共用同一个选中索引。
+    /// 鼠标点击携带的稳定身份必须选中对应卡片，并保持在快照的选中索引中。
     #[test]
     fn 鼠标按稳定身份选择卡片() {
         let mut state = UiState::default();
@@ -5322,8 +5276,7 @@ mod tests {
         );
         assert_eq!(state.snapshot.selected_index, Some(2));
 
-        state.apply(UiEvent::MoveSelection { delta: -1 });
-        assert_eq!(state.snapshot.selected_index, Some(1));
+        assert_eq!(state.snapshot.selected_index, Some(2));
     }
 
     /// 点击索引必须在排队前解析为当前面板代次、记录 ID 和内容哈希三元身份。
@@ -5536,7 +5489,6 @@ mod tests {
         }));
         state.apply(UiEvent::OpenPanel);
         let _ = state.take_pending_history_request();
-        state.apply(UiEvent::MoveSelection { delta: 1 });
 
         assert!(matches!(
             state.apply_at(UiEvent::SearchFilterChanged(SearchFilter::Pinned), start,),
@@ -5748,58 +5700,6 @@ mod tests {
         );
         assert_eq!(super::resolve_copy_item(-1), None);
         assert_eq!(super::resolve_copy_item(2), None);
-    }
-
-    /// 空历史不应因为上下键产生伪造的索引。
-    #[test]
-    fn 空列表上下键保持无选择() {
-        let mut state = UiState::default();
-        state.apply(UiEvent::OpenPanel);
-
-        assert_eq!(
-            state.apply(UiEvent::MoveSelection { delta: 1 }),
-            UiAction::ScrollSelection
-        );
-        assert_eq!(state.snapshot.selected_index, None);
-        state.apply(UiEvent::MoveSelection { delta: -1 });
-        assert_eq!(state.snapshot.selected_index, None);
-    }
-
-    /// 面板隐藏后到达的迟到选择事件不能污染下一轮打开时的状态。
-    #[test]
-    fn 隐藏面板忽略迟到选择事件() {
-        let mut state = UiState::default();
-        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
-            items: vec![test_item(0), test_item(1)],
-            selected_index: None,
-        }));
-
-        assert_eq!(
-            state.apply(UiEvent::MoveSelection { delta: 1 }),
-            UiAction::None
-        );
-        assert_eq!(state.snapshot.selected_index, None);
-    }
-
-    /// 连续上下键只能在当前首批范围内移动，不能越过两端。
-    #[test]
-    fn 三十条边界不越界() {
-        let mut state = UiState::default();
-        state.apply(UiEvent::ReplaceSnapshot(UiSnapshot {
-            items: (0..UI_FIRST_BATCH_SIZE).map(test_item).collect(),
-            selected_index: None,
-        }));
-        state.apply(UiEvent::OpenPanel);
-
-        for _ in 0..(UI_FIRST_BATCH_SIZE + 10) {
-            state.apply(UiEvent::MoveSelection { delta: 1 });
-        }
-        assert_eq!(state.snapshot.selected_index, Some(UI_FIRST_BATCH_SIZE - 1));
-
-        for _ in 0..(UI_FIRST_BATCH_SIZE + 10) {
-            state.apply(UiEvent::MoveSelection { delta: -1 });
-        }
-        assert_eq!(state.snapshot.selected_index, Some(0));
     }
 
     /// 快照中存在首批以后的合法旧索引时，恢复逻辑必须保留该选择。

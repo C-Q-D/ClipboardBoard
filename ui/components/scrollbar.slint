@@ -1,0 +1,90 @@
+// ClipboardBoard 的主题化滚动条，只负责把已有 Flickable/ScrollView 的滚动几何呈现为可见控件。
+// value 和 maximum 由调用方的唯一滚动状态绑定；本组件不保存业务索引、正文或分页事实。
+
+import { Theme } from "../theme.slint";
+
+// ThemedScrollBar 复用预览和历史列表的同一拖动、滚轮与 thumb 映射规则。
+export component ThemedScrollBar inherits Rectangle {
+    // enabled 只控制当前滚动路径是否允许命中，不能绕过调用方的业务状态门禁。
+    in property <bool> enabled: true;
+    // value 使用 Flickable 的负向 viewport 坐标；maximum 必须是非负可滚动距离。
+    in-out property <length> value: 0px;
+    in property <length> maximum: 0px;
+    in property <length> page-size: 0px;
+    // track-height 由外层实际视口高度计算，滚动条不参与业务布局测量。
+    in property <length> track-height: 0px;
+
+    property <length> thumb-height:
+        maximum <= 0px
+            ? 0px
+            : max(
+                0px,
+                min(
+                    track-height,
+                    max(
+                        Theme.scrollbar-min-thumb-size,
+                        track-height * page-size / max(page-size + maximum, 1px)
+                    )
+                )
+            );
+    property <length> thumb-travel: max(0px, track-height - thumb-height);
+    property <length> thumb-y:
+        maximum <= 0px || thumb-travel <= 0px
+            ? 0px
+            : (-value / maximum) * thumb-travel;
+
+    width: Theme.scrollbar-width;
+    height: track-height;
+    visible: enabled && maximum > 0px;
+    background: Theme.scrollbar-track;
+    border-radius: Theme.scrollbar-width / 2;
+
+    thumb := Rectangle {
+        x: 1px;
+        y: root.thumb-y;
+        width: parent.width - 2px;
+        height: root.thumb-height;
+        background: Theme.scrollbar-thumb;
+        border-radius: (parent.width - 2px) / 2;
+    }
+
+    // 只在 thumb 上开始拖动，拖动结果仍写回外层 Flickable 的 viewport-y。
+    scrollbar-touch := TouchArea {
+        enabled: root.enabled && root.visible;
+        property <length> pointer-offset: 0px;
+        property <bool> dragging: false;
+
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.dragging = self.mouse-y >= root.thumb-y
+                    && self.mouse-y <= root.thumb-y + root.thumb-height;
+                self.pointer-offset = self.mouse-y - root.thumb-y;
+            }
+        }
+
+        moved => {
+            if (self.enabled && self.pressed && self.dragging && root.thumb-travel > 0px) {
+                root.value = -max(
+                    0px,
+                    min(
+                        root.maximum,
+                        (self.mouse-y - self.pointer-offset)
+                            / root.thumb-travel * root.maximum
+                    )
+                );
+            }
+        }
+
+        scroll-event(event) => {
+            if (event.delta-y != 0) {
+                root.value = max(
+                    -root.maximum,
+                    min(0px, root.value + event.delta-y)
+                );
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+}

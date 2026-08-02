@@ -8,6 +8,7 @@ import { TextButton } from "components/controls.slint";
 import { ClipboardCard, HistoryRowVisual } from "components/history-row.slint";
 import { CleanupPanel } from "components/cleanup-panel.slint";
 import { PreviewPane } from "components/preview-pane.slint";
+import { ThemedScrollBar } from "components/scrollbar.slint";
 export { PrimitiveGallery } from "components/controls.slint";
 
 // ListView 是 Slint 编译器识别的窗口化 Flickable：只有视口附近的重复项会实例化。
@@ -602,6 +603,28 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             overflow: clip;
                         }
+                    }
+
+                    if !geometry-mode: ThemedScrollBar {
+                        // legacy ListView 的滚动位置仍由 ListView 唯一持有，滚动条只提供可见拖动接缝。
+                        x: parent.width - Theme.scrollbar-width;
+                        y: Theme.scrollbar-inset;
+                        track-height: max(0px, parent.height - Theme.scrollbar-inset - Theme.scrollbar-inset);
+                        enabled: !geometry-mode;
+                        maximum: max(0px, history-list.viewport-height - history-list.height);
+                        page-size: history-list.height;
+                        value <=> history-list.viewport-y;
+                    }
+
+                    if geometry-mode: ThemedScrollBar {
+                        // geometry 模式绑定 Rust prefix-sum 的内容高度，拖动后继续走既有分页门禁。
+                        x: parent.width - Theme.scrollbar-width;
+                        y: Theme.scrollbar-inset;
+                        track-height: max(0px, parent.height - Theme.scrollbar-inset - Theme.scrollbar-inset);
+                        enabled: geometry-mode;
+                        maximum: max(0px, geometry-content-height - geometry-history-list.height);
+                        page-size: geometry-history-list.height;
+                        value <=> geometry-history-list.viewport-y;
                     }
                 }
 

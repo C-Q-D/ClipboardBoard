@@ -35,6 +35,26 @@ fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
         });
 }
 
+/// 发送一次真实滚动条 thumb 拖动，验证视觉滚动条会写回当前列表的 viewport-y。
+fn drag(window: &clipboard_board::AppWindow, start: LogicalPosition, end: LogicalPosition) {
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerMoved { position: start });
+    window.window().dispatch_event(WindowEvent::PointerPressed {
+        position: start,
+        button: PointerEventButton::Left,
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerMoved { position: end });
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerReleased {
+            position: end,
+            button: PointerEventButton::Left,
+        });
+}
+
 /// 按软件快照读取单个 RGBA 像素，避免把颜色判断分散到测试主体。
 fn pixel(snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, x: usize, y: usize) -> [u8; 4] {
     let offset = (y * snapshot.width() as usize + x) * 4;
@@ -103,6 +123,21 @@ fn light_pixels(
             alpha == 255 && red > 80 && green > 80 && blue > 80
         })
         .count()
+}
+
+/// 从实际主题令牌读取滚动条 thumb 颜色，避免测试复制第二套视觉常量。
+fn theme_color(name: &str) -> [u8; 3] {
+    let source = include_str!("../ui/theme.slint");
+    let marker = format!("{name}: #");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("主题缺少颜色令牌：{name}"))
+        + marker.len();
+    let hex = &source[start..start + 6];
+    [0, 2, 4].map(|offset| {
+        u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .unwrap_or_else(|_| panic!("主题令牌 {name} 不是合法 RGB：#{hex}"))
+    })
 }
 
 /// 构造单张文本卡片；shell 契约只需要稳定的最小展示数据。
@@ -212,6 +247,40 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         right_surface_pixels > 10_000,
         "右侧预览占位没有形成独立表面：{right_surface_pixels}"
     );
+
+    // 左侧“最近复制”列表出现足够多的卡片时，也必须绘制同一主题 thumb，方便拖动浏览历史。
+    window.set_cards(ModelRc::new(VecModel::from(vec![card(); 8])));
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    let history_snapshot = window.window().take_snapshot().expect("历史滚动条快照失败");
+    let thumb = theme_color("scrollbar-thumb");
+    let thumb_start = (200_usize..488)
+        .flat_map(|y| (276_usize..292).map(move |x| (x, y)))
+        .find(|(x, y)| {
+            let [red, green, blue, _] = pixel(&history_snapshot, *x, *y);
+            [red, green, blue] == thumb
+        })
+        .expect("左侧历史滚动条 thumb 应有真实像素");
+    let history_scrollbar_pixels = (200_usize..488)
+        .flat_map(|y| (276_usize..292).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            let [red, green, blue, _] = pixel(&history_snapshot, *x, *y);
+            [red, green, blue] == thumb
+        })
+        .count();
+    assert!(
+        history_scrollbar_pixels > 20,
+        "左侧历史列表没有绘制可见滚动条，仅发现 {history_scrollbar_pixels} 个 thumb 像素"
+    );
+    drag(
+        &window,
+        LogicalPosition::new(thumb_start.0 as f32, thumb_start.1 as f32 + 10.0),
+        LogicalPosition::new(thumb_start.0 as f32, thumb_start.1 as f32 + 50.0),
+    );
+    assert!(
+        window.get_history_viewport_y() < 0.0,
+        "拖动左侧历史滚动条没有写回负向 viewport-y"
+    );
+    window.set_history_viewport_y(0.0);
 
     let empty_card_pixels =
         solid_surface_pixels(&empty_snapshot, 28, 292, 200, 350, [21, 21, 26, 255]);

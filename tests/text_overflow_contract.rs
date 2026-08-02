@@ -27,6 +27,14 @@ ON CLUSTER default_cluster;"#,
         is_pinned: false,
         pin_pending: false,
         delete_pending: false,
+        // 长文本契约不依赖图片和复制行为，但必须填满当前 UI DTO 的安全默认值。
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 
@@ -39,6 +47,14 @@ fn short_card() -> ClipboardCard {
         is_pinned: false,
         pin_pending: false,
         delete_pending: false,
+        // 间隔采样只关心文本卡片几何，图片字段使用稳定的非图片默认值。
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 

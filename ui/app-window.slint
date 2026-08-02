@@ -336,14 +336,24 @@ export component AppWindow inherits Window {
         }
 
 
-        Rectangle {
-            background: Theme.window-bg;
+        // 唯一内容 shell：窗口背景留在外侧，shell 负责圆角裁剪和连续内容表面。
+        shell := Rectangle {
+            x: Theme.page-inset;
+            y: Theme.page-inset;
+            width: parent.width - Theme.page-inset - Theme.page-inset;
+            height: parent.height - Theme.page-inset - Theme.page-inset;
+            background: Theme.shell-bg;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            border-radius: Theme.shell-radius;
+            clip: true;
 
             VerticalLayout {
-                x: 24px;
-                y: 24px;
-                width: parent.width - 48px;
-                height: parent.height - 48px;
+                // shell 内部保留独立 14px padding；外框尺寸变化不能改写业务布局顺序。
+                x: Theme.page-inset;
+                y: Theme.page-inset;
+                width: parent.width - Theme.page-inset - Theme.page-inset;
+                height: parent.height - Theme.page-inset - Theme.page-inset;
                 spacing: 12px;
 
                 ThemedText {

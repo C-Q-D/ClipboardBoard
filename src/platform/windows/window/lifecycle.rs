@@ -3,8 +3,11 @@
 //! 应用只用 Win32 修正 Slint 窗口的物理位置与尺寸，不保存外部目标窗口，也不向
 //! 其他进程注入键盘输入。
 
+// 资源 ID 由 build.rs 从仓库内受控文本生成；标题栏和托盘必须复用同一资源。
+include!(concat!(env!("OUT_DIR"), "/clipboard_board_resources.rs"));
+
 use std::mem::size_of;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -15,8 +18,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus}
 use windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, FindWindowExW, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    SetForegroundWindow, SetWindowPos, SwitchToThisWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    LoadIconW, SendMessageW, SetForegroundWindow, SetWindowPos, SwitchToThisWindow, ICON_BIG,
+    ICON_SMALL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_SETICON,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 /// 鼠标所在显示器扣除任务栏后的物理工作区。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +53,30 @@ pub(crate) fn move_panel(position: PanelPosition) -> bool {
 /// 在不改变当前位置和尺寸的前提下重新断言 topmost，供重复热键激活路径使用。
 pub(crate) fn reassert_panel_topmost() -> bool {
     set_panel_topmost(None)
+}
+
+/// 将应用资源图标显式设置到 Slint/Winit 创建的真实 HWND；托盘图标不会自动同步到标题栏。
+///
+/// 该函数只使用模块内共享资源句柄，不负责销毁由 Windows 资源表管理的图标；窗口销毁时
+/// Windows 会清理 `WM_SETICON` 的引用。找不到窗口或资源时返回 `false`，不阻断面板显示。
+pub(crate) fn apply_panel_icon() -> bool {
+    let hwnd = find_panel_hwnd();
+    if hwnd.is_null() {
+        return false;
+    }
+    let module = unsafe { GetModuleHandleW(null()) };
+    if module.is_null() {
+        return false;
+    }
+    let icon = unsafe { LoadIconW(module, APP_ICON_RESOURCE_ID as usize as *const u16) };
+    if icon.is_null() {
+        return false;
+    }
+    unsafe {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
+    }
+    true
 }
 
 /// 使用统一的 `HWND_TOPMOST` 调用设置面板层级；`None` 只改变 Z 序。

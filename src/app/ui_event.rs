@@ -41,7 +41,7 @@ use std::time::Instant;
 
 #[cfg(windows)]
 use crate::platform::windows::window::{
-    activate_panel, center_position, cursor_work_area, move_panel, panel_size,
+    activate_panel, apply_panel_icon, center_position, cursor_work_area, move_panel, panel_size,
     reassert_panel_topmost,
 };
 #[cfg(windows)]
@@ -3334,6 +3334,9 @@ fn panel_visible_after_event() -> bool {
 #[cfg(windows)]
 /// 在窗口真正显示后设置物理坐标，避免部分 Windows 后端用默认位置覆盖预定位结果。
 fn position_panel(window: &AppWindow) -> bool {
+    // Slint 窗口的 HWND 在首次 show 后才稳定；每次定位顺便重试标题栏图标，
+    // 这样异步创建窗口时也能在后续激活重试中完成设置。
+    let _ = apply_panel_icon();
     let slint_size = window.window().size();
     let (width, height) = panel_size().unwrap_or((slint_size.width, slint_size.height));
     if let Some(area) = cursor_work_area() {

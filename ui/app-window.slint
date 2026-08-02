@@ -627,13 +627,29 @@ export component AppWindow inherits Window {
                 // metadata 未提供时仍保留旧固定高度 ListView，兼容 ATOM-14R 和旧 set_cards 调用。
                 history-list := ListView {
                     visible: !geometry-mode;
-                    vertical-stretch: 1;
+                    // 两条列表位于同一个 VerticalLayout；隐藏分支必须释放伸展槽，
+                    // 否则旧 ListView 仍会占用一整块高度，把显式列表和首条卡片整体下移。
+                    vertical-stretch: geometry-mode ? 0 : 1;
+                    min-height: geometry-mode ? 0px : 0px;
+                    preferred-height: geometry-mode ? 0px : 0px;
+                    max-height: geometry-mode ? 0px : 100000px;
                     changed viewport-y => {
-                        if (!geometry-mode) { history-viewport-y = self.viewport-y; }
-                        history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                        // legacy 列表隐藏或重排时只释放布局槽，不得把无效视口写回几何列表。
+                        if (!geometry-mode) {
+                            history-viewport-y = self.viewport-y;
+                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                        }
                     }
-                    changed visible-height => { history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, ""); }
-                    changed viewport-height => { history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, ""); }
+                    changed visible-height => {
+                        if (!geometry-mode) {
+                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                        }
+                    }
+                    changed viewport-height => {
+                        if (!geometry-mode) {
+                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                        }
+                    }
                     for card[index] in legacy-cards: Rectangle {
                         // legacy repeater 项必须直接声明固定高度；不要把 HistoryCard 作为根组件，
                         // 否则组件内部布局信息会被 ListView 当成额外行高。
@@ -819,11 +835,15 @@ export component AppWindow inherits Window {
                 // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
                 geometry-history-list := Flickable {
                     visible: geometry-mode;
-                    vertical-stretch: 1;
+                    // 与 legacy ListView 互斥分配伸展空间，避免两者在隐藏状态下同时占位。
+                    vertical-stretch: geometry-mode ? 1 : 0;
+                    min-height: geometry-mode ? 0px : 0px;
+                    preferred-height: geometry-mode ? 0px : 0px;
+                    max-height: geometry-mode ? 100000px : 0px;
                     // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
                     viewport-height: geometry-content-height;
                     changed viewport-y => {
-                        if (!geometry-events-suppressed) {
+                        if (geometry-mode && !geometry-events-suppressed) {
                             history-viewport-y = self.viewport-y;
                             let token = geometry-origin-token;
                             geometry-origin-token = "";
@@ -831,7 +851,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     changed height => {
-                        if (!geometry-events-suppressed) {
+                        if (geometry-mode && !geometry-events-suppressed) {
                             history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
                         }
                     }

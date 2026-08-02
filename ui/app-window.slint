@@ -118,6 +118,9 @@ export component AppWindow inherits Window {
     in property <int> window-length: 0;
     // 鼠标选择与快照恢复共用同一选中索引；负数表示当前没有选中卡片。
     in property <int> selected-index: -1;
+    // 右栏选中投影只由 Rust 完整快照派生；无选择时必须先由 has-selected-card 门禁隐藏。
+    in property <bool> has-selected-card: false;
+    in property <ClipboardCard> selected-card;
     // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
     in-out property <string> search-text: "";
     in-out property <int> search-filter: 0;

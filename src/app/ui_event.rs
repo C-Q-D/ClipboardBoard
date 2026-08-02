@@ -2364,12 +2364,18 @@ pub fn post_ui_event(event: UiEvent) -> Result<(), slint::EventLoopError> {
                     exhausted_append_window = Some(window.as_weak());
                 }
             }
-            // 选中视觉始终由 reducer 的单一索引驱动；鼠标和键盘不能在 Slint 内另存状态。
+            // 选中视觉和右栏投影都由完整快照的单一索引驱动；Slint 不另存选择事实。
             window.set_selected_index(
                 snapshot
                     .selected_index
                     .and_then(|index| i32::try_from(index).ok())
                     .unwrap_or(-1),
+            );
+            set_selected_card_projection(
+                &window,
+                &snapshot,
+                pending_pin_mutation.as_ref(),
+                pending_delete_mutation.as_ref(),
             );
             if refresh_model
                 && !thumbnail_applied
@@ -3044,6 +3050,50 @@ fn to_slint_card(
     }
 }
 
+/// 返回完整快照中的当前选中项；不读取 WindowCommit 的局部索引或 Slint 展示字段。
+fn selected_item_from_snapshot(snapshot: &UiSnapshot) -> Option<&UiClipboardItem> {
+    let selected_index = snapshot.selected_index?;
+    if selected_index >= selection_limit(snapshot) {
+        return None;
+    }
+    snapshot.items.get(selected_index)
+}
+
+/// 构造无选择时的安全投影；has-selected-card=false 时右栏不得读取其中任何字段。
+fn empty_slint_card() -> crate::ClipboardCard {
+    crate::ClipboardCard {
+        preview: SharedString::default(),
+        source: SharedString::default(),
+        relative_time: SharedString::default(),
+        is_pinned: false,
+        pin_pending: false,
+        delete_pending: false,
+        is_image: false,
+        copy_enabled: false,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: slint::Image::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
+    }
+}
+
+/// 从完整快照同步选中投影；先关闭门禁再替换 DTO，避免异步刷新期间暴露旧身份。
+fn set_selected_card_projection(
+    window: &AppWindow,
+    snapshot: &UiSnapshot,
+    pending_pin: Option<&PinMutationRequest>,
+    pending_delete: Option<&DeleteMutationRequest>,
+) {
+    let selected_card = selected_item_from_snapshot(snapshot)
+        .map(|item| to_slint_card(item, pending_pin, pending_delete));
+    let has_selected_card = selected_card.is_some();
+
+    window.set_has_selected_card(false);
+    window.set_selected_card(selected_card.unwrap_or_else(empty_slint_card));
+    window.set_has_selected_card(has_selected_card);
+}
+
 /// 将 Slint length 量化为有限整数像素；NaN/Infinity/越界输入直接丢弃。
 fn quantize_slint_length(value: f32) -> Option<i64> {
     if !value.is_finite() {
@@ -3457,6 +3507,28 @@ mod tests {
             height: 200,
         });
         item
+    }
+
+    /// 选中投影必须按完整快照的绝对索引解析，并在无选择或越界时安全关闭。
+    #[test]
+    fn 选中投影只来自完整快照() {
+        let snapshot = UiSnapshot {
+            items: (0..85).map(test_item).collect(),
+            selected_index: Some(84),
+        };
+
+        let selected =
+            super::selected_item_from_snapshot(&snapshot).expect("完整快照中的选中项应存在");
+        assert_eq!(selected.id, 85);
+        assert_eq!(selected.preview, "条目-84");
+
+        let mut no_selection = snapshot.clone();
+        no_selection.selected_index = None;
+        assert!(super::selected_item_from_snapshot(&no_selection).is_none());
+
+        let mut out_of_range = snapshot;
+        out_of_range.selected_index = Some(85);
+        assert!(super::selected_item_from_snapshot(&out_of_range).is_none());
     }
 
     /// 将测试摘要包装成带存储修订号的持久化捕获事件。

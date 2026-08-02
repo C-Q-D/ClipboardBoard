@@ -1,11 +1,32 @@
-//! 此集成测试用真实软件渲染验证 UIR-03 的连续外框和列表首项几何。
+//! 此集成测试用真实软件渲染验证 UIR-03 的连续外框、UIR-05 的双栏边界和列表首项几何。
 //!
 //! 测试只采样窗口背景、shell 表面和真实卡片绘制，不读取源码字符串，也不访问剪贴板、
 //! 数据库或默认应用目录；卡片只使用受限摘要和安全默认字段。
 
 use clipboard_board::{create_app_window, ClipboardCard};
 use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::platform::{PointerEventButton, WindowEvent};
+use slint::{ComponentHandle, LogicalPosition, ModelRc, SharedString, VecModel};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// 在指定逻辑坐标发送一次完整左键点击，验证筛选和历史卡片都走真实 TouchArea。
+fn click(window: &clipboard_board::AppWindow, x: f32, y: f32) {
+    let position = LogicalPosition::new(x, y);
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    window.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Left,
+    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+}
 
 /// 按软件快照读取单个 RGBA 像素，避免把颜色判断分散到测试主体。
 fn pixel(snapshot: &slint::SharedPixelBuffer<slint::Rgba8Pixel>, x: usize, y: usize) -> [u8; 4] {
@@ -53,7 +74,7 @@ fn card() -> ClipboardCard {
     }
 }
 
-/// 空历史保留窗口外框；填充一张卡片后首项直接出现在同一历史槽顶部。
+/// 空历史保留窗口外框；四个筛选可命中；填充卡片后首项位于左栏历史槽顶部。
 #[test]
 fn 连续外框隔离窗口背景且首项没有整卡空白() {
     slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
@@ -64,18 +85,46 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     .expect("测试平台只能初始化一次");
 
     let window = create_app_window().expect("测试窗口应成功创建");
+    let filters = Rc::new(RefCell::new(Vec::new()));
+    let filters_for_callback = Rc::clone(&filters);
+    window.on_search_filter_requested(move |filter| {
+        filters_for_callback.borrow_mut().push(filter);
+    });
     window.show().expect("测试窗口应成功显示");
     let empty_snapshot = window.window().take_snapshot().expect("空历史快照失败");
 
+    assert_eq!(empty_snapshot.width(), 720);
+    assert_eq!(empty_snapshot.height(), 520);
+
     // #09090B 是窗口外背景；#101014 是 shell 内表面，采样点避开边框和文字。
-    for (x, y) in [(0, 0), (559, 0), (0, 639), (559, 639)] {
+    for (x, y) in [(0, 0), (719, 0), (0, 519), (719, 519)] {
         assert_eq!(pixel(&empty_snapshot, x, y), [9, 9, 11, 255]);
     }
     assert_eq!(pixel(&empty_snapshot, 7, 320), [9, 9, 11, 255]);
     assert_eq!(pixel(&empty_snapshot, 20, 20), [16, 16, 20, 255]);
-    assert_eq!(pixel(&empty_snapshot, 520, 620), [16, 16, 20, 255]);
+    assert_eq!(pixel(&empty_snapshot, 700, 500), [16, 16, 20, 255]);
 
-    let empty_card_pixels = surface_pixels(&empty_snapshot, 28, 532, 180, 330, [21, 21, 26, 255]);
+    // 左栏四项筛选位于全局 x=28..308、y=94..130；索引顺序必须原样透传。
+    for x in [60.0, 132.0, 204.0, 276.0] {
+        click(&window, x, 112.0);
+    }
+    assert_eq!(filters.borrow().as_slice(), &[0, 1, 2, 3]);
+    assert!(!filters.borrow().is_empty(), "筛选契约必须真实执行至少一次");
+
+    // 300px 左栏与右侧占位之间必须有连续 1px 分隔线，不能互相覆盖。
+    let divider_pixels = surface_pixels(&empty_snapshot, 328, 329, 94, 488, [42, 41, 49, 255]);
+    assert!(
+        divider_pixels > 300,
+        "左右栏分隔线绘制不足：{divider_pixels}"
+    );
+    let right_surface_pixels =
+        surface_pixels(&empty_snapshot, 340, 692, 110, 488, [21, 21, 26, 255]);
+    assert!(
+        right_surface_pixels > 10_000,
+        "右侧预览占位没有形成独立表面：{right_surface_pixels}"
+    );
+
+    let empty_card_pixels = surface_pixels(&empty_snapshot, 28, 328, 200, 350, [21, 21, 26, 255]);
     assert_eq!(
         empty_card_pixels, 0,
         "空历史不能用透明卡片或整卡占位，发现 {empty_card_pixels} 个卡片表面像素"
@@ -84,7 +133,7 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     window.set_cards(ModelRc::new(VecModel::from(vec![card()])));
     i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
     let filled_snapshot = window.window().take_snapshot().expect("首项快照失败");
-    let first_card_pixels = surface_pixels(&filled_snapshot, 28, 532, 180, 330, [21, 21, 26, 255]);
+    let first_card_pixels = surface_pixels(&filled_snapshot, 28, 328, 200, 350, [21, 21, 26, 255]);
     assert!(
         first_card_pixels > 1_000,
         "首张真实卡片没有在历史区域顶部形成连续表面，仅发现 {first_card_pixels} 个像素"

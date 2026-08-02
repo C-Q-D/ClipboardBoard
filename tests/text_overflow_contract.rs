@@ -75,13 +75,13 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
     window.show().expect("测试窗口应成功显示");
 
     let snapshot = window.window().take_snapshot().expect("软件渲染快照失败");
-    assert_eq!(snapshot.width(), 560);
-    assert_eq!(snapshot.height(), 640);
+    assert_eq!(snapshot.width(), 720);
+    assert_eq!(snapshot.height(), 520);
     let pixels = snapshot.as_bytes();
     let stride = snapshot.width() as usize * 4;
-    // 开头空行之后的 `/*` 和首行正文应在 253～286px 留下足够浅色字形。
+    // 开头空行之后的 `/*` 和首行正文应在 287～320px 留下足够浅色字形。
     // 旧实现用 elide 只留下 `/*...`，该区域像素过少，因此能精确捕获用户截图。
-    let continuation_pixels = (253_usize..287)
+    let continuation_pixels = (287_usize..321)
         .flat_map(|y| (38_usize..380).map(move |x| (x, y)))
         .filter(|(x, y)| {
             let offset = y * stride + x * 4;
@@ -93,9 +93,10 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
         "短首行后的正文没有显示，后续区域只有 {continuation_pixels} 个浅色像素"
     );
 
-    // 当前固定布局中首张卡片底边约为 320px，随后是 10px 透明间隔。
-    let light_pixels = (321_usize..329)
-        .flat_map(|y| (38_usize..420).map(move |x| (x, y)))
+    // 720×520 双栏布局中首张卡片边框位于 344px，第二张从 355px 开始；
+    // 只扫描左栏内的 10px 透明间隔，避免把右侧预览边界纳入文本越界判定。
+    let light_pixels = (345_usize..355)
+        .flat_map(|y| (38_usize..328).map(move |x| (x, y)))
         .filter(|(x, y)| {
             let offset = y * stride + x * 4;
             pixels[offset] > 120 && pixels[offset + 1] > 120 && pixels[offset + 2] > 120

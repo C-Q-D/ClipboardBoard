@@ -14,14 +14,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTOPRIMARY,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOPMOST;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, FindWindowExW, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    LoadIconW, SendMessageW, SetForegroundWindow, SetWindowPos, SwitchToThisWindow, ICON_BIG,
-    ICON_SMALL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_SETICON,
+    BringWindowToTop, FindWindowExW, GetCursorPos, GetForegroundWindow, GetWindowRect, LoadIconW,
+    SendMessageW, SetForegroundWindow, SetWindowPos, SwitchToThisWindow, ICON_BIG, ICON_SMALL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_SETICON,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 /// 鼠标所在显示器扣除任务栏后的物理工作区。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,8 +246,8 @@ mod tests {
             bottom: 1000,
         };
         assert_eq!(
-            center_position(area, 560, 640),
-            PanelPosition { x: -1240, y: 140 }
+            center_position(area, 720, 520),
+            PanelPosition { x: -1320, y: 200 }
         );
     }
 
@@ -261,7 +261,7 @@ mod tests {
             bottom: 200,
         };
         assert_eq!(
-            center_position(area, 560, 640),
+            center_position(area, 720, 520),
             PanelPosition { x: 100, y: 50 }
         );
     }

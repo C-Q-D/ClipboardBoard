@@ -241,8 +241,8 @@ export component AppWindow inherits Window {
     forward-focus: panel-focus;
 
     title: "ClipboardBoard";
-    width: 560px;
-    height: 640px;
+    width: 720px;
+    height: 520px;
     background: Theme.window-bg;
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
@@ -434,78 +434,114 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // 清理确认和失败提示归入筛选区的可变高度容器；默认状态仍只占 30px，
-                // 避免不可见的零高度控件因外层 spacing 令历史卡片整体下移。
-                VerticalLayout {
-                    height: 30px
-                        + (clear-all-confirmation-visible ? 110px
-                            : clear-unpinned-confirmation-visible ? 56px : 0px)
-                        + ((clear-unpinned-error-visible || clear-all-error-visible) ? 30px : 0px);
-                    spacing: 12px;
+                // 工具栏以下明确分隔左侧历史工作区和右侧只读预览占位；右侧没有输入或滚轮接缝。
+                Rectangle {
+                    // 先让外层 VerticalLayout 分配真实剩余高度，再由内部 HLayout 负责横向分栏；
+                    // 这样右侧占位不会退化为仅按文字计算的底部小块。
+                    height: parent.height;
+                    vertical-stretch: 1;
+                    background: transparent;
 
+                    HorizontalLayout {
+                        width: parent.width;
+                        height: parent.height;
+                        spacing: 0px;
+
+                    // 左栏暂定 300px；其内部列表和状态区共享同一个真实伸展高度。
+                    VerticalLayout {
+                        preferred-width: 300px;
+                        min-width: 300px;
+                        max-width: 300px;
+                        horizontal-stretch: 0;
+                        vertical-stretch: 1;
+                        spacing: 12px;
+
+                        // 清理确认和失败提示归入筛选区的可变高度容器；默认状态包含 36px 筛选行
+                        // 与 30px 清理行，隐藏确认不会让首张卡片获得整卡空白。
+                        VerticalLayout {
+                            height: 78px
+                                + (clear-all-confirmation-visible ? 110px
+                                    : clear-unpinned-confirmation-visible ? 56px : 0px)
+                                + ((clear-unpinned-error-visible || clear-all-error-visible) ? 30px : 0px);
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                height: 36px;
+                                spacing: 8px;
+
+                                Rectangle {
+                                    width: 64px;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: search-filter == 0 ? Theme.border-selected : Theme.border-subtle;
+                                    background: search-filter == 0 ? Theme.surface-selected : Theme.surface-bg;
+                                    TouchArea {
+                                        clicked => { search-filter-requested(0); }
+                                    }
+                                    ThemedText {
+                                        text: "全部";
+                                        color: search-filter == 0 ? Theme.accent-text : Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 64px;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: search-filter == 1 ? Theme.border-selected : Theme.border-subtle;
+                                    background: search-filter == 1 ? Theme.surface-selected : Theme.surface-bg;
+                                    TouchArea {
+                                        clicked => { search-filter-requested(1); }
+                                    }
+                                    ThemedText {
+                                        text: "文本";
+                                        color: search-filter == 1 ? Theme.accent-text : Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 64px;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: search-filter == 2 ? Theme.border-selected : Theme.border-subtle;
+                                    background: search-filter == 2 ? Theme.surface-selected : Theme.surface-bg;
+                                    TouchArea {
+                                        clicked => { search-filter-requested(2); }
+                                    }
+                                    ThemedText {
+                                        text: "图片";
+                                        color: search-filter == 2 ? Theme.accent-text : Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 64px;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: search-filter == 3 ? Theme.border-selected : Theme.border-subtle;
+                                    background: search-filter == 3 ? Theme.surface-selected : Theme.surface-bg;
+                                    TouchArea {
+                                        clicked => { search-filter-requested(3); }
+                                    }
+                                    ThemedText {
+                                        text: "收藏";
+                                        color: search-filter == 3 ? Theme.accent-text : Theme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                    // 清理入口独立成第二行，300px 左栏内仍完整保留两个危险操作。
                     HorizontalLayout {
                         height: 30px;
                         spacing: 8px;
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 0 ? Theme.surface-selected : Theme.surface-bg;
-                            TouchArea {
-                                clicked => { search-filter-requested(0); }
-                            }
-                            ThemedText {
-                                text: "全部";
-                                color: search-filter == 0 ? Theme.accent-text : Theme.text-secondary;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 1 ? Theme.surface-selected : Theme.surface-bg;
-                            TouchArea {
-                                clicked => { search-filter-requested(1); }
-                            }
-                            ThemedText {
-                                text: "文本";
-                                color: search-filter == 1 ? Theme.accent-text : Theme.text-secondary;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 2 ? Theme.surface-selected : Theme.surface-bg;
-                            TouchArea {
-                                clicked => { search-filter-requested(2); }
-                            }
-                            ThemedText {
-                                text: "图片";
-                                color: search-filter == 2 ? Theme.accent-text : Theme.text-secondary;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 3 ? Theme.surface-selected : Theme.surface-bg;
-                            TouchArea {
-                                clicked => { search-filter-requested(3); }
-                            }
-                            ThemedText {
-                                text: "收藏";
-                                color: search-filter == 3 ? Theme.accent-text : Theme.text-secondary;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
 
                         Rectangle {
                             horizontal-stretch: 1;
@@ -674,11 +710,11 @@ export component AppWindow inherits Window {
                                         font-size: Theme.button-font-size;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                }
+            }
+        }
+    }
+}
 
                     ThemedText {
                         visible: clear-unpinned-error-visible || clear-all-error-visible;
@@ -1057,6 +1093,53 @@ export component AppWindow inherits Window {
                     font-weight: Theme.font-weight-medium;
                 }
             }
+
+            // 1px 分隔线是非交互边界，不能承接历史列表的滚轮事件。
+            Rectangle {
+                preferred-width: 1px;
+                min-width: 1px;
+                max-width: 1px;
+                horizontal-stretch: 0;
+                height: parent.height;
+                vertical-stretch: 1;
+                background: Theme.border-subtle;
+            }
+
+            // UIR-05 只建立稳定预览占位；不读取 selected-index，也不注册任何回调。
+            Rectangle {
+                // 左栏 300px 与分隔线 1px 已固定，右栏宽度随 HLayout 客户区剩余量变化。
+                width: parent.width - 300px - 1px;
+                vertical-stretch: 1;
+                background: Theme.surface-bg;
+                border-radius: Theme.control-radius;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+
+                VerticalLayout {
+                    x: 24px;
+                    y: 24px;
+                    width: parent.width - 48px;
+                    height: parent.height - 48px;
+                    spacing: 8px;
+
+                    ThemedText {
+                        text: "内容预览";
+                        color: Theme.text-primary;
+                        font-size: Theme.section-title-font-size;
+                        font-weight: Theme.font-weight-semibold;
+                    }
+                    ThemedText {
+                        text: "选择左侧内容后在这里预览";
+                        color: Theme.text-secondary;
+                        font-size: Theme.preview-font-size;
+                        wrap: word-wrap;
+                        overflow: clip;
+                    }
+                }
+            }
         }
     }
+            }
+        }
+}
 }

@@ -36,6 +36,14 @@ fn card(label: &str) -> ClipboardCard {
         is_pinned: false,
         pin_pending: false,
         delete_pending: false,
+        // 选择边界测试只观察摘要命中，图片和复制字段使用稳定安全默认值。
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 
@@ -57,14 +65,19 @@ fn 卡片点击产生可见索引且空白区无动作() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    // 固定布局中历史列表从约 205px 开始，每张代理高度为 106px。
-    click(&window, 100.0, 240.0);
-    click(&window, 100.0, 346.0);
-    click(&window, 100.0, 452.0);
-    // 第一张卡片后的 10px 透明间隔和右侧预留操作区都不属于选择点击区。
-    click(&window, 100.0, 321.0);
+    // 720×520 双栏布局中左栏历史列表从约 242px 开始，每张代理高度为 106px。
+    click(&window, 100.0, 250.0);
+    click(&window, 100.0, 356.0);
+    // 第一张卡片背景后的 10px 透明间隔和左栏右侧预留操作区都不属于选择点击区。
+    click(&window, 100.0, 349.0);
+    assert_eq!(selected.borrow().as_slice(), &[0, 1]);
+
+    // 视口不足以同时显示第三项时，沿用生产 setter 滚动一个文本行高后再点击末项；
+    // 测试仍验证真实 TouchArea 产生的稳定索引，而不是直接调用选择回调。
+    window.set_history_viewport_y(-106.0);
+    click(&window, 100.0, 370.0);
     assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
-    click(&window, 520.0, 240.0);
+    click(&window, 280.0, 250.0);
 
     assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
 }

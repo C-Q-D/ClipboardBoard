@@ -1,4 +1,5 @@
-//! 此集成测试验证 UIR-04 顶部工具栏的真实绘制、数量语义和搜索框程序回写边界。
+//! 此集成测试验证 UIR-04 顶部工具栏的真实绘制、数量语义和搜索框程序回写边界，
+//! 并同步锁定 UIR-05 的 720×520 工具栏坐标。
 //!
 //! 测试只使用 Slint 软件后端和内存模型，不访问剪贴板、SQLite、窗口定位或真实快捷键；
 //! geometry 模式的 20,000 条逻辑历史只通过受限属性进入界面，实际窗口模型保持有界。
@@ -78,8 +79,8 @@ fn 顶部工具栏显示真实品牌搜索和快捷键提示() {
 
     window.show().expect("顶部工具栏测试窗口应成功显示");
     let snapshot = window.window().take_snapshot().expect("顶部工具栏快照失败");
-    assert_eq!(snapshot.width(), 560);
-    assert_eq!(snapshot.height(), 640);
+    assert_eq!(snapshot.width(), 720);
+    assert_eq!(snapshot.height(), 520);
 
     // 全局坐标叠加 14px 外边距和 14px shell padding；工具栏内容位于 y=28..82。
     assert!(
@@ -87,16 +88,16 @@ fn 顶部工具栏显示真实品牌搜索和快捷键提示() {
         "品牌图标和 ClipboardBoard 文案没有形成真实绘制"
     );
     assert!(
-        non_shell_pixels(&snapshot, 196, 448, 36, 74) > 200,
+        non_shell_pixels(&snapshot, 196, 608, 36, 74) > 200,
         "搜索框没有形成真实绘制区域"
     );
     assert!(
-        non_shell_pixels(&snapshot, 460, 520, 43, 67) > 80,
+        non_shell_pixels(&snapshot, 620, 680, 43, 67) > 80,
         "Alt + V 静态胶囊没有形成真实绘制"
     );
 
     // 工具栏底部 1px 分隔线位于 shell 内全局 y=81；采样宽度证明它不是普通文本下划线。
-    let separator_pixels = non_shell_pixels(&snapshot, 28, 532, 81, 82);
+    let separator_pixels = non_shell_pixels(&snapshot, 28, 692, 81, 82);
     assert!(
         separator_pixels > 300,
         "工具栏底部分隔线绘制不足：{separator_pixels}"

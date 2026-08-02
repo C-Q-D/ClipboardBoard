@@ -4,6 +4,9 @@
 
 import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { TextButton } from "components/controls.slint";
+import { PinFilledIcon, PinOutlineIcon } from "components/icons.slint";
+export { PrimitiveGallery } from "components/controls.slint";
 
 // ClipboardCard 是 UI 卡片的最小展示 DTO，只允许摘要、来源和相对时间进入组件树。
 export struct ClipboardCard {
@@ -159,11 +162,23 @@ component HistoryCard inherits Rectangle {
             width: 36px; height: 36px; border-radius: 6px;
             background: pin-touch.pressed ? Theme.accent-bg : pin-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
             border-width: 1px; border-color: card.is_pinned ? Theme.border-selected : Theme.border-subtle;
-            ThemedText {
-                text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
+            if card.pin_pending: ThemedText {
+                text: "…";
                 color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                font-size: card.pin_pending ? Theme.pending-font-size : Theme.icon-font-size;
+                font-size: Theme.pending-font-size;
                 horizontal-alignment: center; vertical-alignment: center;
+            }
+            if !card.pin_pending && card.is_pinned: PinFilledIcon {
+                size: 16px;
+                icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+            if !card.pin_pending && !card.is_pinned: PinOutlineIcon {
+                size: 16px;
+                icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
             }
             pin-touch := TouchArea {
                 enabled: !mutation-pending && !card.pin_pending;
@@ -432,26 +447,15 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                         }
 
-                        Rectangle {
+                        clear-unpinned-button := TextButton {
                             width: 108px;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: Theme.border-subtle;
-                            background: Theme.surface-bg;
-                            clear-touch := TouchArea {
-                                enabled: !history-mutation-pending;
-                                clicked => {
-                                    if (!history-mutation-pending) {
-                                        clear-unpinned-requested();
-                                    }
+                            label: clear-unpinned-pending ? "清理中…" : "清理未收藏";
+                            pending: clear-unpinned-pending;
+                            enabled: !history-mutation-pending;
+                            clicked => {
+                                if (!history-mutation-pending) {
+                                    clear-unpinned-requested();
                                 }
-                            }
-                            ThemedText {
-                                text: clear-unpinned-pending ? "清理中…" : "清理未收藏";
-                                color: clear-unpinned-pending ? Theme.text-muted : Theme.text-primary;
-                                font-size: Theme.button-font-size;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
                             }
                         }
 
@@ -796,12 +800,24 @@ export component AppWindow inherits Window {
                                     : pin-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
                                 border-width: 1px;
                                 border-color: card.is_pinned ? Theme.border-selected : Theme.border-subtle;
-                                ThemedText {
-                                    text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
+                                if card.pin_pending: ThemedText {
+                                    text: "…";
                                     color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
-                                    font-size: card.pin_pending ? Theme.pending-font-size : Theme.icon-font-size;
+                                    font-size: Theme.pending-font-size;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
+                                }
+                                if !card.pin_pending && card.is_pinned: PinFilledIcon {
+                                    size: 16px;
+                                    icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                if !card.pin_pending && !card.is_pinned: PinOutlineIcon {
+                                    size: 16px;
+                                    icon-color: pin-touch.pressed ? Theme.accent-text : Theme.text-primary;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
                                 }
                                 pin-touch := TouchArea {
                                     enabled: !history-mutation-pending && !card.pin_pending;

@@ -1,0 +1,177 @@
+// ClipboardBoard 的基础按钮外壳与 UIR-02 软件渲染测试画廊。
+//
+// 控件只集中处理视觉状态和真实命中区；业务调用方仍负责传入 enabled、danger、primary
+// 与 pending，并通过 callback 接收点击，不允许控件自行推断稳定身份或后台事务。
+
+import { Theme } from "../theme.slint";
+import {
+    CopyIcon,
+    DeleteIcon,
+    ImageIcon,
+    PinFilledIcon,
+    PinOutlineIcon,
+    TextIcon,
+} from "icons.slint";
+
+// ButtonFrame 统一按钮的背景、边框和文字/图标颜色，不持有回调之外的业务状态。
+component ButtonFrame inherits Rectangle {
+    // Rectangle 没有可用的内置 enabled 语义；基础按钮显式暴露它并同步给 TouchArea。
+    in property <bool> enabled: true;
+    // primary 和 danger 必须由调用方显式选择，不能由文字或图标名称推断。
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    // pending 只影响视觉反馈；是否禁用点击仍由调用方通过 enabled 明确传入。
+    in property <bool> pending: false;
+    // 两个状态由具体按钮的 TouchArea 绑定，保证按压和悬停来自真实输入事件。
+    in property <bool> pressed: false;
+    in property <bool> hovered: false;
+
+    // 供子控件复用的语义前景色；disabled/pending 不会通过 opacity 隐藏状态。
+    out property <color> foreground: !enabled || pending
+        ? Theme.text-muted
+        : primary ? Theme.accent-text : danger ? Theme.danger : Theme.text-primary;
+
+    width: Theme.control-hit-size;
+    height: Theme.control-hit-size;
+    border-radius: Theme.control-radius;
+    border-width: 1px;
+    background: !enabled
+        ? Theme.surface-bg
+        : primary ? Theme.accent-bg
+        : danger ? Theme.danger-surface
+        : pressed ? Theme.surface-selected
+        : hovered ? Theme.surface-hover
+        : Theme.surface-bg;
+    border-color: !enabled
+        ? Theme.border-subtle
+        : primary ? Theme.accent-bg
+        : danger ? Theme.danger
+        : pressed ? Theme.border-selected
+        : Theme.border-subtle;
+}
+
+// IconButton 是 36×36 起步的图标命中区；icon 只选择视觉组件，点击不携带业务参数。
+export component IconButton inherits ButtonFrame {
+    // 支持文本、图片、空心/实心收藏、复制和删除图标；icon 只选择视觉组件。
+    in property <string> icon: "text";
+    // 点击只通知调用方；回调不携带稳定 ID、选择索引或完整剪贴板数据。
+    callback clicked();
+
+    touch := TouchArea {
+        enabled: parent.enabled;
+        clicked => { clicked(); }
+    }
+    // 视觉状态绑定真实 TouchArea，不允许通过鼠标坐标或业务状态猜测 pressed。
+    pressed: touch.pressed;
+    hovered: touch.has-hover;
+
+    if icon == "text": TextIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if icon == "image": ImageIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if icon == "pin-outline": PinOutlineIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if icon == "pin-filled": PinFilledIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if icon == "copy": CopyIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    if icon == "delete": DeleteIcon {
+        size: 16px;
+        icon-color: parent.foreground;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+// TextButton 是带可见文案的统一按钮外壳；危险操作仍须保留文字，不能只剩图标。
+export component TextButton inherits ButtonFrame {
+    // label 是界面文案，不携带完整剪贴板正文或后台错误详情。
+    in property <string> label: "";
+    // 点击只通知调用方；enabled 的真正门禁由本组件的 TouchArea 执行。
+    callback clicked();
+
+    touch := TouchArea {
+        enabled: parent.enabled;
+        clicked => { clicked(); }
+    }
+    pressed: touch.pressed;
+    hovered: touch.has-hover;
+
+    Text {
+        text: parent.label;
+        color: parent.foreground;
+        font-family: Theme.font-family;
+        font-size: Theme.button-font-size;
+        font-weight: Theme.font-weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: parent.width;
+        height: parent.height;
+        overflow: clip;
+    }
+}
+
+// PrimitiveGallery 仅用于定向软件渲染测试，展示全部图标和按钮状态，不参与业务窗口布局。
+export component PrimitiveGallery inherits Window {
+    // 测试回调只记录基础按钮是否被命中，不连接生产业务动作。
+    callback enabled-button-clicked();
+    callback disabled-button-clicked();
+
+    width: 344px;
+    height: 144px;
+    title: "UIR-02 primitives";
+    background: Theme.window-bg;
+
+    // 六个图标共用 16×16 视觉盒，顺序与契约测试的像素区域一一对应。
+    TextIcon { x: 8px; y: 8px; icon-color: Theme.text-primary; }
+    ImageIcon { x: 32px; y: 8px; icon-color: Theme.text-primary; }
+    PinOutlineIcon { x: 56px; y: 8px; icon-color: Theme.text-primary; }
+    PinFilledIcon { x: 80px; y: 8px; icon-color: Theme.text-primary; }
+    CopyIcon { x: 104px; y: 8px; icon-color: Theme.text-primary; }
+    DeleteIcon { x: 128px; y: 8px; icon-color: Theme.text-primary; }
+
+    // 两枚图标按钮用于证明普通命中和 disabled 命中都是真实 36×36 区域。
+    enabled-icon-button := IconButton {
+        x: 8px;
+        y: 48px;
+        icon: "copy";
+        clicked => { enabled-button-clicked(); }
+    }
+    IconButton {
+        x: 52px;
+        y: 48px;
+        icon: "delete";
+        enabled: false;
+        clicked => { disabled-button-clicked(); }
+    }
+
+    // 四种文本按钮状态用于软件渲染检查，disabled 仍保留可见文案。
+    TextButton { x: 8px; y: 96px; width: 72px; label: "普通"; }
+    TextButton { x: 88px; y: 96px; width: 72px; label: "主要"; primary: true; }
+    TextButton { x: 168px; y: 96px; width: 72px; label: "危险"; danger: true; }
+    TextButton { x: 248px; y: 96px; width: 88px; label: "禁用"; enabled: false; }
+
+    // 将真实组件命中区尺寸暴露给 Rust 契约，避免只凭截图推断 36×36 要求。
+    out property <length> enabled-icon-hit-width: enabled-icon-button.width;
+    out property <length> enabled-icon-hit-height: enabled-icon-button.height;
+}

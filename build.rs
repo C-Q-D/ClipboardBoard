@@ -14,6 +14,9 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/app-window.slint");
     // 主题令牌是 Slint 编译输入；变更后必须重新生成界面代码。
     println!("cargo:rerun-if-changed=ui/theme.slint");
+    // 基础图标和按钮是 Slint 编译输入；变更后必须重新生成界面代码。
+    println!("cargo:rerun-if-changed=ui/components/icons.slint");
+    println!("cargo:rerun-if-changed=ui/components/controls.slint");
     println!("cargo:rerun-if-changed=assets/clipboard-board.svg");
     println!("cargo:rerun-if-changed=assets/clipboard-board.ico.hex");
     println!("cargo:rerun-if-changed=assets/clipboard-board-resource-id.txt");

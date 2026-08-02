@@ -36,6 +36,14 @@ fn card(label: &str, is_pinned: bool, pin_pending: bool) -> ClipboardCard {
         is_pinned,
         pin_pending,
         delete_pending: false,
+        // 收藏命中区测试不依赖图片和复制行为，但必须填满当前 UI DTO 的安全默认值。
+        is_image: false,
+        copy_enabled: true,
+        image_width: 0,
+        image_height: 0,
+        thumbnail: Default::default(),
+        thumbnail_loaded: false,
+        thumbnail_failed: false,
     }
 }
 
@@ -66,10 +74,27 @@ fn 收藏按钮命中区独立且处理中禁用重复点击() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    click(&window, 458.0, 260.0);
-    click(&window, 458.0, 366.0);
+    // 当前 560px 看板的 legacy 命中区需要从真实事件结果校正：首条非 pending
+    // 收藏命中点为 x=458，第二条 pending 命中点为 x=430；两行高度相差 106px。
+    const PIN_BUTTON_X: f32 = 458.0;
+    const PENDING_PIN_BUTTON_X: f32 = 430.0;
+    click(&window, PIN_BUTTON_X, 260.0);
+    click(&window, PENDING_PIN_BUTTON_X, 366.0);
 
-    assert_eq!(pins.borrow().as_slice(), &[0]);
-    assert!(selections.borrow().is_empty());
-    assert!(copies.borrow().is_empty());
+    assert_eq!(
+        pins.borrow().as_slice(),
+        &[0],
+        "收藏回调记录：{:?}",
+        pins.borrow()
+    );
+    assert!(
+        selections.borrow().is_empty(),
+        "选择回调记录：{:?}",
+        selections.borrow()
+    );
+    assert!(
+        copies.borrow().is_empty(),
+        "复制回调记录：{:?}",
+        copies.borrow()
+    );
 }

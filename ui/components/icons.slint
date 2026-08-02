@@ -1,0 +1,115 @@
+// ClipboardBoard 的无平台差异小图标集合。
+//
+// 图标只负责在统一视觉盒内绘制几何形状，不持有业务状态、稳定 ID、选择索引或
+// pending 逻辑；调用方通过 size 和 icon-color 注入尺寸与语义颜色，禁止把字体符号当图标。
+
+import { Theme } from "../theme.slint";
+
+// 所有图标共享 16×16 默认视觉盒；边界必须留在盒内，避免命中区或裁剪区发生溢出。
+component IconFrame inherits Rectangle {
+    // 调用方可传入统一视觉盒尺寸；当前基础图形按 16×16 盒绘制。
+    in property <length> size: 16px;
+    // 避开 Rectangle 已占用的 color 属性，避免把图标色误当作整块背景。
+    in property <color> icon-color: Theme.text-secondary;
+    width: size;
+    height: size;
+    background: transparent;
+    clip: true;
+}
+
+// 文本图标：纸张外框与三条摘要线，表达文本内容而不是正文数据。
+export component TextIcon inherits IconFrame {
+    Rectangle {
+        x: 3px;
+        y: 2px;
+        width: 10px;
+        height: 12px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 1px;
+    }
+    Rectangle { x: 5px; y: 5px; width: 6px; height: 1px; background: root.icon-color; }
+    Rectangle { x: 5px; y: 8px; width: 6px; height: 1px; background: root.icon-color; }
+    Rectangle { x: 5px; y: 11px; width: 4px; height: 1px; background: root.icon-color; }
+}
+
+// 图片图标：相框、太阳和山形色块，表达图片摘要，不访问或解码原图。
+export component ImageIcon inherits IconFrame {
+    Rectangle {
+        x: 2px;
+        y: 3px;
+        width: 12px;
+        height: 10px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 1px;
+    }
+    Rectangle { x: 9px; y: 5px; width: 2px; height: 2px; background: root.icon-color; border-radius: 1px; }
+    Rectangle { x: 4px; y: 10px; width: 4px; height: 2px; background: root.icon-color; border-radius: 1px; }
+    Rectangle { x: 7px; y: 9px; width: 4px; height: 3px; background: root.icon-color; border-radius: 1px; }
+}
+
+// 空心收藏图标：轮廓状态只表达视觉，不保存收藏结果；状态由调用方选择组件。
+export component PinOutlineIcon inherits IconFrame {
+    Rectangle {
+        x: 5px;
+        y: 2px;
+        width: 6px;
+        height: 5px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 2px;
+    }
+    Rectangle { x: 7px; y: 6px; width: 1px; height: 6px; background: root.icon-color; }
+    Rectangle { x: 4px; y: 12px; width: 8px; height: 1px; background: root.icon-color; border-radius: 1px; }
+}
+
+// 实心收藏图标：与空心图标共享几何盒，仅改变填充状态，不承载收藏业务逻辑。
+export component PinFilledIcon inherits IconFrame {
+    Rectangle { x: 5px; y: 2px; width: 6px; height: 5px; background: root.icon-color; border-radius: 2px; }
+    Rectangle { x: 7px; y: 6px; width: 1px; height: 6px; background: root.icon-color; }
+    Rectangle { x: 4px; y: 12px; width: 8px; height: 1px; background: root.icon-color; border-radius: 1px; }
+}
+
+// 复制图标：两个错位纸张外框，表达复制动作而非直接读取剪贴板正文。
+export component CopyIcon inherits IconFrame {
+    Rectangle {
+        x: 5px;
+        y: 2px;
+        width: 8px;
+        height: 9px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 1px;
+    }
+    Rectangle {
+        x: 3px;
+        y: 5px;
+        width: 8px;
+        height: 9px;
+        background: Theme.window-bg;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 1px;
+    }
+}
+
+// 删除图标：带盖和把手的几何垃圾桶；危险语义仍由按钮调用方显式传入。
+export component DeleteIcon inherits IconFrame {
+    Rectangle {
+        x: 4px;
+        y: 5px;
+        width: 8px;
+        height: 8px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.icon-color;
+        border-radius: 1px;
+    }
+    Rectangle { x: 3px; y: 3px; width: 10px; height: 1px; background: root.icon-color; }
+    Rectangle { x: 6px; y: 2px; width: 4px; height: 1px; background: root.icon-color; }
+}

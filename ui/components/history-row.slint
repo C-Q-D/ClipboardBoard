@@ -66,14 +66,26 @@ export component HistoryRowVisual inherits Rectangle {
             ? Theme.surface-selected
             : card-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
         border-width: selected ? 2px : 1px;
-        border-color: selected ? Theme.border-selected : Theme.control-border;
+        // 未选中项只保留安静的结构边界；选中项才使用高对比边框，层级与参考图一致。
+        border-color: selected ? Theme.border-selected : Theme.border-subtle;
         border-radius: 10px;
 
-        if !card.is_image: TextIcon {
-            size: 16px;
-            icon-color: selected ? Theme.text-primary : Theme.text-secondary;
-            x: 14px;
-            y: (parent.height - self.height) / 2;
+        if !card.is_image: Rectangle {
+            // 文本图标使用独立小徽章，避免细线图标直接贴在卡片表面而显得漂浮。
+            x: 10px;
+            y: (parent.height - 24px) / 2;
+            width: 24px;
+            height: 24px;
+            background: Theme.window-bg;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            border-radius: 6px;
+            TextIcon {
+                size: 16px;
+                icon-color: selected ? Theme.text-primary : Theme.text-secondary;
+                x: 4px;
+                y: 4px;
+            }
         }
 
         if !card.is_image: HistoryRowText {
@@ -122,7 +134,7 @@ export component HistoryRowVisual inherits Rectangle {
             height: 52px;
             background: Theme.window-bg;
             border-width: 1px;
-            border-color: Theme.control-border;
+            border-color: Theme.border-subtle;
             border-radius: 6px;
             clip: true;
             Image {

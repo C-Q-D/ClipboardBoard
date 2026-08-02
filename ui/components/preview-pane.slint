@@ -5,7 +5,7 @@ import { Theme } from "../theme.slint";
 import { ScrollView } from "std-widgets.slint";
 import { ThemedScrollBar } from "scrollbar.slint";
 import { TextButton } from "controls.slint";
-import { ImageIcon } from "icons.slint";
+import { ImageIcon, TextIcon } from "icons.slint";
 import { ClipboardCard } from "history-row.slint";
 
 // 预览文字统一使用主题字体；组件不把来源、时间或正文复制成第二套状态。
@@ -58,7 +58,7 @@ export component PreviewPane inherits Rectangle {
     background: Theme.surface-bg;
     border-radius: Theme.control-radius;
     border-width: 1px;
-    border-color: Theme.control-border;
+    border-color: Theme.border-subtle;
 
     // 内容内缩与列表栏保持一致；右栏自身负责裁剪，不推动外层窗口高度。
     Rectangle {
@@ -69,10 +69,45 @@ export component PreviewPane inherits Rectangle {
         background: transparent;
         clip: true;
 
-        PreviewText {
+        if has-selected-card: Rectangle {
             x: 0px;
             y: 0px;
-            width: parent.width;
+            width: 50px;
+            height: 24px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            background: Theme.surface-selected;
+
+            if card.is_image: ImageIcon {
+                x: 5px;
+                y: 4px;
+                size: 14px;
+                icon-color: Theme.text-secondary;
+            }
+            if !card.is_image: TextIcon {
+                x: 5px;
+                y: 4px;
+                size: 14px;
+                icon-color: Theme.text-secondary;
+            }
+            PreviewText {
+                x: 22px;
+                y: 0px;
+                width: 24px;
+                height: 24px;
+                text: card.is_image ? "图片" : "文本";
+                color: Theme.text-secondary;
+                font-size: Theme.shortcut-font-size;
+                vertical-alignment: center;
+                overflow: clip;
+            }
+        }
+
+        PreviewText {
+            x: has-selected-card ? 58px : 0px;
+            y: 0px;
+            width: parent.width - (has-selected-card ? 58px : 0px);
             height: 22px;
             text: "内容预览";
             color: Theme.text-primary;
@@ -80,6 +115,14 @@ export component PreviewPane inherits Rectangle {
             font-weight: Theme.font-weight-semibold;
             vertical-alignment: center;
             overflow: clip;
+        }
+
+        // 头部下方保留一条低对比度分隔线，明确预览元数据与正文的任务层级。
+        Rectangle {
+            y: 45px;
+            width: parent.width;
+            height: 1px;
+            background: Theme.border-subtle;
         }
 
         if has-selected-card: PreviewText {
@@ -255,9 +298,9 @@ export component PreviewPane inherits Rectangle {
             y: parent.height - preview-action-bar-height;
             width: parent.width;
             height: preview-action-bar-height;
-            background: Theme.surface-bg;
-            border-width: 1px;
-            border-color: Theme.control-border;
+            // 操作区沿用右栏连续表面；按钮仍有真实 36px 以上命中区，不再制造第二个重边框。
+            background: transparent;
+            border-width: 0px;
 
             HorizontalLayout {
                 x: 8px;

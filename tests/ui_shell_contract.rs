@@ -182,14 +182,25 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     assert_eq!(pixel(&empty_snapshot, 20, 20), [16, 16, 20, 255]);
     assert_eq!(pixel(&empty_snapshot, 700, 500), [16, 16, 20, 255]);
 
-    // 左栏四项筛选位于全局 x=28..292、y=94..130；索引顺序必须原样透传。
-    for x in [60.0, 132.0, 204.0, 276.0] {
+    // 选中筛选必须使用深色表面上的强白正文，不能回退到浅色主按钮专用的深色文字。
+    assert!(
+        light_pixels(&empty_snapshot, 38, 82, 101, 123) > 0,
+        "选中筛选文字没有在深色表面上形成可读的浅色像素"
+    );
+
+    // 左栏四项筛选位于全局 x=28..286、y=94..130；索引顺序必须原样透传。
+    for x in [58.0, 124.0, 190.0, 256.0] {
         click(&window, x, 112.0);
     }
     assert_eq!(filters.borrow().as_slice(), &[0, 1, 2, 3]);
     assert!(!filters.borrow().is_empty(), "筛选契约必须真实执行至少一次");
 
-    // 264px 左栏与右侧占位之间必须有连续 1px 分隔线，不能互相覆盖。
+    // 264px 左栏与右侧占位之间必须有连续 1px 分隔线，筛选按钮不能覆盖它。
+    assert_eq!(
+        pixel(&empty_snapshot, 292, 112),
+        [42, 41, 49, 255],
+        "筛选行越过左栏边界并覆盖了左右栏分隔线"
+    );
     let divider_pixels = surface_pixels(&empty_snapshot, 292, 293, 94, 488, [42, 41, 49, 255]);
     assert!(
         divider_pixels > 300,

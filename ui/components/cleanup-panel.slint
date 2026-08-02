@@ -80,7 +80,8 @@ export component CleanupPanel inherits Rectangle {
             }
 
             CleanupText {
-                y: 24px;
+                // 说明行与标题保留 8px 间隔，避免字体下缘贴近后续按钮。
+                y: 28px;
                 width: parent.width;
                 height: 18px;
                 text: "清空未收藏不会影响已收藏记录";
@@ -90,7 +91,8 @@ export component CleanupPanel inherits Rectangle {
 
             TextButton {
                 x: 0px;
-                y: 54px;
+                // 按钮行下移后与说明文字形成明确的 22px 安全间隙，防止字体抗锯齿越入按钮。
+                y: 68px;
                 width: 104px;
                 height: 36px;
                 label: clear-unpinned-pending ? "清理中…" : "清空未收藏";
@@ -105,7 +107,7 @@ export component CleanupPanel inherits Rectangle {
 
             TextButton {
                 x: 112px;
-                y: 54px;
+                y: 68px;
                 width: 92px;
                 height: 36px;
                 label: clear-all-pending ? "清空中…" : "清空全部";
@@ -121,7 +123,7 @@ export component CleanupPanel inherits Rectangle {
 
             TextButton {
                 x: parent.width - 72px;
-                y: 54px;
+                y: 68px;
                 width: 72px;
                 height: 36px;
                 label: "取消";

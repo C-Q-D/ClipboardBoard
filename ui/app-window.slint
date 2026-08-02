@@ -166,6 +166,9 @@ export component AppWindow inherits Window {
     // 无障碍契约读取主按钮的真实尺寸；焦点环由软件快照验证，不能从固定坐标猜测。
     out property <length> selected-copy-hit-width: preview-pane.copy-hit-width;
     out property <length> selected-copy-hit-height: preview-pane.copy-hit-height;
+    // 滚动测试接缝读取右栏 ScrollView 的真实可滚动范围；不复制正文或业务滚动状态。
+    out property <length> preview-scroll-maximum: preview-pane.preview-scroll-maximum;
+    in-out property <length> preview-scroll-offset <=> preview-pane.preview-scroll-offset;
     // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
     changed history-viewport-y => {
         if (geometry-mode) {
@@ -343,10 +346,12 @@ export component AppWindow inherits Window {
 
                             HorizontalLayout {
                                 height: 36px;
-                                spacing: 8px;
+                                // 左栏固定为 264px；四个 60px 控件和三个 6px 间隔共 258px，
+                                // 右侧保留 6px 安全余量，避免最后一个筛选覆盖分隔线。
+                                spacing: 6px;
 
                                 Rectangle {
-                                    width: 64px;
+                                    width: 60px;
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: search-filter == 0 ? Theme.border-selected : Theme.control-border;
@@ -355,17 +360,18 @@ export component AppWindow inherits Window {
                                         clicked => { search-filter-requested(0); }
                                     }
                                     ThemedText {
-                                        width: 64px;
+                                        width: 60px;
                                         height: parent.height;
                                         text: "全部";
-                                        color: search-filter == 0 ? Theme.accent-text : Theme.text-secondary;
+                                        // accent-text 只适用于浅色 accent-bg；深色选中面必须使用强白正文。
+                                        color: search-filter == 0 ? Theme.text-primary : Theme.text-secondary;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
                                 }
 
                                 Rectangle {
-                                    width: 64px;
+                                    width: 60px;
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: search-filter == 1 ? Theme.border-selected : Theme.control-border;
@@ -374,17 +380,17 @@ export component AppWindow inherits Window {
                                         clicked => { search-filter-requested(1); }
                                     }
                                     ThemedText {
-                                        width: 64px;
+                                        width: 60px;
                                         height: parent.height;
                                         text: "文本";
-                                        color: search-filter == 1 ? Theme.accent-text : Theme.text-secondary;
+                                        color: search-filter == 1 ? Theme.text-primary : Theme.text-secondary;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
                                 }
 
                                 Rectangle {
-                                    width: 64px;
+                                    width: 60px;
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: search-filter == 2 ? Theme.border-selected : Theme.control-border;
@@ -393,17 +399,17 @@ export component AppWindow inherits Window {
                                         clicked => { search-filter-requested(2); }
                                     }
                                     ThemedText {
-                                        width: 64px;
+                                        width: 60px;
                                         height: parent.height;
                                         text: "图片";
-                                        color: search-filter == 2 ? Theme.accent-text : Theme.text-secondary;
+                                        color: search-filter == 2 ? Theme.text-primary : Theme.text-secondary;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
                                 }
 
                                 Rectangle {
-                                    width: 64px;
+                                    width: 60px;
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: search-filter == 3 ? Theme.border-selected : Theme.control-border;
@@ -412,10 +418,10 @@ export component AppWindow inherits Window {
                                         clicked => { search-filter-requested(3); }
                                     }
                                     ThemedText {
-                                        width: 64px;
+                                        width: 60px;
                                         height: parent.height;
                                         text: "收藏";
-                                        color: search-filter == 3 ? Theme.accent-text : Theme.text-secondary;
+                                        color: search-filter == 3 ? Theme.text-primary : Theme.text-secondary;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }

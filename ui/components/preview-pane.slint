@@ -2,6 +2,7 @@
 // 文本内容来自 ClipboardCard.preview 的受限摘要；完整正文和图片原图永远不进入组件。
 
 import { Theme } from "../theme.slint";
+import { ScrollView } from "std-widgets.slint";
 import { TextButton } from "controls.slint";
 import { ImageIcon } from "icons.slint";
 import { ClipboardCard } from "history-row.slint";
@@ -43,6 +44,27 @@ export component PreviewPane inherits Rectangle {
     callback copy-requested();
     callback pin-requested();
     callback delete-requested();
+
+    // 仅暴露预览滚动的真实几何接缝，便于软件测试确认长摘要确实获得可滚动范围；
+    // 滚动位置仍由 ScrollView 和用户输入驱动，不复制 Rust 侧的业务状态。
+    out property <length> preview-scroll-maximum: max(0px, preview-scroll.viewport-height - preview-scroll.height);
+    in-out property <length> preview-scroll-offset <=> preview-scroll.viewport-y;
+    property <length> preview-scroll-track-height:
+        max(0px, preview-scroll.height - Theme.scrollbar-inset - Theme.scrollbar-inset);
+    property <length> preview-scroll-thumb-height:
+        preview-scroll-maximum <= 0px
+            ? 0px
+            : max(
+                Theme.scrollbar-min-thumb-size,
+                preview-scroll-track-height * preview-scroll.height
+                    / max(preview-scroll.viewport-height, 1px)
+            );
+    property <length> preview-scroll-thumb-travel:
+        max(0px, preview-scroll-track-height - preview-scroll-thumb-height);
+    property <length> preview-scroll-thumb-y:
+        preview-scroll-maximum <= 0px || preview-scroll-thumb-travel <= 0px
+            ? 0px
+            : (-preview-scroll-offset / preview-scroll-maximum) * preview-scroll-thumb-travel;
 
     // 预览是受限摘要；复制仍由 Rust 按稳定身份读取完整内容，本组件不负责复制。
 
@@ -98,7 +120,14 @@ export component PreviewPane inherits Rectangle {
             vertical-alignment: center;
         }
 
-        if has-selected-card && !card.is_image: Flickable {
+        // 滚动容器始终存在但仅在文本预览时可见，确保输出的滚动几何不会引用条件实例。
+        preview-scroll := ScrollView {
+            visible: has-selected-card && !card.is_image;
+            // 复用标准滚动条的拖动、滚轮和按需显示行为；文本不足一屏时不显示空滚动条。
+            // 标准条只负责滚轮和内容拖动；视觉条由下方主题化覆盖层负责，避免 Fluent 深色透明色阶不可见。
+            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+            mouse-drag-pan-enabled: true;
             x: 0px;
             y: preview-header-height;
             width: parent.width;
@@ -123,6 +152,64 @@ export component PreviewPane inherits Rectangle {
                     wrap: word-wrap;
                     overflow: clip;
                     vertical-alignment: top;
+                }
+            }
+        }
+
+        if has-selected-card && !card.is_image && preview-scroll-maximum > 0px: Rectangle {
+            // 可见滚动条只覆盖正文右侧，不缩小正文视口；其位置直接映射 ScrollView 的负向 viewport-y。
+            x: parent.width - Theme.scrollbar-width;
+            y: preview-scroll.y + Theme.scrollbar-inset;
+            width: Theme.scrollbar-width;
+            height: preview-scroll-track-height;
+            background: Theme.scrollbar-track;
+            border-radius: Theme.scrollbar-width / 2;
+
+            Rectangle {
+                x: 1px;
+                y: preview-scroll-thumb-y;
+                width: parent.width - 2px;
+                height: preview-scroll-thumb-height;
+                background: Theme.scrollbar-thumb;
+                border-radius: (parent.width - 2px) / 2;
+            }
+
+            // 只允许在真实 thumb 上开始拖动；拖动计算使用同一个 maximum，避免产生第二个滚动范围。
+            scrollbar-touch := TouchArea {
+                property <length> pointer-offset: 0px;
+                property <bool> dragging: false;
+
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                        self.dragging = self.mouse-y >= preview-scroll-thumb-y
+                            && self.mouse-y <= preview-scroll-thumb-y + preview-scroll-thumb-height;
+                        self.pointer-offset = self.mouse-y - preview-scroll-thumb-y;
+                    }
+                }
+
+                moved => {
+                    if (self.enabled && self.pressed && self.dragging && preview-scroll-thumb-travel > 0px) {
+                        preview-scroll-offset = -max(
+                            0px,
+                            min(
+                                preview-scroll-maximum,
+                                (self.mouse-y - self.pointer-offset)
+                                    / preview-scroll-thumb-travel * preview-scroll-maximum
+                            )
+                        );
+                    }
+                }
+
+                scroll-event(event) => {
+                    if (event.delta-y != 0) {
+                        preview-scroll-offset = max(
+                            -preview-scroll-maximum,
+                            min(0px, preview-scroll-offset + event.delta-y)
+                        );
+                        accept
+                    } else {
+                        reject
+                    }
                 }
             }
         }

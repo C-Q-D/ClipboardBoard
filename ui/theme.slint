@@ -23,6 +23,9 @@ export global Theme {
     in property <color> danger: #E98989;
     in property <color> danger-surface: #2A171A;
     in property <color> warning: #D9A06F;
+    // 预览滚动条在深色 surface 上保持可见；滚动范围和位置仍由 ScrollView 唯一管理。
+    in property <color> scrollbar-track: #25232C;
+    in property <color> scrollbar-thumb: #9086A6;
 
     // 本轮固定的圆角、间距和交互命中尺寸；几何原子会继续复用这些令牌。
     in property <length> shell-radius: 14px;
@@ -31,6 +34,9 @@ export global Theme {
     in property <length> content-padding: 12px;
     in property <length> section-gap: 10px;
     in property <length> control-hit-size: 36px;
+    in property <length> scrollbar-width: 8px;
+    in property <length> scrollbar-inset: 4px;
+    in property <length> scrollbar-min-thumb-size: 28px;
     // 文本行外层固定 78px；共享视觉中的 70px 背景内含选中边框，不能向外撑高。
     in property <length> history-text-row-height: 78px;
     in property <length> history-text-background-height: 70px;

@@ -7,11 +7,25 @@ use clipboard_board::{create_app_window, ClipboardCard};
 use i_slint_backend_testing::{TestingBackend, TestingBackendOptions};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
+/// 从实际主题令牌读取颜色，避免测试复制滚动条的视觉常量。
+fn theme_color(name: &str) -> [u8; 3] {
+    let source = include_str!("../ui/theme.slint");
+    let marker = format!("{name}: #");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("主题缺少颜色令牌：{name}"))
+        + marker.len();
+    let hex = &source[start..start + 6];
+    [0, 2, 4].map(|offset| {
+        u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .unwrap_or_else(|_| panic!("主题令牌 {name} 不是合法 RGB：#{hex}"))
+    })
+}
+
 /// 构造用户实际遇到“只显示 /*...”问题的多行 SQL 卡片。
 fn long_card() -> ClipboardCard {
-    ClipboardCard {
-        preview: SharedString::from(
-            r#"
+    let mut preview = String::from(
+        r#"
 /*
 #4 正向交换；只执行一次。
 执行后无论客户端返回成功、失败还是超时，都先执行 #5、#6，禁止重跑本语句。
@@ -21,7 +35,16 @@ EXCHANGE TABLES
     nlp_semantic_layer.__exchange_cutover_probe_codex_20260728_a
 AND nlp_semantic_layer.__exchange_cutover_probe_codex_20260728_b
 ON CLUSTER default_cluster;"#,
-        ),
+    );
+    // 追加足够多的真实多行摘要，让预览在固定视口内进入可滚动状态，而不是只验证首屏换行。
+    for index in 0..48 {
+        preview.push_str(&format!(
+            "\nscroll-line-{index}: 这是一行用于验证预览滚动条的受限摘要内容。"
+        ));
+    }
+
+    ClipboardCard {
+        preview: SharedString::from(preview),
         source: SharedString::from("测试来源"),
         relative_time: SharedString::from("刚刚"),
         is_pinned: false,
@@ -76,6 +99,10 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
     window.set_selected_card(long_card());
     window.set_has_selected_card(true);
     window.show().expect("测试窗口应成功显示");
+    assert!(
+        window.get_preview_scroll_maximum() > 0.0,
+        "长摘要没有形成真实可滚动范围"
+    );
 
     let snapshot = window.window().take_snapshot().expect("软件渲染快照失败");
     assert_eq!(snapshot.width(), 720);
@@ -122,5 +149,19 @@ fn 多行长文本显示后续正文且不会绘制到卡片间隔() {
     assert!(
         preview_pixels > 80,
         "右栏受限摘要没有形成真实正文像素，仅发现 {preview_pixels} 个浅色像素"
+    );
+
+    // 主题化 thumb 必须在右栏正文区域留下连续像素，证明滚动条不是只存在于布局属性中。
+    let thumb = theme_color("scrollbar-thumb");
+    let scrollbar_pixels = (180_usize..426)
+        .flat_map(|y| (650_usize..690).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+            let offset = y * stride + x * 4;
+            pixels[offset..offset + 3] == thumb
+        })
+        .count();
+    assert!(
+        scrollbar_pixels > 20,
+        "长摘要没有绘制可见主题滚动条，仅发现 {scrollbar_pixels} 个 thumb 像素"
     );
 }

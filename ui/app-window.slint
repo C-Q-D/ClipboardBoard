@@ -23,6 +23,9 @@ component ListView inherits Flickable {
 component ThemedText inherits Text {
     // Microsoft YaHei UI 不可用时由 Slint/Windows 使用系统无衬线回退。
     font-family: Theme.font-family;
+    // 工具栏、筛选和状态文案均位于固定槽位，默认单行裁剪；多行摘要使用专用组件覆盖。
+    wrap: no-wrap;
+    overflow: clip;
 }
 
 // HistoryCard 只声明 geometry 路径的 78/92 外层行高；内部视觉统一委托给 HistoryRowVisual。
@@ -160,6 +163,9 @@ export component AppWindow inherits Window {
     // 测试接缝只暴露 legacy 分支的实际布局高度，用于证明显式模式不会被隐藏 ListView 占位。
     out property <length> history-legacy-visible-height: history-list.visible-height;
     out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
+    // 无障碍契约读取主按钮的真实尺寸；焦点环由软件快照验证，不能从固定坐标猜测。
+    out property <length> selected-copy-hit-width: preview-pane.copy-hit-width;
+    out property <length> selected-copy-hit-height: preview-pane.copy-hit-height;
     // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
     changed history-viewport-y => {
         if (geometry-mode) {
@@ -250,17 +256,30 @@ export component AppWindow inherits Window {
                         overflow: clip;
                     }
 
-                    // LineEdit 仍是唯一用户输入源；防抖、代次和程序回写由 Rust reducer 管理。
-                    search-input := LineEdit {
+                    // LineEdit 仍是唯一用户输入源；外框只负责统一边界和焦点视觉，防抖、代次及回写仍由 Rust reducer 管理。
+                    search-input-frame := Rectangle {
                         x: 168px;
                         y: 8px;
                         width: parent.width - 252px;
                         height: 38px;
-                        font-family: Theme.font-family;
-                        placeholder-text: "搜索剪贴内容…";
-                        text: search-text;
-                        edited(text) => {
-                            search-text-changed(text);
+                        border-radius: Theme.control-radius;
+                        border-width: 1px;
+                        border-color: search-input.has-focus
+                            ? Theme.focus-ring : Theme.control-border;
+                        background: Theme.surface-bg;
+                        clip: true;
+
+                        search-input := LineEdit {
+                            x: 1px;
+                            y: 1px;
+                            width: parent.width - 2px;
+                            height: parent.height - 2px;
+                            font-family: Theme.font-family;
+                            placeholder-text: "搜索剪贴内容…";
+                            text: search-text;
+                            edited(text) => {
+                                search-text-changed(text);
+                            }
                         }
                     }
 
@@ -272,9 +291,11 @@ export component AppWindow inherits Window {
                         height: 24px;
                         border-radius: Theme.control-radius;
                         border-width: 1px;
-                        border-color: Theme.border-subtle;
+                        border-color: Theme.control-border;
                         background: Theme.surface-bg;
                         ThemedText {
+                            width: parent.width;
+                            height: parent.height;
                             text: "Alt + V";
                             color: Theme.text-secondary;
                             font-size: Theme.shortcut-font-size;
@@ -328,12 +349,14 @@ export component AppWindow inherits Window {
                                     width: 64px;
                                     border-radius: 6px;
                                     border-width: 1px;
-                                    border-color: search-filter == 0 ? Theme.border-selected : Theme.border-subtle;
+                                    border-color: search-filter == 0 ? Theme.border-selected : Theme.control-border;
                                     background: search-filter == 0 ? Theme.surface-selected : Theme.surface-bg;
                                     TouchArea {
                                         clicked => { search-filter-requested(0); }
                                     }
                                     ThemedText {
+                                        width: 64px;
+                                        height: parent.height;
                                         text: "全部";
                                         color: search-filter == 0 ? Theme.accent-text : Theme.text-secondary;
                                         horizontal-alignment: center;
@@ -345,12 +368,14 @@ export component AppWindow inherits Window {
                                     width: 64px;
                                     border-radius: 6px;
                                     border-width: 1px;
-                                    border-color: search-filter == 1 ? Theme.border-selected : Theme.border-subtle;
+                                    border-color: search-filter == 1 ? Theme.border-selected : Theme.control-border;
                                     background: search-filter == 1 ? Theme.surface-selected : Theme.surface-bg;
                                     TouchArea {
                                         clicked => { search-filter-requested(1); }
                                     }
                                     ThemedText {
+                                        width: 64px;
+                                        height: parent.height;
                                         text: "文本";
                                         color: search-filter == 1 ? Theme.accent-text : Theme.text-secondary;
                                         horizontal-alignment: center;
@@ -362,12 +387,14 @@ export component AppWindow inherits Window {
                                     width: 64px;
                                     border-radius: 6px;
                                     border-width: 1px;
-                                    border-color: search-filter == 2 ? Theme.border-selected : Theme.border-subtle;
+                                    border-color: search-filter == 2 ? Theme.border-selected : Theme.control-border;
                                     background: search-filter == 2 ? Theme.surface-selected : Theme.surface-bg;
                                     TouchArea {
                                         clicked => { search-filter-requested(2); }
                                     }
                                     ThemedText {
+                                        width: 64px;
+                                        height: parent.height;
                                         text: "图片";
                                         color: search-filter == 2 ? Theme.accent-text : Theme.text-secondary;
                                         horizontal-alignment: center;
@@ -379,12 +406,14 @@ export component AppWindow inherits Window {
                                     width: 64px;
                                     border-radius: 6px;
                                     border-width: 1px;
-                                    border-color: search-filter == 3 ? Theme.border-selected : Theme.border-subtle;
+                                    border-color: search-filter == 3 ? Theme.border-selected : Theme.control-border;
                                     background: search-filter == 3 ? Theme.surface-selected : Theme.surface-bg;
                                     TouchArea {
                                         clicked => { search-filter-requested(3); }
                                     }
                                     ThemedText {
+                                        width: 64px;
+                                        height: parent.height;
                                         text: "收藏";
                                         color: search-filter == 3 ? Theme.accent-text : Theme.text-secondary;
                                         horizontal-alignment: center;
@@ -396,6 +425,8 @@ export component AppWindow inherits Window {
                 }
 
                 ThemedText {
+                    // 左栏固定 264px；标题槽显式收窄并裁剪，保证异常本地化文案不越过分隔线。
+                    width: 240px;
                     text: "最近复制";
                     color: Theme.text-primary;
                     font-size: Theme.section-title-font-size;
@@ -403,6 +434,7 @@ export component AppWindow inherits Window {
                 }
 
                 ThemedText {
+                    width: 240px;
                     text: "内容会在这里按最新复制时间排列";
                     color: Theme.text-secondary;
                     font-size: Theme.preview-font-size;
@@ -463,6 +495,8 @@ export component AppWindow inherits Window {
                         y: 0px;
                         width: parent.width;
                         height: parent.height;
+                        // 列表只允许纵向滚动；宽度始终跟随视口，长来源由行内槽位裁剪。
+                        viewport-width: parent.width;
                         // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
                         viewport-height: geometry-content-height;
                         changed viewport-y => {

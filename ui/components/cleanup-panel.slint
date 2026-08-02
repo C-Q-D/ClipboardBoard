@@ -8,6 +8,9 @@ import { TextButton } from "controls.slint";
 // 覆盖层专用文字组件统一字体，避免把 AppWindow 内部的 ThemedText 复制成第二套业务组件。
 component CleanupText inherits Text {
     font-family: Theme.font-family;
+    // 清理文案全部位于固定槽位；单行裁剪阻止异常长来源或本地化文字撑开对话框。
+    wrap: no-wrap;
+    overflow: clip;
 }
 
 // CleanupPanel 是 shell 最后声明的全屏命中层；透明底板也必须拦截底层列表和右栏点击。
@@ -48,7 +51,7 @@ export component CleanupPanel inherits Rectangle {
         height: dialog-height;
         border-radius: Theme.shell-radius;
         border-width: 1px;
-        border-color: Theme.border-subtle;
+        border-color: Theme.control-border;
         background: Theme.surface-bg;
 
         CleanupText {
@@ -198,15 +201,29 @@ export component CleanupPanel inherits Rectangle {
                 font-size: Theme.button-font-size;
             }
 
-            LineEdit {
+            // 外框只承担主题化焦点环；LineEdit 保留自己的文本编辑和可访问性语义。
+            clear-all-input-frame := Rectangle {
                 x: 0px;
                 y: 60px;
                 width: parent.width;
                 height: 38px;
-                font-family: Theme.font-family;
-                placeholder-text: "输入“清空全部”";
-                text: clear-all-confirmation-text;
-                edited(text) => { edit-clear-all-confirmation-text(text); }
+                border-radius: Theme.control-radius;
+                border-width: 1px;
+                border-color: clear-all-input.has-focus
+                    ? Theme.focus-ring : Theme.control-border;
+                background: Theme.surface-bg;
+                clip: true;
+
+                clear-all-input := LineEdit {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    font-family: Theme.font-family;
+                    placeholder-text: "输入“清空全部”";
+                    text: clear-all-confirmation-text;
+                    edited(text) => { edit-clear-all-confirmation-text(text); }
+                }
             }
 
             TextButton {

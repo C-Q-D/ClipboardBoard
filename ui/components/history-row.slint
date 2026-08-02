@@ -36,6 +36,9 @@ export struct ClipboardCard {
 // HistoryRowText 只统一共享视觉中的字体继承，不持有任何业务状态。
 component HistoryRowText inherits Text {
     font-family: Theme.font-family;
+    // 来源、时间和图片元数据都只能在父级分配的槽位内单行裁剪。
+    wrap: no-wrap;
+    overflow: clip;
 }
 
 // HistoryRowVisual 复用文本/图片卡片的背景、摘要和整行选择命中区。
@@ -49,8 +52,12 @@ export component HistoryRowVisual inherits Rectangle {
 
     // 父级必须显式传入外层行尺寸；共享组件本身不参与列表的高度推导。
     background: transparent;
+    // 外层行是固定 78/92px 的安全边界，任何异常长文案都不能绘制到下一行。
+    clip: true;
 
     card-background := Rectangle {
+        x: 0px;
+        y: 0px;
         height: card.is_image ? Theme.history-image-background-height : Theme.history-text-background-height;
         // 背景尺寸只表达卡片内部绘制范围；外层行高由两个父级路径分别固定。
         width: parent.width;
@@ -59,7 +66,7 @@ export component HistoryRowVisual inherits Rectangle {
             ? Theme.surface-selected
             : card-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
         border-width: selected ? 2px : 1px;
-        border-color: selected ? Theme.border-selected : Theme.border-subtle;
+        border-color: selected ? Theme.border-selected : Theme.control-border;
         border-radius: 10px;
 
         if !card.is_image: TextIcon {
@@ -91,13 +98,14 @@ export component HistoryRowVisual inherits Rectangle {
             HistoryRowText {
                 min-width: 0px;
                 horizontal-stretch: 1;
-                overflow: clip;
+                height: parent.height;
                 text: card.source;
                 color: Theme.text-secondary;
                 font-size: Theme.metadata-font-size;
             }
             HistoryRowText {
                 min-width: 0px;
+                height: parent.height;
                 text: card.relative_time;
                 color: Theme.text-muted;
                 font-size: Theme.metadata-font-size;
@@ -114,7 +122,7 @@ export component HistoryRowVisual inherits Rectangle {
             height: 52px;
             background: Theme.window-bg;
             border-width: 1px;
-            border-color: Theme.border-subtle;
+            border-color: Theme.control-border;
             border-radius: 6px;
             clip: true;
             Image {
@@ -159,6 +167,7 @@ export component HistoryRowVisual inherits Rectangle {
             HistoryRowText {
                 min-width: 0px;
                 horizontal-stretch: 1;
+                height: parent.height;
                 text: card.source;
                 color: Theme.text-secondary;
                 font-size: Theme.metadata-font-size;
@@ -166,6 +175,7 @@ export component HistoryRowVisual inherits Rectangle {
             }
             HistoryRowText {
                 min-width: 0px;
+                height: parent.height;
                 text: card.relative_time;
                 color: Theme.text-muted;
                 font-size: Theme.metadata-font-size;

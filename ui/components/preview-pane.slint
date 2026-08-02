@@ -9,6 +9,9 @@ import { ClipboardCard } from "history-row.slint";
 // 预览文字统一使用主题字体；组件不把来源、时间或正文复制成第二套状态。
 component PreviewText inherits Text {
     font-family: Theme.font-family;
+    // 预览字段默认单行裁剪；正文在具体 Flickable 中显式打开 word-wrap，避免长来源改变布局。
+    wrap: no-wrap;
+    overflow: clip;
 }
 
 // PreviewPane 只展示当前 selected-card 的安全摘要；复制、收藏和删除属于后续原子。
@@ -46,7 +49,7 @@ export component PreviewPane inherits Rectangle {
     background: Theme.surface-bg;
     border-radius: Theme.control-radius;
     border-width: 1px;
-    border-color: Theme.border-subtle;
+    border-color: Theme.control-border;
 
     // 内容内缩与列表栏保持一致；右栏自身负责裁剪，不推动外层窗口高度。
     Rectangle {
@@ -67,6 +70,7 @@ export component PreviewPane inherits Rectangle {
             font-size: Theme.section-title-font-size;
             font-weight: Theme.font-weight-semibold;
             vertical-alignment: center;
+            overflow: clip;
         }
 
         if has-selected-card: PreviewText {
@@ -100,6 +104,7 @@ export component PreviewPane inherits Rectangle {
             width: parent.width;
             height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height;
             // viewport-height 与摘要 Text 的实际 preferred-height 同步，长摘要才能滚动。
+            viewport-width: parent.width;
             viewport-height: preview-text.preferred-height;
 
             Rectangle {
@@ -129,7 +134,7 @@ export component PreviewPane inherits Rectangle {
             height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height - 24px;
             background: Theme.window-bg;
             border-width: 1px;
-            border-color: Theme.border-subtle;
+            border-color: Theme.control-border;
             border-radius: Theme.control-radius;
             clip: true;
 
@@ -226,13 +231,14 @@ export component PreviewPane inherits Rectangle {
             height: preview-action-bar-height;
             background: Theme.surface-bg;
             border-width: 1px;
-            border-color: Theme.border-subtle;
+            border-color: Theme.control-border;
 
             HorizontalLayout {
                 x: 8px;
-                y: 9px;
+                y: 8px;
                 width: parent.width - 16px;
-                height: 36px;
+                // 主操作保持计划规定的 108×38 逻辑命中区；操作栏仍固定 54px，不挤压正文。
+                height: 38px;
                 spacing: 8px;
 
                 pin-button := TextButton {
@@ -263,7 +269,8 @@ export component PreviewPane inherits Rectangle {
                 }
 
                 copy-button := TextButton {
-                    width: 96px;
+                    width: 108px;
+                    height: 38px;
                     primary: true;
                     enabled: has-selected-card && !history-mutation-pending && card.copy_enabled;
                     label: card.is_image ? "复制图片" : "复制文本";
@@ -276,4 +283,8 @@ export component PreviewPane inherits Rectangle {
             }
         }
     }
+
+    // Rust 契约读取真实组件尺寸，避免用截图猜测主按钮命中区并误把布局宽度当成命中宽度。
+    out property <length> copy-hit-width: copy-button.width;
+    out property <length> copy-hit-height: copy-button.height;
 }

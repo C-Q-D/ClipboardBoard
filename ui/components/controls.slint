@@ -43,11 +43,11 @@ component ButtonFrame inherits Rectangle {
         : hovered ? Theme.surface-hover
         : Theme.surface-bg;
     border-color: !enabled
-        ? Theme.border-subtle
-        : primary ? Theme.accent-bg
+        ? Theme.control-border
+        : primary ? Theme.accent-text
         : danger ? Theme.danger
         : pressed ? Theme.border-selected
-        : Theme.border-subtle;
+        : Theme.control-border;
 }
 
 // IconButton 是 36×36 起步的图标命中区；icon 只选择视觉组件，点击不携带业务参数。

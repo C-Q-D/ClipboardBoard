@@ -9,11 +9,14 @@ export global Theme {
     in property <color> surface-bg: #15151A;
     in property <color> surface-hover: #1E1D25;
     in property <color> surface-selected: #2B2936;
+    // 安静分隔线保持低对比度；真正可操作控件使用 control-border，避免边界不可见。
     in property <color> border-subtle: #2A2931;
-    in property <color> border-selected: #625C73;
+    in property <color> control-border: #6A6378;
+    in property <color> border-selected: #7B748E;
     in property <color> text-primary: #F2F1F5;
     in property <color> text-secondary: #AAA7B0;
-    in property <color> text-muted: #77747E;
+    // 元数据仍需在深色表面上达到正文 4.5:1 的最低对比度，不能用不可读的灰色伪装层级。
+    in property <color> text-muted: #85818C;
     in property <color> accent-bg: #D8D3E4;
     in property <color> accent-text: #17151B;
     in property <color> focus-ring: #9086A6;

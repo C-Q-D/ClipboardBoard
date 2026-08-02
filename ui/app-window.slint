@@ -840,7 +840,10 @@ export component AppWindow inherits Window {
                         height: geometry-content-height;
                         for card[index] in window-cards: HistoryCard {
                             x: 0px;
+                            // 绝对定位父容器不会使用 preferred-height，必须显式声明行高，
+                            // 否则 HistoryCard delegate 的实际高度为零而完全不可见。
                             y: window-offsets[index];
+                            height: card.is_image ? 186px : 106px;
                             width: parent.width;
                             card: card;
                             card-index: index;

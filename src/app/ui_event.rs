@@ -3185,8 +3185,10 @@ fn apply_window_commit(
     }
     // 先抑制中间布局回调，再原子替换 cards/offsets/尺寸；最终视口设置后才允许回调携带 token。
     window.set_geometry_events_suppressed(true);
-    window.set_window_cards(ModelRc::new(VecModel::from(cards)));
+    // 先发布与卡片一一对应的偏移模型，再发布卡片模型；避免 repeater 在偏移模型为空时
+    // 创建 delegate，导致首次进入显式 Flickable 时绑定被永久判定为无效。
     window.set_window_offsets(ModelRc::new(VecModel::from(offsets)));
+    window.set_window_cards(ModelRc::new(VecModel::from(cards)));
     window.set_window_start(window_start);
     window.set_window_length(window_length);
     window.set_history_logical_count(logical_count);

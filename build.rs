@@ -96,10 +96,13 @@ fn write_generated_resource_constants(out_dir: &Path, icon_resource_id: u16) {
 
 /// 在资源编译器可用时嵌入版本与主图标；工具不可用时保留开发构建并明确报警。
 fn configure_windows_resources(icon_path: &Path, icon_resource_id: u16) {
-    if !resource_compiler_available() {
+    let Some(resource_compiler) = locate_resource_compiler() else {
         println!("cargo:warning=Windows 资源编译器不可用，ClipboardBoard 图标和版本资源未嵌入");
         return;
-    }
+    };
+    // 把已解析的 SDK 目录只注入当前构建脚本进程，供 rc.exe 的依赖工具或子进程使用；
+    // 资源编译器本身通过下方显式 toolkit_path 调用，避免要求用户永久修改环境变量。
+    prepend_resource_compiler_path(&resource_compiler);
 
     let version = env::var("CARGO_PKG_VERSION").expect("Cargo 未提供 CARGO_PKG_VERSION");
     let version_value = version_resource_value(&version)
@@ -118,18 +121,81 @@ fn configure_windows_resources(icon_path: &Path, icon_resource_id: u16) {
     resource.set("OriginalFilename", "clipboard-board.exe");
     resource.set_version_info(winres::VersionInfo::FILEVERSION, version_value);
     resource.set_version_info(winres::VersionInfo::PRODUCTVERSION, version_value);
+    // winres 的 MSVC 实现不会依赖 PATH 解析 rc.exe，而是直接拼接 toolkit_path；
+    // 显式传入已定位的 bin 架构目录，确保注册表不可用时自动发现仍然真正可编译。
+    resource.set_toolkit_path(
+        resource_compiler
+            .parent()
+            .and_then(Path::to_str)
+            .expect("资源编译器路径包含无法转换的非 Unicode 字符"),
+    );
     resource
         .compile()
         .expect("Windows 资源编译失败，未生成可发布的版本/图标资源");
 }
 
-/// 检测 rc.exe 是否可调用；只在目标为 Windows 时执行该探测。
-fn resource_compiler_available() -> bool {
-    Command::new("where.exe")
-        .arg("rc.exe")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+/// 定位可调用的 rc.exe；先使用 PATH，再探测常见 Windows SDK 安装目录。
+fn locate_resource_compiler() -> Option<PathBuf> {
+    if let Ok(output) = Command::new("where.exe").arg("rc.exe").output() {
+        if output.status.success() {
+            if let Some(path) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+            {
+                return Some(path);
+            }
+        }
+    }
+
+    let mut sdk_bin_roots = Vec::new();
+    for variable in ["WindowsSdkDir", "ProgramFiles(x86)", "ProgramFiles"] {
+        let Some(root) = env::var_os(variable).map(PathBuf::from) else {
+            continue;
+        };
+        let root = if variable == "WindowsSdkDir" {
+            root.join("bin")
+        } else {
+            root.join("Windows Kits").join("10").join("bin")
+        };
+        if root.is_dir() {
+            sdk_bin_roots.push(root);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for root in sdk_bin_roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        let mut versions = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        // 版本目录名称可直接按字符串倒序，优先使用最新 SDK，避免旧资源工具拒绝新格式。
+        versions.sort_by(|left, right| right.cmp(left));
+        for version in versions {
+            candidates.push(version.join("x64").join("rc.exe"));
+            candidates.push(version.join("x86").join("rc.exe"));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 将 rc.exe 所在目录放到当前构建脚本的 PATH 首位；不会修改用户持久化环境变量。
+fn prepend_resource_compiler_path(resource_compiler: &Path) {
+    let Some(parent) = resource_compiler.parent() else {
+        return;
+    };
+    let mut path = parent.as_os_str().to_owned();
+    if let Some(existing) = env::var_os("PATH") {
+        path.push(";");
+        path.push(existing);
+    }
+    env::set_var("PATH", path);
 }
 
 /// 将 SemVer 的前三段映射为四段 16 位 Windows 文件版本字段。

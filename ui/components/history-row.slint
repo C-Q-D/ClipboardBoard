@@ -35,10 +35,16 @@ export struct ClipboardCard {
 
 // HistoryRowText 只统一共享视觉中的字体继承，不持有任何业务状态。
 component HistoryRowText inherits Text {
+    // 列表标题、来源、时间和图片尺寸沿用默认系统字族；正文轻字重由专用子组件选择。
     font-family: Theme.font-family;
     // 来源、时间和图片元数据都只能在父级分配的槽位内单行裁剪。
     wrap: no-wrap;
     overflow: clip;
+}
+
+// HistoryRowBodyText 只用于摘要正文和状态说明，避免把列表元数据意外变成过细的 Light。
+component HistoryRowBodyText inherits HistoryRowText {
+    font-family: Theme.font-family-light;
 }
 
 // HistoryRowVisual 复用文本/图片卡片的背景、摘要和整行选择命中区。
@@ -56,16 +62,18 @@ export component HistoryRowVisual inherits Rectangle {
     clip: true;
 
     card-background := Rectangle {
-        x: 0px;
+        // 背景内缩而不缩小整行命中区，复现参考图中安静的列表边缘和连续底色。
+        x: Theme.history-card-inset;
         y: 0px;
         height: card.is_image ? Theme.history-image-background-height : Theme.history-text-background-height;
         // 背景尺寸只表达卡片内部绘制范围；外层行高由两个父级路径分别固定。
-        width: parent.width;
+        width: parent.width - Theme.history-card-inset - Theme.history-card-inset;
         clip: true;
         background: selected
             ? Theme.surface-selected
             : card-touch.has-hover ? Theme.surface-hover : Theme.surface-bg;
-        border-width: selected ? 2px : 1px;
+        // 选中态只保留一像素边界；未选中项不绘制卡片边框，避免列表变成密集的表格。
+        border-width: selected ? 1px : 0px;
         // 未选中项只保留安静的结构边界；选中项才使用高对比边框，层级与参考图一致。
         border-color: selected ? Theme.border-selected : Theme.border-subtle;
         border-radius: 10px;
@@ -88,10 +96,10 @@ export component HistoryRowVisual inherits Rectangle {
             }
         }
 
-        if !card.is_image: HistoryRowText {
-            x: 38px;
+        if !card.is_image: HistoryRowBodyText {
+            x: 46px;
             y: 8px;
-            width: parent.width - 52px;
+            width: parent.width - 60px;
             height: 32px;
             text: card.preview;
             color: Theme.text-primary;
@@ -101,9 +109,9 @@ export component HistoryRowVisual inherits Rectangle {
         }
 
         if !card.is_image: HorizontalLayout {
-            x: 38px;
+            x: 46px;
             y: 49px;
-            width: parent.width - 52px;
+            width: parent.width - 60px;
             height: 14px;
             spacing: 4px;
             // source 允许收缩并裁剪；relative_time 保留独立布局槽，不能被来源文案覆盖。
@@ -142,7 +150,7 @@ export component HistoryRowVisual inherits Rectangle {
                 width: parent.width; height: parent.height;
                 source: card.thumbnail; image-fit: cover;
             }
-            if !card.thumbnail_loaded && !card.thumbnail_failed: HistoryRowText {
+            if !card.thumbnail_loaded && !card.thumbnail_failed: HistoryRowBodyText {
                 // 加载文案必须显式占满 52×52 缩略图盒，不能依赖 Text 的 preferred 尺寸漂移出裁剪区。
                 x: 0px;
                 y: 0px;
@@ -159,7 +167,7 @@ export component HistoryRowVisual inherits Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: 7px;
             }
-            if !card.thumbnail_loaded && card.thumbnail_failed: HistoryRowText {
+            if !card.thumbnail_loaded && card.thumbnail_failed: HistoryRowBodyText {
                 x: 0px; y: 34px; width: parent.width; height: 14px;
                 text: "图片不可用";
                 color: Theme.text-muted; font-size: 10px;
@@ -196,12 +204,13 @@ export component HistoryRowVisual inherits Rectangle {
             }
         }
 
-        card-touch := TouchArea {
-            // 行内不再承载复制、收藏或删除；整行只产生选择意图，右栏操作区位于另一组件。
-            width: parent.width;
-            height: parent.height;
-            clicked => { row-selected(card-index); }
-        }
+    }
 
+    // 命中区必须直接覆盖外层 78/92px 行；背景只绘制 70/84px，底部透明间隔也必须可选择。
+    card-touch := TouchArea {
+        // 行内不再承载复制、收藏或删除；整行只产生选择意图，右栏操作区位于另一组件。
+        width: parent.width;
+        height: parent.height;
+        clicked => { row-selected(card-index); }
     }
 }

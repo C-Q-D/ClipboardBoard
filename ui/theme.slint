@@ -34,6 +34,11 @@ export global Theme {
     in property <length> content-padding: 12px;
     in property <length> section-gap: 10px;
     in property <length> control-hit-size: 36px;
+    // 历史项背景向内收 8px，保留列表的连续暗色基底；TouchArea 仍覆盖整行。
+    in property <length> history-card-inset: 8px;
+    // 筛选项保留 60px 真实命中槽位，选中表面在槽位内收窄成参考图的胶囊形态。
+    in property <length> filter-slot-width: 60px;
+    in property <length> filter-slot-gap: 8px;
     in property <length> scrollbar-width: 8px;
     in property <length> scrollbar-inset: 4px;
     in property <length> scrollbar-min-thumb-size: 28px;
@@ -46,6 +51,8 @@ export global Theme {
 
     // 采用系统字体回退，不把 design 目录中的 WOFF/WOFF2 带入程序。
     in property <string> font-family: "Microsoft YaHei UI";
+    // 参考图正文、说明和搜索提示使用轻字重；使用 Windows 已安装字体变体，不增加字体文件。
+    in property <string> font-family-light: "Microsoft YaHei UI Light";
     in property <length> app-name-font-size: 16px;
     in property <length> section-title-font-size: 14px;
     in property <length> history-preview-font-size: 13px;

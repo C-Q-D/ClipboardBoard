@@ -10,10 +10,16 @@ import { ClipboardCard } from "history-row.slint";
 
 // 预览文字统一使用主题字体；组件不把来源、时间或正文复制成第二套状态。
 component PreviewText inherits Text {
+    // 预览标题、类型标签和来源元数据沿用默认系统字族；正文由专用子组件选择轻字重。
     font-family: Theme.font-family;
     // 预览字段默认单行裁剪；正文在具体 Flickable 中显式打开 word-wrap，避免长来源改变布局。
     wrap: no-wrap;
     overflow: clip;
+}
+
+// PreviewBodyText 只承载受限正文或状态说明，避免把标题层级和元数据统一压成 Light。
+component PreviewBodyText inherits PreviewText {
+    font-family: Theme.font-family-light;
 }
 
 // PreviewPane 只展示当前 selected-card 的安全摘要；复制、收藏和删除属于后续原子。
@@ -136,7 +142,7 @@ export component PreviewPane inherits Rectangle {
             overflow: clip;
         }
 
-        if !has-selected-card: PreviewText {
+        if !has-selected-card: PreviewBodyText {
             x: 0px;
             y: preview-header-height;
             width: parent.width;
@@ -151,6 +157,24 @@ export component PreviewPane inherits Rectangle {
         }
 
         // 滚动容器始终存在但仅在文本预览时可见，确保输出的滚动几何不会引用条件实例。
+        if has-selected-card && !card.is_image: Rectangle {
+            // 正文使用独立的柔和表面，复现参考图中“标题—内容卡片—操作栏”的层级。
+            x: 0px;
+            y: preview-header-height + 10px;
+            width: parent.width;
+            height: max(
+                0px,
+                parent.height - preview-header-height - preview-action-bar-height
+                    - preview-status-slot-height - 10px
+            );
+            // 内容表面与左侧选中态共享灰紫层级，避免右栏仍像旧版的纯黑空洞区域。
+            background: Theme.surface-selected;
+            border-width: 1px;
+            border-color: Theme.border-subtle;
+            border-radius: 10px;
+            clip: true;
+        }
+
         preview-scroll := ScrollView {
             visible: has-selected-card && !card.is_image;
             // 复用标准滚动条的拖动、滚轮和按需显示行为；文本不足一屏时不显示空滚动条。
@@ -158,12 +182,17 @@ export component PreviewPane inherits Rectangle {
             vertical-scrollbar-policy: ScrollBarPolicy.always-off;
             horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
             mouse-drag-pan-enabled: true;
-            x: 0px;
-            y: preview-header-height;
-            width: parent.width;
-            height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height;
+            // 正文滚动视口在内容卡片内留出 10px 边距；ScrollView 仍是唯一滚动状态源。
+            x: 10px;
+            y: preview-header-height + 20px;
+            width: parent.width - 20px;
+            height: max(
+                0px,
+                parent.height - preview-header-height - preview-action-bar-height
+                    - preview-status-slot-height - 30px
+            );
             // viewport-height 与摘要 Text 的实际 preferred-height 同步，长摘要才能滚动。
-            viewport-width: parent.width;
+            viewport-width: self.width;
             viewport-height: preview-text.preferred-height;
 
             Rectangle {
@@ -171,7 +200,7 @@ export component PreviewPane inherits Rectangle {
                 height: preview-text.preferred-height;
                 background: transparent;
 
-                preview-text := PreviewText {
+                preview-text := PreviewBodyText {
                     x: 0px;
                     y: 0px;
                     width: parent.width;
@@ -198,13 +227,19 @@ export component PreviewPane inherits Rectangle {
 
         if has-selected-card && card.is_image: Rectangle {
             x: 0px;
-            y: preview-header-height;
+            y: preview-header-height + 10px;
             width: parent.width;
-            height: parent.height - preview-header-height - preview-action-bar-height - preview-status-slot-height - 24px;
-            background: Theme.window-bg;
+            height: max(
+                0px,
+                parent.height - preview-header-height - preview-action-bar-height
+                    // 图片表面在尺寸元数据前结束，保留两像素边界，避免内容层覆盖尺寸文案。
+                    - preview-status-slot-height - 30px
+            );
+            // 图片预览与文本预览使用同一内容表面，状态变化不改变右栏层级。
+            background: Theme.surface-selected;
             border-width: 1px;
-            border-color: Theme.control-border;
-            border-radius: Theme.control-radius;
+            border-color: Theme.border-subtle;
+            border-radius: 10px;
             clip: true;
 
             // 右栏图片只使用受限 thumbnail，并保持完整比例；绝不读取原图或使用 cover。
@@ -224,7 +259,7 @@ export component PreviewPane inherits Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2 - 12px;
             }
-            if !card.thumbnail_loaded && !card.thumbnail_failed: PreviewText {
+            if !card.thumbnail_loaded && !card.thumbnail_failed: PreviewBodyText {
                 x: 0px;
                 y: (parent.height - self.height) / 2 + 18px;
                 width: parent.width;
@@ -241,7 +276,7 @@ export component PreviewPane inherits Rectangle {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2 - 12px;
             }
-            if !card.thumbnail_loaded && card.thumbnail_failed: PreviewText {
+            if !card.thumbnail_loaded && card.thumbnail_failed: PreviewBodyText {
                 x: 0px;
                 y: (parent.height - self.height) / 2 + 18px;
                 width: parent.width;

@@ -1,6 +1,6 @@
 //! 此集成测试验证真实 Slint 卡片代理把鼠标点击转换为可见索引。
 //!
-//! 测试只覆盖 WCB-INT-05 的卡片点击边界：卡片区域发送索引，空白区域不发送，
+//! 测试覆盖首项、次项、视觉底部留白和滚动后的卡片边界；分隔线外的点击不发送选择，
 //! 记录身份与异步代次校验由 UI reducer 的单元测试负责。
 
 use clipboard_board::{create_app_window, ClipboardCard};
@@ -64,24 +64,22 @@ fn 卡片点击产生可见索引且空白区无动作() {
     });
 
     window.show().expect("测试窗口应成功显示");
-    // 720×520 双栏布局中左栏历史列表从约 242px 开始，每张文本代理外层高度为 78px。
-    click(&window, 100.0, 250.0);
-    click(&window, 100.0, 328.0);
-    // 当前 mock 布局的第一项背景结束于约 y=271，第二项从约 y=280 开始；
-    // y=275 落在两项之间的真实透明间隔，不能使用旧高度夹具中的 y=321。
-    click(&window, 100.0, 275.0);
-    assert_eq!(selected.borrow().as_slice(), &[0, 1]);
+    // 当前 720×520 双栏布局中历史首行约从 y=142 开始，每个文本代理外层固定 78px。
+    click(&window, 100.0, 175.0);
+    click(&window, 100.0, 253.0);
+    // 首行背景在约 y=212 结束，但其外层底部 8px 仍属于首行命中区，不能被视觉留白吞掉。
+    click(&window, 100.0, 218.0);
+    assert_eq!(selected.borrow().as_slice(), &[0, 1, 0]);
 
     // 视口不足以同时显示第三项时，沿用生产 setter 滚动一个文本行高后再点击末项；
     // 测试仍验证真实 TouchArea 产生的稳定索引，而不是直接调用选择回调。
     window.set_history_viewport_y(-78.0);
     i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
-    // 78px 文本外层在该 mock 视口中第三项的可见背景覆盖约 y=280..344；
-    // 选取其内部坐标，避免旧 106px 夹具的 y=350 落入透明间隔。
-    click(&window, 100.0, 330.0);
-    assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
+    // 78px 文本外层在该 mock 视口中第三项覆盖约 y=242..320，选择其内部坐标。
+    click(&window, 100.0, 253.0);
+    assert_eq!(selected.borrow().as_slice(), &[0, 1, 0, 2]);
     // 最终左栏宽度为 264px；x=310 已在分隔线右侧，不应伪造历史行选择。
     click(&window, 310.0, 250.0);
 
-    assert_eq!(selected.borrow().as_slice(), &[0, 1, 2]);
+    assert_eq!(selected.borrow().as_slice(), &[0, 1, 0, 2]);
 }

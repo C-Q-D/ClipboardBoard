@@ -298,7 +298,8 @@ export component AppWindow inherits Window {
                             y: 1px;
                             width: parent.width - 31px;
                             height: parent.height - 2px;
-                            font-family: Theme.font-family;
+                            // 搜索提示和输入内容采用轻字重；LineEdit 仍是唯一输入与防抖事件入口。
+                            font-family: Theme.font-family-light;
                             placeholder-text: "搜索剪贴内容…";
                             // std-widgets::LineEdit 的内部文字色由当前平台样式管理；外层主题框、字体和图标负责与本应用表面对齐。
                             text: search-text;
@@ -368,21 +369,27 @@ export component AppWindow inherits Window {
 
                             HorizontalLayout {
                                 height: 36px;
-                                // 左栏固定为 264px；四个 60px 控件和三个 6px 间隔共 258px，
-                                // 右侧保留 6px 安全余量，避免最后一个筛选覆盖分隔线。
-                                spacing: 6px;
+                                // 四个固定命中槽位只承载文字或选中胶囊，右侧留出滚动条与分隔线安全区。
+                                spacing: Theme.filter-slot-gap;
 
                                 Rectangle {
-                                    width: 60px;
-                                    border-radius: 6px;
-                                    border-width: search-filter == 0 ? 1px : 0px;
-                                    border-color: search-filter == 0 ? Theme.border-selected : transparent;
-                                    background: search-filter == 0 ? Theme.surface-selected : transparent;
+                                    width: Theme.filter-slot-width;
+                                    background: transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(0); }
                                     }
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 4px;
+                                        width: parent.width - 20px;
+                                        height: parent.height - 8px;
+                                        border-radius: Theme.control-radius;
+                                        border-width: search-filter == 0 ? 1px : 0px;
+                                        border-color: search-filter == 0 ? Theme.border-selected : transparent;
+                                        background: search-filter == 0 ? Theme.surface-selected : transparent;
+                                    }
                                     ThemedText {
-                                        width: 60px;
+                                        width: parent.width;
                                         height: parent.height;
                                         text: "全部";
                                         // accent-text 只适用于浅色 accent-bg；深色选中面必须使用强白正文。
@@ -393,16 +400,23 @@ export component AppWindow inherits Window {
                                 }
 
                                 Rectangle {
-                                    width: 60px;
-                                    border-radius: 6px;
-                                    border-width: search-filter == 1 ? 1px : 0px;
-                                    border-color: search-filter == 1 ? Theme.border-selected : transparent;
-                                    background: search-filter == 1 ? Theme.surface-selected : transparent;
+                                    width: Theme.filter-slot-width;
+                                    background: transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(1); }
                                     }
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 4px;
+                                        width: parent.width - 20px;
+                                        height: parent.height - 8px;
+                                        border-radius: Theme.control-radius;
+                                        border-width: search-filter == 1 ? 1px : 0px;
+                                        border-color: search-filter == 1 ? Theme.border-selected : transparent;
+                                        background: search-filter == 1 ? Theme.surface-selected : transparent;
+                                    }
                                     ThemedText {
-                                        width: 60px;
+                                        width: parent.width;
                                         height: parent.height;
                                         text: "文本";
                                         color: search-filter == 1 ? Theme.text-primary : Theme.text-secondary;
@@ -412,16 +426,23 @@ export component AppWindow inherits Window {
                                 }
 
                                 Rectangle {
-                                    width: 60px;
-                                    border-radius: 6px;
-                                    border-width: search-filter == 2 ? 1px : 0px;
-                                    border-color: search-filter == 2 ? Theme.border-selected : transparent;
-                                    background: search-filter == 2 ? Theme.surface-selected : transparent;
+                                    width: Theme.filter-slot-width;
+                                    background: transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(2); }
                                     }
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 4px;
+                                        width: parent.width - 20px;
+                                        height: parent.height - 8px;
+                                        border-radius: Theme.control-radius;
+                                        border-width: search-filter == 2 ? 1px : 0px;
+                                        border-color: search-filter == 2 ? Theme.border-selected : transparent;
+                                        background: search-filter == 2 ? Theme.surface-selected : transparent;
+                                    }
                                     ThemedText {
-                                        width: 60px;
+                                        width: parent.width;
                                         height: parent.height;
                                         text: "图片";
                                         color: search-filter == 2 ? Theme.text-primary : Theme.text-secondary;
@@ -431,16 +452,23 @@ export component AppWindow inherits Window {
                                 }
 
                                 Rectangle {
-                                    width: 60px;
-                                    border-radius: 6px;
-                                    border-width: search-filter == 3 ? 1px : 0px;
-                                    border-color: search-filter == 3 ? Theme.border-selected : transparent;
-                                    background: search-filter == 3 ? Theme.surface-selected : transparent;
+                                    width: Theme.filter-slot-width;
+                                    background: transparent;
                                     TouchArea {
                                         clicked => { search-filter-requested(3); }
                                     }
+                                    Rectangle {
+                                        x: 10px;
+                                        y: 4px;
+                                        width: parent.width - 20px;
+                                        height: parent.height - 8px;
+                                        border-radius: Theme.control-radius;
+                                        border-width: search-filter == 3 ? 1px : 0px;
+                                        border-color: search-filter == 3 ? Theme.border-selected : transparent;
+                                        background: search-filter == 3 ? Theme.surface-selected : transparent;
+                                    }
                                     ThemedText {
-                                        width: 60px;
+                                        width: parent.width;
                                         height: parent.height;
                                         text: "收藏";
                                         color: search-filter == 3 ? Theme.text-primary : Theme.text-secondary;

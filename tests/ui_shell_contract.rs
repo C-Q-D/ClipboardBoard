@@ -242,11 +242,13 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         "选中筛选文字没有在深色表面上形成可读的浅色像素"
     );
 
-    // 左栏四项筛选位于全局 x=28..286、y=94..130；索引顺序必须原样透传。
+    // 左栏四项筛选保留 60px 命中槽位，内部胶囊收窄；索引顺序必须原样透传。
     for x in [58.0, 124.0, 190.0, 256.0] {
         click(&window, x, 112.0);
     }
-    assert_eq!(filters.borrow().as_slice(), &[0, 1, 2, 3]);
+    // 第一项右边缘仍属于 60px 命中槽，不能因视觉胶囊收窄而丢失筛选操作。
+    click(&window, 82.0, 112.0);
+    assert_eq!(filters.borrow().as_slice(), &[0, 1, 2, 3, 0]);
     assert!(!filters.borrow().is_empty(), "筛选契约必须真实执行至少一次");
 
     // 264px 左栏与右侧占位之间必须有连续 1px 分隔线，筛选按钮不能覆盖它。
@@ -482,6 +484,12 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
     click(&geometry, 100.0, 175.0);
     assert_eq!(legacy_selected.borrow().as_slice(), &[0]);
     assert_eq!(geometry_selected.borrow().as_slice(), &[0]);
+
+    // 文本外层行的底部 8px 属于同一行，不能因卡片背景内缩而失去整行选择命中。
+    click(&window, 100.0, 215.0);
+    click(&geometry, 100.0, 215.0);
+    assert_eq!(legacy_selected.borrow().as_slice(), &[0, 0]);
+    assert_eq!(geometry_selected.borrow().as_slice(), &[0, 0]);
 
     // UIR-08：三种图片缩略图状态都必须在固定 92px 行内留下真实可见证据。
     window.set_selected_index(-1);

@@ -30,7 +30,8 @@ export global Theme {
     // 本轮固定的圆角、间距和交互命中尺寸；几何原子会继续复用这些令牌。
     in property <length> shell-radius: 14px;
     in property <length> control-radius: 6px;
-    in property <length> page-inset: 14px;
+    // 客户区只有一个主表面；原来“外边距 14px + shell 内缩 14px”合并为一个内容内缩。
+    in property <length> content-inset: 28px;
     in property <length> content-padding: 12px;
     in property <length> section-gap: 10px;
     in property <length> control-hit-size: 36px;

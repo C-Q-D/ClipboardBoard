@@ -1,6 +1,6 @@
-//! 此集成测试用真实软件渲染验证 UIR-03 的连续外框、UIR-05 的双栏边界和列表首项几何。
+//! 此集成测试用真实软件渲染验证 UIR-03 的单一客户区表面、UIR-05 的双栏边界和列表首项几何。
 //!
-//! 测试只采样窗口背景、shell 表面和真实卡片绘制，不读取源码字符串，也不访问剪贴板、
+//! 测试只采样客户区主表面、边界和真实卡片绘制，不读取源码字符串，也不访问剪贴板、
 //! 数据库或默认应用目录；卡片只使用受限摘要和安全默认字段。
 
 use clipboard_board::app::set_window_commit;
@@ -201,9 +201,9 @@ fn solid_thumbnail() -> Image {
     Image::from_rgba8(buffer)
 }
 
-/// 空历史保留窗口外框；四个筛选可命中；填充卡片后首项位于左栏历史槽顶部。
+/// 空历史保持单一客户区表面；四个筛选可命中；填充卡片后首项位于左栏历史槽顶部。
 #[test]
-fn 连续外框隔离窗口背景且首项没有整卡空白() {
+fn 单一客户区表面且首项没有整卡空白() {
     slint::platform::set_platform(Box::new(TestingBackend::new(TestingBackendOptions {
         mock_time: true,
         threading: true,
@@ -228,13 +228,15 @@ fn 连续外框隔离窗口背景且首项没有整卡空白() {
         "legacy 历史内容必须为右侧 8px 滚动条预留槽位"
     );
 
-    // #09090B 是窗口外背景；#101014 是 shell 内表面，采样点避开边框和文字。
+    // 根客户区与 shell 共用 #101014；四角和客户区中部不能再出现窗口背景或内缩边框。
     for (x, y) in [(0, 0), (719, 0), (0, 519), (719, 519)] {
-        assert_eq!(pixel(&empty_snapshot, x, y), [9, 9, 11, 255]);
+        assert_eq!(pixel(&empty_snapshot, x, y), [16, 16, 20, 255]);
     }
-    assert_eq!(pixel(&empty_snapshot, 7, 320), [9, 9, 11, 255]);
+    assert_eq!(pixel(&empty_snapshot, 7, 320), [16, 16, 20, 255]);
     assert_eq!(pixel(&empty_snapshot, 20, 20), [16, 16, 20, 255]);
     assert_eq!(pixel(&empty_snapshot, 700, 500), [16, 16, 20, 255]);
+    // 客户区不再在 14px 处绘制第二个 shell 边框；该点应仍是主表面，而不是边框色。
+    assert_eq!(pixel(&empty_snapshot, 14, 320), [16, 16, 20, 255]);
 
     // 选中筛选必须使用深色表面上的强白正文，不能回退到浅色主按钮专用的深色文字。
     assert!(

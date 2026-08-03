@@ -92,7 +92,8 @@ export component AppWindow inherits Window {
     title: "ClipboardBoard";
     width: 720px;
     height: 520px;
-    background: Theme.window-bg;
+    // 根客户区是唯一主表面；内层 shell 只负责统一边界、裁剪和事件覆盖，不再形成内缩窗口。
+    background: Theme.shell-bg;
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
     // legacy repeater 的动态模型；进入 geometry-mode 后强制为空，避免隐藏 ListView 访问旧模型。
@@ -203,24 +204,25 @@ export component AppWindow inherits Window {
         }
 
 
-        // 唯一内容 shell：窗口背景留在外侧，shell 负责圆角裁剪和连续内容表面。
+        // 唯一内容 shell 覆盖整个客户区；原生标题栏仍由 Window 保留，客户区内不再嵌套第二个面板。
         shell := Rectangle {
-            x: Theme.page-inset;
-            y: Theme.page-inset;
-            width: parent.width - Theme.page-inset - Theme.page-inset;
-            height: parent.height - Theme.page-inset - Theme.page-inset;
-            background: Theme.shell-bg;
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            // 主表面已经由 AppWindow 绘制；透明 shell 避免再次建立客户区表面。
+            background: transparent;
             border-width: 1px;
             border-color: Theme.border-subtle;
             border-radius: Theme.shell-radius;
             clip: true;
 
             VerticalLayout {
-                // shell 内部保留独立 14px padding；外框尺寸变化不能改写业务布局顺序。
-                x: Theme.page-inset;
-                y: Theme.page-inset;
-                width: parent.width - Theme.page-inset - Theme.page-inset;
-                height: parent.height - Theme.page-inset - Theme.page-inset;
+                // 合并原 shell 外边距和内部 padding，保持工具栏及双栏内容的原有全局坐标。
+                x: Theme.content-inset;
+                y: Theme.content-inset;
+                width: parent.width - Theme.content-inset - Theme.content-inset;
+                height: parent.height - Theme.content-inset - Theme.content-inset;
                 spacing: 12px;
 
                 // 固定 54px 顶部工具栏只承载品牌、活动历史总数、搜索和静态快捷键提示。

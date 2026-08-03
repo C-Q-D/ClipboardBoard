@@ -82,7 +82,7 @@ fn 顶部工具栏显示真实品牌搜索和快捷键提示() {
     assert_eq!(snapshot.width(), 720);
     assert_eq!(snapshot.height(), 520);
 
-    // 全局坐标叠加 14px 外边距和 14px shell padding；工具栏内容位于 y=28..82。
+    // 唯一客户区内容内缩为 28px；工具栏内容保持原有全局坐标 y=28..82。
     assert!(
         non_shell_pixels(&snapshot, 28, 188, 28, 82) > 200,
         "品牌图标和 ClipboardBoard 文案没有形成真实绘制"

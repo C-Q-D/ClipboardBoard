@@ -1801,10 +1801,17 @@ pub fn bind_app_window(window: &AppWindow) {
         }
     });
 
-    // 标题栏关闭和 Alt+F4 都只拒绝本次原生关闭请求；Esc 仍通过显式事件隐藏到托盘。
-    window
-        .window()
-        .on_close_requested(|| CloseRequestResponse::KeepWindowShown);
+    // 标题栏关闭和 Alt+F4 必须进入统一 Quit 收口；Esc/Alt+V 仍只隐藏当前面板并保留托盘驻留。
+    // 先投递 reducer 让业务桥、迟到事件和资源清理按既有顺序收口，再允许 Slint 隐藏窗口。
+    window.window().on_close_requested(|| {
+        if let Err(error) = post_ui_event(UiEvent::Quit) {
+            // 事件队列已经关闭时，直接请求退出，避免“窗口已隐藏但进程仍驻留”的半关闭状态。
+            if let Err(quit_error) = slint::quit_event_loop() {
+                eprintln!("原生关闭退出事件无法入队：{error}；直接退出事件循环也失败：{quit_error}");
+            }
+        }
+        CloseRequestResponse::HideWindow
+    });
 
     window.on_card_selection_requested(|index| {
         // Slint 回调与 UI reducer 位于同一线程；在事件排队前立刻把易变索引解析成稳定身份。

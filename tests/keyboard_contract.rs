@@ -1,9 +1,12 @@
 //! 此集成测试验证面板级键盘捕获先于搜索框等内部控件执行。
 //!
-//! 测试验证 WCB-INT-01 的键盘契约，以及 WCB-INT-03 的失焦驻留和原生关闭拒绝；
+//! 测试验证 WCB-INT-01 的键盘契约，以及 WCB-INT-03 的失焦驻留和原生关闭退出；
 //! 上下键不得改变当前选择，Enter 组合不得触发复制，Esc 仍负责关闭面板。
 
-use clipboard_board::{app::bind_app_window, create_app_window};
+use clipboard_board::{
+    app::{bind_app_window, ui_state_snapshot},
+    create_app_window,
+};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, SharedString};
 use std::cell::{Cell, RefCell};
@@ -85,8 +88,6 @@ fn 内部焦点遵守面板级键盘契约() {
         .window()
         .dispatch_event(WindowEvent::WindowActiveChanged(false));
     assert!(window.window().is_visible());
-    window.window().dispatch_event(WindowEvent::CloseRequested);
-    assert!(window.window().is_visible());
     // 搜索框位于固定顶部工具区；先点击并输入字符，以可观察回调证明内部 LineEdit 已获焦。
     focus_search_input(&window);
     send_text(&window, "x");
@@ -131,4 +132,15 @@ fn 内部焦点遵守面板级键盘契约() {
 
     send_key(&window, Key::Escape);
     assert_eq!(dismiss_count.get(), 1);
+
+    // 原生标题栏关闭必须收口进程，而不是像 Esc 一样只保留托盘驻留窗口。
+    window.show().expect("关闭契约测试应能重新显示窗口");
+    window.window().dispatch_event(WindowEvent::CloseRequested);
+    assert!(!window.window().is_visible(), "原生关闭请求不能继续保持窗口可见");
+    // 真实 UI 事件队列必须消费 Quit 并结束事件循环；仅隐藏窗口不能满足进程退出语义。
+    slint::run_event_loop_until_quit().expect("原生关闭应能结束 Slint 事件循环");
+    assert!(
+        ui_state_snapshot().quitting,
+        "原生关闭结束事件循环前必须先置位退出闩锁"
+    );
 }

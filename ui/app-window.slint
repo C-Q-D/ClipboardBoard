@@ -1,6 +1,6 @@
-// 此文件定义 ClipboardBoard 的黑色浮动看板、搜索筛选、文本摘要卡片和面板级键盘契约。
+// 此文件定义 ClipboardBoard 的单窗口 Apple-inspired 工作台视觉层。
+// 视觉层使用灰色、浅紫和轻量玻璃材质；窗口边框、标题栏、拖拽和缩放仍交给 Windows。
 // 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
-// 历史内容区默认保留旧 ListView 兼容路径；metadata 模式使用普通 Flickable 和精确画布。
 
 import { LineEdit } from "std-widgets.slint";
 
@@ -44,143 +44,231 @@ component ListView inherits Flickable {
 
 // HistoryCard 复用文本/图片卡片视觉和操作按钮；geometry 模式只替换其绝对定位父容器。
 component HistoryCard inherits Rectangle {
+    // 当前卡片展示 DTO。
     in property <ClipboardCard> card;
+    // 当前卡片在可见窗口中的索引。
     in property <int> card-index: -1;
+    // 当前卡片是否是 Rust 侧统一选择状态。
     in property <bool> selected: false;
+    // 当前是否有任意历史 mutation 正在进行。
     in property <bool> mutation-pending: false;
+    // 卡片被鼠标选择时发出索引。
     callback card-selected(index: int);
+    // 卡片复制按钮被点击时发出索引。
     callback card-copied(index: int);
+    // 卡片收藏按钮被点击时发出索引。
     callback card-pinned(index: int);
+    // 卡片删除按钮被点击时发出索引。
     callback card-deleted(index: int);
 
-    // 显式固定 layout info，避免 ListView 把内部 TouchArea 的默认首选高度叠加到行高。
+    // 固定行高必须与 Rust history_geometry 保持一致，避免虚拟列表和滚动坐标漂移。
     preferred-height: card.is_image ? 186px : 106px;
     min-height: self.preferred-height;
     max-height: self.preferred-height;
     background: transparent;
 
-    card-background := Rectangle {
-        height: card.is_image ? 176px : 96px;
-        // 根 HistoryCard 已声明真实行高；背景子树不应再把自身布局首选高度向外累加。
-        preferred-height: 0px;
+    card-surface := Rectangle {
+        // 行高和内容面高度之间保留 10px 空白，使列表边界清楚但不堆叠卡片。
         width: parent.width;
-        clip: true;
+        height: card.is_image ? 176px : 96px;
         background: selected
-            ? #242424
-            : card-touch.has-hover ? #1b1b1b : #141414;
+            ? #ebe6ff
+            : card-touch.has-hover ? #f6f4fa : #ffffffb8;
         border-width: selected ? 2px : 1px;
-        border-color: selected ? #f5f5f5 : #292929;
-        border-radius: 10px;
+        border-color: selected ? #7868d6 : #dedce7;
+        border-radius: 14px;
+        clip: true;
 
+        // 顶部高光是轻量玻璃表面的边缘，而不是第二个窗口边框。
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: 1px;
+            background: selected ? #b6aef1 : #ffffff;
+        }
+
+        // 文本卡片只显示受限摘要和稳定 metadata。
         VerticalLayout {
             visible: !card.is_image;
-            width: parent.width - 144px;
-            height: parent.height;
-            padding: 14px;
+            x: 18px;
+            y: 14px;
+            width: parent.width - 154px;
+            height: parent.height - 28px;
             spacing: 8px;
+
             Text {
                 text: card.preview;
                 height: 46px;
                 vertical-stretch: 0;
-                color: #f5f5f5;
-                font-size: 14px;
+                color: #292732;
+                font-size: 15px;
                 wrap: word-wrap;
                 overflow: clip;
             }
             HorizontalLayout {
+                height: 18px;
                 spacing: 8px;
-                Text { text: card.source; color: #8c8c8c; font-size: 11px; }
+                Text {
+                    text: card.source;
+                    color: #706d79;
+                    font-size: 12px;
+                }
                 Text {
                     text: card.relative_time;
-                    color: #666666;
-                    font-size: 11px;
+                    color: #9995a3;
+                    font-size: 12px;
                     horizontal-alignment: right;
                     horizontal-stretch: 1;
                 }
             }
         }
 
+        // 图片卡片把缩略图和尺寸摘要作为主内容，不在图片上覆盖长文本。
         if card.is_image: Rectangle {
-            x: 14px; y: 12px; width: parent.width - 172px; height: 112px;
-            background: #0d0d0d; border-width: 1px; border-color: #303030; border-radius: 6px; clip: true;
+            x: 18px;
+            y: 14px;
+            width: parent.width - 164px;
+            height: 104px;
+            background: #e4e4eb;
+            border-width: 1px;
+            border-color: #d6d4df;
+            border-radius: 10px;
+            clip: true;
+
             Image {
                 visible: card.thumbnail_loaded;
-                width: parent.width; height: parent.height;
-                source: card.thumbnail; image-fit: cover;
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: parent.height - 2px;
+                source: card.thumbnail;
+                image-fit: cover;
             }
             Text {
                 visible: !card.thumbnail_loaded;
                 text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
-                color: #666666; font-size: 12px;
-                horizontal-alignment: center; vertical-alignment: center;
+                color: #817e8b;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
         }
         if card.is_image: Text {
-            x: 14px; y: 132px; width: parent.width - 172px;
+            x: 18px;
+            y: 127px;
+            width: parent.width - 164px;
             text: "图片  " + card.image_width + " × " + card.image_height;
-            color: #f5f5f5; font-size: 12px;
+            color: #4f4c59;
+            font-size: 12px;
         }
         if card.is_image: Text {
-            x: 14px; y: 151px; width: parent.width - 172px;
+            x: 18px;
+            y: 148px;
+            width: parent.width - 164px;
             text: card.source + "  ·  " + card.relative_time;
-            color: #777777; font-size: 11px;
+            color: #8c8895;
+            font-size: 12px;
         }
 
+        // 选择区域不覆盖右侧动作区，保证空白区域不会伪造选择事件。
         card-touch := TouchArea {
             width: parent.width - 144px;
+            height: parent.height;
             clicked => { card-selected(card-index); }
         }
 
+        // 删除是次要动作，使用低对比度的图形按钮并保留明确的 hover/pressed 状态。
         delete-button := Rectangle {
-            x: parent.width - 138px; y: (parent.height - self.height) / 2;
-            width: 36px; height: 36px; border-radius: 6px;
-            background: delete-touch.pressed ? #f5f5f5 : delete-touch.has-hover ? #303030 : #242424;
-            border-width: 1px; border-color: #4a4a4a;
+            x: parent.width - 138px;
+            y: (parent.height - self.height) / 2;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: delete-touch.pressed
+                ? #d9d6e1
+                : delete-touch.has-hover ? #eeecf2 : #e4e2ea;
+            border-width: 1px;
+            border-color: #d2cfdb;
             Text {
-                text: card.delete_pending ? "…" : "删";
-                color: delete-touch.pressed ? #080808 : #f5f5f5;
-                font-size: card.delete_pending ? 15px : 12px;
-                horizontal-alignment: center; vertical-alignment: center;
+                text: card.delete_pending ? "…" : "×";
+                color: #5d5967;
+                font-size: card.delete_pending ? 17px : 19px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
             delete-touch := TouchArea {
                 enabled: !mutation-pending && !card.delete_pending;
-                clicked => { if (!mutation-pending && !card.delete_pending) { card-deleted(card-index); } }
+                clicked => {
+                    if (!mutation-pending && !card.delete_pending) {
+                        card-deleted(card-index);
+                    }
+                }
             }
         }
+
+        // 收藏按钮维持可识别的状态，但不与复制动作争夺视觉层级。
         pin-button := Rectangle {
-            x: parent.width - 94px; y: (parent.height - self.height) / 2;
-            width: 36px; height: 36px; border-radius: 6px;
-            background: pin-touch.pressed ? #f5f5f5 : pin-touch.has-hover ? #303030 : #242424;
-            border-width: 1px; border-color: card.is_pinned ? #f5f5f5 : #4a4a4a;
+            x: parent.width - 94px;
+            y: (parent.height - self.height) / 2;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: pin-touch.pressed
+                ? #d9d6e1
+                : pin-touch.has-hover ? #eeecf2 : #e4e2ea;
+            border-width: 1px;
+            border-color: card.is_pinned ? #988ce0 : #d2cfdb;
             Text {
                 text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
-                color: pin-touch.pressed ? #080808 : #f5f5f5;
-                font-size: card.pin_pending ? 15px : 18px;
-                horizontal-alignment: center; vertical-alignment: center;
+                color: card.is_pinned ? #7564cf : #6d6977;
+                font-size: card.pin_pending ? 17px : 18px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
             pin-touch := TouchArea {
                 enabled: !mutation-pending && !card.pin_pending;
-                clicked => { if (!mutation-pending && !card.pin_pending) { card-pinned(card-index); } }
+                clicked => {
+                    if (!mutation-pending && !card.pin_pending) {
+                        card-pinned(card-index);
+                    }
+                }
             }
         }
+
+        // 复制是每张卡片最主要的直接动作，使用唯一的紫色强调按钮。
         copy-button := Rectangle {
-            x: parent.width - 50px; y: (parent.height - self.height) / 2;
-            width: 44px; height: 36px; border-radius: 6px;
-            background: copy-touch.pressed ? #f5f5f5 : copy-touch.has-hover ? #303030 : #242424;
-            border-width: 1px; border-color: #4a4a4a;
+            x: parent.width - 50px;
+            y: (parent.height - self.height) / 2;
+            width: 44px;
+            height: 36px;
+            border-radius: 10px;
+            background: copy-touch.pressed
+                ? #5545b8
+                : copy-touch.has-hover ? #7969dc : #6c5bcf;
+            border-width: 1px;
+            border-color: #897ce0;
             Text {
-                text: "复制"; color: copy-touch.pressed ? #080808 : #f5f5f5;
-                font-size: 12px; horizontal-alignment: center; vertical-alignment: center;
+                text: "复制";
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
             copy-touch := TouchArea {
                 enabled: card.copy_enabled;
-                clicked => { if (card.copy_enabled) { card-copied(card-index); } }
+                clicked => {
+                    if (card.copy_enabled) {
+                        card-copied(card-index);
+                    }
+                }
             }
         }
     }
 }
 
-// AppWindow 是快捷键呼出的临时黑色看板，Rust 侧负责生命周期和事件代次。
+// AppWindow 是快捷键呼出的临时单窗口工作台；Rust 侧负责生命周期和事件代次。
 export component AppWindow inherits Window {
     // Rust 侧在 UI 线程登记此回调，并用打开代次确保只有当前会话的 Esc 可以隐藏。
     callback panel-dismiss-requested();
@@ -216,17 +304,20 @@ export component AppWindow inherits Window {
     callback history-viewport-changed(viewport-y: length, visible-height: length, content-height: length, origin-token: string);
     // 续页失败提示是唯一的同区重试入口，普通重绘不能自动重发请求。
     callback retry-history-page-requested();
+    // 所有子控件的键盘事件先进入面板级捕获层，保持 Esc/上下键契约稳定。
     forward-focus: panel-focus;
 
+    // 原生窗口使用足够宽的 split view 展示列表和预览；标题栏仍由 Windows 提供。
     title: "ClipboardBoard";
-    width: 560px;
-    height: 640px;
-    background: #080808;
+    width: 960px;
+    height: 720px;
+    background: #e9e8ee;
+
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
     in property <[ClipboardCard]> cards: [];
     // legacy repeater 的动态模型；进入 geometry-mode 后强制为空，避免隐藏 ListView 访问旧模型。
     in property <[ClipboardCard]> legacy-cards: geometry-mode ? [] : cards;
-    // 显式几何模式的有界窗口卡片；其长度最多 100，不代表完整逻辑数量。
+    // metadata 模式下的有界窗口卡片；其长度最多 100，不代表完整逻辑数量。
     in property <[ClipboardCard]> window-cards: [];
     // 每个窗口卡片相对于精确内容画布顶部的整数像素偏移。
     in property <[length]> window-offsets: [];
@@ -242,13 +333,16 @@ export component AppWindow inherits Window {
     in-out property <string> geometry-origin-token: "";
     // Rust 原子替换 cards/offsets/画布期间抑制中间布局回调，最终视口设置后再发出一次完整事件。
     in property <bool> geometry-events-suppressed: false;
+    // 当前窗口在完整逻辑历史中的绝对起点。
     in property <int> window-start: 0;
+    // 当前窗口卡片数量。
     in property <int> window-length: 0;
     // 鼠标与键盘共用同一选中索引；负数表示当前没有选中卡片。
     in property <int> selected-index: -1;
     // Rust 侧同步搜索框和标签状态，防止旧代次结果回写错误的选中标签。
     in-out property <string> search-text: "";
     in-out property <int> search-filter: 0;
+    // 搜索状态只用于轻量 inline feedback，不创建阻塞式提示框。
     in property <string> search-status: "idle";
     // 开机启动操作的稳定反馈；不显示路径、命令行或底层错误详情。
     in property <string> startup-status: "";
@@ -270,7 +364,7 @@ export component AppWindow inherits Window {
     in property <bool> clear-all-error-visible: false;
     // 收藏、删除和两种清空共享的视觉互斥；Rust reducer 仍负责最终权限校验。
     in property <bool> history-mutation-pending: false;
-    // 性能探针和后续滚轮交互通过此统一视口属性驱动 legacy 或显式 Flickable；默认值保持顶部。
+    // 性能探针和滚轮交互通过此统一视口属性驱动 legacy 或显式 Flickable。
     in-out property <length> history-viewport-y: 0px;
     // legacy ListView 保留双向别名，使模型替换后的内部 clamp 能同步回统一视口属性。
     in-out property <length> legacy-history-viewport-y <=> history-list.viewport-y;
@@ -278,6 +372,76 @@ export component AppWindow inherits Window {
     out property <int> history-model-length: geometry-mode ? history-logical-count : cards.length;
     out property <length> history-visible-height: geometry-mode ? geometry-history-list.height : history-list.visible-height;
     out property <length> history-viewport-height: geometry-mode ? geometry-content-height : history-list.viewport-height;
+
+    // 选中详情的派生属性把 legacy 和 geometry 两条渲染路径统一到一个预览面板。
+    property <bool> selected-card-visible: geometry-mode
+        ? (selected-index >= window-start && selected-index < window-start + window-length)
+        : (selected-index >= 0 && selected-index < cards.length);
+    // 当前选中卡片是否为图片。
+    property <bool> selected-card-is-image: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].is_image
+            : cards[selected-index].is_image)
+        : false;
+    // 当前选中卡片是否有可复制内容。
+    property <bool> selected-card-copy-enabled: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].copy_enabled
+            : cards[selected-index].copy_enabled)
+        : false;
+    // 当前选中卡片是否已收藏。
+    property <bool> selected-card-is-pinned: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].is_pinned
+            : cards[selected-index].is_pinned)
+        : false;
+    // 当前选中卡片的摘要文本。
+    property <string> selected-card-preview: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].preview
+            : cards[selected-index].preview)
+        : "";
+    // 当前选中卡片的来源程序。
+    property <string> selected-card-source: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].source
+            : cards[selected-index].source)
+        : "";
+    // 当前选中卡片的相对时间。
+    property <string> selected-card-relative-time: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].relative_time
+            : cards[selected-index].relative_time)
+        : "";
+    // 当前选中图片的原始宽度。
+    property <int> selected-card-image-width: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].image_width
+            : cards[selected-index].image_width)
+        : 0;
+    // 当前选中图片的原始高度。
+    property <int> selected-card-image-height: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].image_height
+            : cards[selected-index].image_height)
+        : 0;
+    // 当前选中图片是否已完成缩略图加载。
+    property <bool> selected-card-thumbnail-loaded: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].thumbnail_loaded
+            : cards[selected-index].thumbnail_loaded)
+        : false;
+    // 当前选中图片是否加载失败。
+    property <bool> selected-card-thumbnail-failed: selected-card-visible
+        ? (geometry-mode
+            ? window-cards[selected-index - window-start].thumbnail_failed
+            : cards[selected-index].thumbnail_failed)
+        : false;
+    // geometry 模式的按钮需要传递可见窗口内索引，legacy 模式直接传逻辑索引。
+    property <int> selected-card-action-index: geometry-mode
+        ? selected-index - window-start
+        : selected-index;
+
     // 外部 setter 根据当前渲染分支写入对应 Flickable；显式模式不触碰隐藏 legacy 列表。
     changed history-viewport-y => {
         if (geometry-mode) {
@@ -293,9 +457,9 @@ export component AppWindow inherits Window {
         }
     }
 
+    // 面板级 FocusScope 捕获 Esc、上下键和 Enter，避免子控件改变既有键盘契约。
     panel-focus := FocusScope {
         // 捕获阶段先于搜索框等内部控件执行，确保 Esc 和选择键不会因子控件消费而失效。
-        // 所有 Enter 组合都在这里静默消费；复制只允许由后续卡片按钮显式触发。
         capture-key-pressed(event) => {
             if (event.text == Key.Escape) {
                 panel-dismiss-requested();
@@ -313,123 +477,206 @@ export component AppWindow inherits Window {
             }
         }
 
-
+        // 根背景填满客户区，不绘制第二个圆角外框或伪造的标题栏。
         Rectangle {
-            background: #080808;
+            width: parent.width;
+            height: parent.height;
+            background: #e9e8ee;
+
+            // 顶部浅紫光晕只作为玻璃材质背后的色彩层，不承载交互内容。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 168px;
+                background: #f1eff8;
+            }
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 1px;
+                background: #ffffff;
+            }
 
             VerticalLayout {
                 x: 24px;
-                y: 24px;
+                y: 20px;
                 width: parent.width - 48px;
-                height: parent.height - 48px;
+                height: parent.height - 40px;
                 spacing: 12px;
 
-                Text {
-                    text: "CLIPBOARD";
-                    color: #f5f5f5;
-                    font-size: 12px;
-                    font-weight: 700;
-                    letter-spacing: 2px;
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: #2a2a2a;
-                }
-
-                // LineEdit 使用标准文本输入控件；防抖和结果代次由 Rust reducer 统一管理。
-                search-input := LineEdit {
-                    height: 38px;
-                    placeholder-text: "搜索剪贴内容…";
-                    text: search-text;
-                    edited(text) => {
-                        search-text-changed(text);
+                // 顶部身份区保持克制，不重复 Windows 标题栏的信息。
+                HorizontalLayout {
+                    height: 26px;
+                    Text {
+                        text: "剪贴板";
+                        color: #292732;
+                        font-size: 20px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "按时间排列的本地记录";
+                        color: #8b8795;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "Esc 关闭";
+                        color: #9a96a5;
+                        font-size: 12px;
+                        vertical-alignment: center;
                     }
                 }
 
-                // 清理确认和失败提示归入筛选区的可变高度容器；默认状态仍只占 30px，
-                // 避免不可见的零高度控件因外层 spacing 令历史卡片整体下移。
+                // 搜索区域使用标准 LineEdit，并以浅色玻璃表面承载焦点环和输入内容。
+                Rectangle {
+                    height: 44px;
+                    background: #ffffffd9;
+                    border-width: 1px;
+                    border-color: #ffffff;
+                    border-radius: 14px;
+
+                    // 用几何圆环表达搜索入口，避免依赖当前系统字体是否包含特殊符号。
+                    Rectangle {
+                        x: 18px;
+                        y: 14px;
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #777381;
+                        background: transparent;
+                    }
+                    // LineEdit 使用标准文本输入控件；防抖和结果代次由 Rust reducer 统一管理。
+                    search-input := LineEdit {
+                        x: 44px;
+                        y: 3px;
+                        width: parent.width - 96px;
+                        height: 38px;
+                        font-size: 13px;
+                        placeholder-text: "搜索剪贴内容…";
+                        text: search-text;
+                        edited(text) => {
+                            search-text-changed(text);
+                        }
+                    }
+                    // Fluent LineEdit 的占位文字由主题控制；此提示层保证浅色玻璃表面上始终可读。
+                    Text {
+                        visible: search-text == "";
+                        x: 72px;
+                        y: 0px;
+                        width: parent.width - 132px;
+                        height: parent.height;
+                        text: "搜索剪贴内容…";
+                        color: #9a96a5;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: parent.width - 48px;
+                        y: 0px;
+                        width: 34px;
+                        height: parent.height;
+                        text: "输入";
+                        color: #aaa6b2;
+                        font-size: 10px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 筛选、清理和危险操作位于同一功能带；确认区只在需要时展开。
                 VerticalLayout {
-                    height: 30px
-                        + (clear-all-confirmation-visible ? 110px
-                            : clear-unpinned-confirmation-visible ? 56px : 0px)
-                        + ((clear-unpinned-error-visible || clear-all-error-visible) ? 30px : 0px);
-                    spacing: 12px;
+                    height: 34px
+                        + (clear-all-confirmation-visible ? 96px
+                            : clear-unpinned-confirmation-visible ? 44px : 0px)
+                        + ((clear-unpinned-error-visible || clear-all-error-visible) ? 22px : 0px);
+                    spacing: 8px;
 
                     HorizontalLayout {
-                        height: 30px;
+                        height: 34px;
                         spacing: 8px;
 
+                        // 四个互斥筛选项组成一个完整 segmented control。
                         Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 0 ? #f5f5f5 : #141414;
-                            TouchArea {
-                                clicked => { search-filter-requested(0); }
-                            }
-                            Text {
-                                text: "全部";
-                                color: search-filter == 0 ? #080808 : #8c8c8c;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 1 ? #f5f5f5 : #141414;
-                            TouchArea {
-                                clicked => { search-filter-requested(1); }
-                            }
-                            Text {
-                                text: "文本";
-                                color: search-filter == 1 ? #080808 : #8c8c8c;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 2 ? #f5f5f5 : #141414;
-                            TouchArea {
-                                clicked => { search-filter-requested(2); }
-                            }
-                            Text {
-                                text: "图片";
-                                color: search-filter == 2 ? #080808 : #8c8c8c;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 64px;
-                            border-radius: 6px;
-                            background: search-filter == 3 ? #f5f5f5 : #141414;
-                            TouchArea {
-                                clicked => { search-filter-requested(3); }
-                            }
-                            Text {
-                                text: "收藏";
-                                color: search-filter == 3 ? #080808 : #8c8c8c;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                        }
-
-                        Rectangle {
-                            width: 108px;
-                            border-radius: 6px;
+                            width: 264px;
+                            height: 34px;
+                            background: #ffffff80;
                             border-width: 1px;
-                            border-color: #3a3a3a;
-                            background: #141414;
+                            border-color: #ffffffb8;
+                            border-radius: 12px;
+                            HorizontalLayout {
+                                x: 4px;
+                                y: 4px;
+                                width: parent.width - 8px;
+                                height: parent.height - 8px;
+                                spacing: 2px;
+                                Rectangle {
+                                    width: 62px;
+                                    border-radius: 9px;
+                                    background: search-filter == 0 ? #ffffff : transparent;
+                                    TouchArea { clicked => { search-filter-requested(0); } }
+                                    Text {
+                                        text: "全部";
+                                        color: search-filter == 0 ? #3e3a4b : #7d7987;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 62px;
+                                    border-radius: 9px;
+                                    background: search-filter == 1 ? #ffffff : transparent;
+                                    TouchArea { clicked => { search-filter-requested(1); } }
+                                    Text {
+                                        text: "文本";
+                                        color: search-filter == 1 ? #3e3a4b : #7d7987;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 62px;
+                                    border-radius: 9px;
+                                    background: search-filter == 2 ? #ffffff : transparent;
+                                    TouchArea { clicked => { search-filter-requested(2); } }
+                                    Text {
+                                        text: "图片";
+                                        color: search-filter == 2 ? #3e3a4b : #7d7987;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle {
+                                    width: 62px;
+                                    border-radius: 9px;
+                                    background: search-filter == 3 ? #ffffff : transparent;
+                                    TouchArea { clicked => { search-filter-requested(3); } }
+                                    Text {
+                                        text: "收藏";
+                                        color: search-filter == 3 ? #3e3a4b : #7d7987;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 固定宽度让确认测试和键盘用户都能稳定找到清理动作。
+                        Rectangle {
+                            width: 112px;
+                            height: 34px;
+                            border-radius: 11px;
+                            border-width: 1px;
+                            border-color: #d8d5df;
+                            background: clear-unpinned-pending ? #e6e3ec : #ffffffa8;
                             clear-touch := TouchArea {
                                 enabled: !history-mutation-pending;
                                 clicked => {
@@ -440,7 +687,7 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: clear-unpinned-pending ? "清理中…" : "清理未收藏";
-                                color: clear-unpinned-pending ? #666666 : #cfcfcf;
+                                color: clear-unpinned-pending ? #9995a3 : #625e6c;
                                 font-size: 12px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
@@ -448,11 +695,12 @@ export component AppWindow inherits Window {
                         }
 
                         Rectangle {
-                            width: 92px;
-                            border-radius: 6px;
+                            width: 104px;
+                            height: 34px;
+                            border-radius: 11px;
                             border-width: 1px;
-                            border-color: #7a3434;
-                            background: #1b1111;
+                            border-color: #e2cfd3;
+                            background: clear-all-pending ? #f1e1e3 : #fff8f8;
                             TouchArea {
                                 enabled: !history-mutation-pending;
                                 clicked => {
@@ -463,60 +711,58 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: clear-all-pending ? "清空中…" : "清空全部";
-                                color: clear-all-pending ? #666666 : #ff9a9a;
+                                color: clear-all-pending ? #a48a91 : #9a5867;
                                 font-size: 12px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
                         }
+
+                        Rectangle { horizontal-stretch: 1; }
                     }
 
-                    // 两种确认共享一个布局槽，避免隐藏控件改变默认卡片位置。
+                    // 两种确认共享一个布局槽，避免隐藏控件改变默认列表位置。
                     Rectangle {
                         visible: clear-unpinned-confirmation-visible || clear-all-confirmation-visible;
-                        height: clear-all-confirmation-visible ? 98px
+                        preferred-width: 512px;
+                        height: clear-all-confirmation-visible ? 96px
                             : clear-unpinned-confirmation-visible ? 44px : 0px;
-                        border-radius: 6px;
+                        border-radius: 12px;
                         border-width: 1px;
-                        border-color: clear-all-confirmation-visible ? #7a3434 : #3a3a3a;
-                        background: clear-all-confirmation-visible ? #1b1111 : #141414;
+                        border-color: clear-all-confirmation-visible ? #e4c4cb : #d8d5df;
+                        background: clear-all-confirmation-visible ? #fff7f8 : #ffffffb8;
 
                         HorizontalLayout {
                             visible: clear-unpinned-confirmation-visible;
                             padding-left: 12px;
                             padding-right: 8px;
                             spacing: 8px;
-
                             Text {
                                 text: "将删除所有未收藏记录";
-                                color: #d8d8d8;
+                                color: #5a5663;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                             }
-
                             Rectangle {
                                 width: 58px;
                                 height: 28px;
-                                border-radius: 5px;
-                                background: #222222;
-                                TouchArea {
-                                    clicked => { clear-unpinned-cancelled(); }
-                                }
+                                border-radius: 9px;
+                                background: #eeecf2;
+                                TouchArea { clicked => { clear-unpinned-cancelled(); } }
                                 Text {
                                     text: "取消";
-                                    color: #b8b8b8;
+                                    color: #6d6976;
                                     font-size: 12px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
                             }
-
                             Rectangle {
                                 width: 72px;
                                 height: 28px;
-                                border-radius: 5px;
-                                background: #f2f2f2;
+                                border-radius: 9px;
+                                background: #6c5bcf;
                                 TouchArea {
                                     enabled: !history-mutation-pending;
                                     clicked => {
@@ -527,7 +773,7 @@ export component AppWindow inherits Window {
                                 }
                                 Text {
                                     text: "确认清空";
-                                    color: #111111;
+                                    color: #ffffff;
                                     font-size: 12px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
@@ -539,17 +785,14 @@ export component AppWindow inherits Window {
                             visible: clear-all-confirmation-visible;
                             padding: 10px;
                             spacing: 8px;
-
                             Text {
                                 text: "将删除全部记录，包括已收藏记录";
-                                color: #ffb0b0;
+                                color: #9a5867;
                                 font-size: 12px;
                             }
-
                             HorizontalLayout {
                                 height: 38px;
                                 spacing: 8px;
-
                                 clear-all-input := LineEdit {
                                     horizontal-stretch: 1;
                                     placeholder-text: "输入“清空全部”";
@@ -558,28 +801,24 @@ export component AppWindow inherits Window {
                                         clear-all-confirmation-text-changed(text);
                                     }
                                 }
-
                                 Rectangle {
                                     width: 58px;
-                                    border-radius: 5px;
-                                    background: #2a1c1c;
-                                    TouchArea {
-                                        clicked => { clear-all-cancelled(); }
-                                    }
+                                    border-radius: 9px;
+                                    background: #eeecf2;
+                                    TouchArea { clicked => { clear-all-cancelled(); } }
                                     Text {
                                         text: "取消";
-                                        color: #d0aaaa;
+                                        color: #6d6976;
                                         font-size: 12px;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
                                 }
-
                                 Rectangle {
-                                    width: 76px;
-                                    border-radius: 5px;
+                                    width: 78px;
+                                    border-radius: 9px;
                                     background: clear-all-confirmation-text == "清空全部"
-                                        ? #f05d5d : #4b2b2b;
+                                        ? #6c5bcf : #d9d3ed;
                                     TouchArea {
                                         enabled: !history-mutation-pending
                                             && clear-all-confirmation-text == "清空全部";
@@ -593,7 +832,7 @@ export component AppWindow inherits Window {
                                     Text {
                                         text: "确认清空";
                                         color: clear-all-confirmation-text == "清空全部"
-                                            ? #160808 : #8c6666;
+                                            ? #ffffff : #90879f;
                                         font-size: 12px;
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
@@ -605,365 +844,385 @@ export component AppWindow inherits Window {
 
                     Text {
                         visible: clear-unpinned-error-visible || clear-all-error-visible;
-                        height: (clear-unpinned-error-visible || clear-all-error-visible) ? 18px : 0px;
+                        height: (clear-unpinned-error-visible || clear-all-error-visible) ? 14px : 0px;
                         text: clear-all-error-visible ? "清空全部失败，请重试" : "清空失败，请重试";
-                        color: #ff8e8e;
+                        color: #a55f6d;
                         font-size: 12px;
                     }
                 }
 
-                Text {
-                    text: "最近复制";
-                    color: #f5f5f5;
-                    font-size: 20px;
-                }
+                // 主内容是一个语义明确的 split view；左侧是历史，右侧是选中内容的 inspector。
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 16px;
 
-                Text {
-                    text: "内容会在这里按最新复制时间排列";
-                    color: #8c8c8c;
-                    font-size: 14px;
-                }
+                    // 左侧列表 pane 使用半透明玻璃表面，但重复项本身保持平面列表语言。
+                    Rectangle {
+                        preferred-width: 512px;
+                        min-width: 512px;
+                        max-width: 512px;
+                        background: #ffffff99;
+                        border-width: 1px;
+                        border-color: #ffffffcc;
+                        border-radius: 18px;
 
-                // metadata 未提供时仍保留旧固定高度 ListView，兼容 ATOM-14R 和旧 set_cards 调用。
-                history-list := ListView {
-                    visible: !geometry-mode;
-                    // 两条列表位于同一个 VerticalLayout；隐藏分支必须释放伸展槽，
-                    // 否则旧 ListView 仍会占用一整块高度，把显式列表和首条卡片整体下移。
-                    vertical-stretch: geometry-mode ? 0 : 1;
-                    min-height: geometry-mode ? 0px : 0px;
-                    preferred-height: geometry-mode ? 0px : 0px;
-                    max-height: geometry-mode ? 0px : 100000px;
-                    changed viewport-y => {
-                        // legacy 列表隐藏或重排时只释放布局槽，不得把无效视口写回几何列表。
-                        if (!geometry-mode) {
-                            history-viewport-y = self.viewport-y;
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    changed visible-height => {
-                        if (!geometry-mode) {
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    changed viewport-height => {
-                        if (!geometry-mode) {
-                            history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
-                        }
-                    }
-                    for card[index] in legacy-cards: Rectangle {
-                        // legacy repeater 项必须直接声明固定高度；不要把 HistoryCard 作为根组件，
-                        // 否则组件内部布局信息会被 ListView 当成额外行高。
-                        height: card.is_image ? 186px : 106px;
-                        background: transparent;
+                        VerticalLayout {
+                            x: 16px;
+                            y: 16px;
+                            width: parent.width - 32px;
+                            height: parent.height - 32px;
+                            spacing: 12px;
 
-                        card-background := Rectangle {
-                            height: card.is_image ? 176px : 96px;
-                            width: parent.width;
-                            clip: true;
-                            background: index == selected-index
-                                ? #242424
-                                : card-touch.has-hover ? #1b1b1b : #141414;
-                            border-width: index == selected-index ? 2px : 1px;
-                            border-color: index == selected-index ? #f5f5f5 : #292929;
-                            border-radius: 10px;
-
-                            VerticalLayout {
-                                visible: !card.is_image;
-                                width: parent.width - 144px;
-                                height: parent.height;
-                                padding: 14px;
-                                spacing: 8px;
-
+                            HorizontalLayout {
+                                height: 32px;
                                 Text {
-                                    text: card.preview;
-                                    height: 46px;
-                                    vertical-stretch: 0;
-                                    color: #f5f5f5;
-                                    font-size: 14px;
+                                    text: "历史记录";
+                                    color: #35313f;
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "·  " + history-model-length + " 条";
+                                    color: #948f9f;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: search-status == "loading" ? "搜索中…" : "本地";
+                                    color: search-status == "loading" ? #796bd0 : #aaa5b2;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            // metadata 未提供时仍保留旧固定高度 ListView，兼容旧 set_cards 调用。
+                            history-list := ListView {
+                                visible: !geometry-mode;
+                                // 两条列表互斥分配伸展空间，隐藏分支不得占用可见列表高度。
+                                vertical-stretch: geometry-mode ? 0 : 1;
+                                min-height: 0px;
+                                preferred-height: 0px;
+                                max-height: geometry-mode ? 0px : 100000px;
+                                changed viewport-y => {
+                                    if (!geometry-mode) {
+                                        history-viewport-y = self.viewport-y;
+                                        history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                                    }
+                                }
+                                changed visible-height => {
+                                    if (!geometry-mode) {
+                                        history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                                    }
+                                }
+                                changed viewport-height => {
+                                    if (!geometry-mode) {
+                                        history-viewport-changed(self.viewport-y, self.visible-height, self.viewport-height, "");
+                                    }
+                                }
+                                for card[index] in legacy-cards: Rectangle {
+                                    // 外层代理声明固定高度，防止组件内部布局信息改变 ListView 行高。
+                                    height: card.is_image ? 186px : 106px;
+                                    background: transparent;
+                                    HistoryCard {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        card: card;
+                                        card-index: index;
+                                        selected: index == selected-index;
+                                        mutation-pending: history-mutation-pending;
+                                        card-selected(index) => { card-selection-requested(index); }
+                                        card-copied(index) => { copy-item-requested(index); }
+                                        card-pinned(index) => { pin-item-requested(index); }
+                                        card-deleted(index) => { delete-item-requested(index); }
+                                    }
+                                }
+                            }
+
+                            // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
+                            geometry-history-list := Flickable {
+                                visible: geometry-mode;
+                                // 与 legacy ListView 互斥分配伸展空间，避免两者同时占位。
+                                vertical-stretch: geometry-mode ? 1 : 0;
+                                min-height: 0px;
+                                preferred-height: 0px;
+                                max-height: geometry-mode ? 100000px : 0px;
+                                // 显式绑定内容高度，避免动态 Rectangle 的 min-height 为零导致 viewport-y 被锁在顶部。
+                                viewport-height: geometry-content-height;
+                                changed viewport-y => {
+                                    if (geometry-mode && !geometry-events-suppressed) {
+                                        history-viewport-y = self.viewport-y;
+                                        let token = geometry-origin-token;
+                                        geometry-origin-token = "";
+                                        history-viewport-changed(self.viewport-y, self.height, geometry-content-height, token);
+                                    }
+                                }
+                                changed height => {
+                                    if (geometry-mode && !geometry-events-suppressed) {
+                                        history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
+                                    }
+                                }
+                                Rectangle {
+                                    width: parent.width;
+                                    height: geometry-content-height;
+                                    for card[index] in window-cards: HistoryCard {
+                                        x: 0px;
+                                        // 绝对定位父容器不会使用 preferred-height，必须显式声明行高。
+                                        y: window-offsets[index];
+                                        height: card.is_image ? 186px : 106px;
+                                        width: parent.width;
+                                        card: card;
+                                        card-index: index;
+                                        selected: window-start + index == selected-index;
+                                        mutation-pending: history-mutation-pending;
+                                        // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份。
+                                        card-selected(index) => { card-selection-requested(index); }
+                                        card-copied(index) => { copy-item-requested(index); }
+                                        card-pinned(index) => { pin-item-requested(index); }
+                                        card-deleted(index) => { delete-item-requested(index); }
+                                    }
+                                }
+                            }
+
+                            // 分页、失败和空状态都使用固定高度 inline feedback，不改变列表 viewport。
+                            Rectangle {
+                                height: 30px;
+                                border-radius: 10px;
+                                background: history-retry-required ? #fff1ee : #ffffff5c;
+                                Text {
+                                    text: history-retry-required
+                                        ? "加载失败，点击重试"
+                                        : history-next-page-loading ? "正在加载更多…" : "";
+                                    color: history-retry-required ? #a55f6d : #8b8795;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                retry-touch := TouchArea {
+                                    enabled: history-retry-required;
+                                    clicked => {
+                                        if (history-retry-required) {
+                                            retry-history-page-requested();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 右侧 inspector 是 split view 的第二个语义 pane，不是包在窗口里的第二个窗口。
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 320px;
+                        background: #ffffffb8;
+                        border-width: 1px;
+                        border-color: #ffffffcc;
+                        border-radius: 18px;
+
+                        VerticalLayout {
+                            x: 24px;
+                            y: 20px;
+                            width: parent.width - 48px;
+                            height: parent.height - 40px;
+                            spacing: 16px;
+
+                            HorizontalLayout {
+                                height: 32px;
+                                Text {
+                                    text: "内容预览";
+                                    color: #35313f;
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: selected-card-visible
+                                        ? selected-card-source + "  ·  " + selected-card-relative-time
+                                        : "选择一条记录查看详情";
+                                    color: #948f9f;
+                                    font-size: 12px;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            Rectangle {
+                                vertical-stretch: 1;
+                                background: #f9f8fb;
+                                border-width: 1px;
+                                border-color: #ebe9f0;
+                                border-radius: 14px;
+                                clip: true;
+
+                                if !selected-card-visible: VerticalLayout {
+                                    x: 28px;
+                                    y: 28px;
+                                    width: parent.width - 56px;
+                                    height: parent.height - 56px;
+                                    Text {
+                                        text: "从左侧选择一条剪贴内容";
+                                        color: #716d7b;
+                                        font-size: 17px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        vertical-stretch: 1;
+                                    }
+                                    Text {
+                                        text: "文本和图片都会在这里显示摘要";
+                                        color: #a19ca9;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+
+                                if selected-card-visible: Text {
+                                    visible: !selected-card-is-image;
+                                    x: 26px;
+                                    y: 24px;
+                                    width: parent.width - 52px;
+                                    height: parent.height - 84px;
+                                    text: selected-card-preview;
+                                    color: #302d38;
+                                    font-size: 16px;
                                     wrap: word-wrap;
                                     overflow: clip;
                                 }
 
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    Text { text: card.source; color: #8c8c8c; font-size: 11px; }
+                                if selected-card-visible && selected-card-is-image: Rectangle {
+                                    x: 26px;
+                                    y: 24px;
+                                    width: parent.width - 52px;
+                                    height: parent.height - 78px;
+                                    background: #ecebf1;
+                                    border-width: 1px;
+                                    border-color: #dfdde7;
+                                    border-radius: 12px;
+                                    clip: true;
+                                    Image {
+                                        visible: selected-card-thumbnail-loaded;
+                                        x: 1px;
+                                        y: 1px;
+                                        width: parent.width - 2px;
+                                        height: parent.height - 2px;
+                                        source: geometry-mode
+                                            ? window-cards[selected-index - window-start].thumbnail
+                                            : cards[selected-index].thumbnail;
+                                        image-fit: contain;
+                                    }
                                     Text {
-                                        text: card.relative_time;
-                                        color: #666666;
-                                        font-size: 11px;
+                                        visible: !selected-card-thumbnail-loaded;
+                                        text: selected-card-thumbnail-failed ? "图片不可用" : "图片加载中…";
+                                        color: #817e8b;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                if selected-card-visible: HorizontalLayout {
+                                    x: 26px;
+                                    y: parent.height - 42px;
+                                    width: parent.width - 52px;
+                                    height: 20px;
+                                    Text {
+                                        text: selected-card-is-image
+                                            ? "图片  " + selected-card-image-width + " × " + selected-card-image-height
+                                            : "文本摘要";
+                                        color: #8b8795;
+                                        font-size: 12px;
+                                    }
+                                    Text {
+                                        text: selected-card-source;
+                                        color: #aaa5b2;
+                                        font-size: 12px;
                                         horizontal-alignment: right;
                                         horizontal-stretch: 1;
                                     }
                                 }
                             }
 
-                            if card.is_image: Rectangle {
-                                x: 14px;
-                                y: 12px;
-                                width: parent.width - 172px;
-                                height: 112px;
-                                background: #0d0d0d;
-                                border-width: 1px;
-                                border-color: #303030;
-                                border-radius: 6px;
-                                clip: true;
-                                Image {
-                                    visible: card.thumbnail_loaded;
-                                    width: parent.width;
-                                    height: parent.height;
-                                    source: card.thumbnail;
-                                    image-fit: cover;
-                                }
-                                Text {
-                                    visible: !card.thumbnail_loaded;
-                                    text: card.thumbnail_failed ? "图片不可用" : "图片加载中…";
-                                    color: #666666;
-                                    font-size: 12px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            if card.is_image: Text {
-                                x: 14px;
-                                y: 132px;
-                                width: parent.width - 172px;
-                                text: "图片  " + card.image_width + " × " + card.image_height;
-                                color: #f5f5f5;
-                                font-size: 12px;
-                            }
-
-                            if card.is_image: Text {
-                                x: 14px;
-                                y: 151px;
-                                width: parent.width - 172px;
-                                text: card.source + "  ·  " + card.relative_time;
-                                color: #777777;
-                                font-size: 11px;
-                            }
-
-                            card-touch := TouchArea {
-                                width: parent.width - 144px;
-                                clicked => { card-selection-requested(index); }
-                            }
-
-                            delete-button := Rectangle {
-                                x: parent.width - 138px;
-                                y: (parent.height - self.height) / 2;
-                                width: 36px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: delete-touch.pressed
-                                    ? #f5f5f5
-                                    : delete-touch.has-hover ? #303030 : #242424;
-                                border-width: 1px;
-                                border-color: #4a4a4a;
-                                Text {
-                                    text: card.delete_pending ? "…" : "删";
-                                    color: delete-touch.pressed ? #080808 : #f5f5f5;
-                                    font-size: card.delete_pending ? 15px : 12px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                delete-touch := TouchArea {
-                                    enabled: !history-mutation-pending && !card.delete_pending;
-                                    clicked => {
-                                        if (!history-mutation-pending && !card.delete_pending) {
-                                            delete-item-requested(index);
+                            // 详情动作保持同一动作语义；只有复制使用紫色主按钮。
+                            HorizontalLayout {
+                                height: 44px;
+                                spacing: 8px;
+                                Rectangle {
+                                    width: 118px;
+                                    height: 44px;
+                                    border-radius: 12px;
+                                    background: selected-card-visible && selected-card-copy-enabled
+                                        ? copy-detail-touch.pressed
+                                            ? #5545b8
+                                            : copy-detail-touch.has-hover ? #7969dc : #6c5bcf
+                                        : #d8d4e5;
+                                    Text {
+                                        text: "复制内容";
+                                        color: selected-card-visible && selected-card-copy-enabled ? #ffffff : #9690a3;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    copy-detail-touch := TouchArea {
+                                        enabled: selected-card-visible && selected-card-copy-enabled;
+                                        clicked => {
+                                            if (selected-card-visible && selected-card-copy-enabled) {
+                                                copy-item-requested(selected-card-action-index);
+                                            }
                                         }
                                     }
                                 }
-                            }
-
-                            pin-button := Rectangle {
-                                x: parent.width - 94px;
-                                y: (parent.height - self.height) / 2;
-                                width: 36px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: pin-touch.pressed
-                                    ? #f5f5f5
-                                    : pin-touch.has-hover ? #303030 : #242424;
-                                border-width: 1px;
-                                border-color: card.is_pinned ? #f5f5f5 : #4a4a4a;
-                                Text {
-                                    text: card.pin_pending ? "…" : card.is_pinned ? "★" : "☆";
-                                    color: pin-touch.pressed ? #080808 : #f5f5f5;
-                                    font-size: card.pin_pending ? 15px : 18px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                pin-touch := TouchArea {
-                                    enabled: !history-mutation-pending && !card.pin_pending;
-                                    clicked => {
-                                        if (!history-mutation-pending && !card.pin_pending) {
-                                            pin-item-requested(index);
+                                Rectangle {
+                                    width: 82px;
+                                    height: 44px;
+                                    border-radius: 12px;
+                                    background: #eeecf2;
+                                    border-width: 1px;
+                                    border-color: #ddd9e5;
+                                    Text {
+                                        text: selected-card-is-pinned ? "已收藏" : "收藏";
+                                        color: selected-card-visible ? #625e6c : #aaa5b2;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        enabled: selected-card-visible && !history-mutation-pending;
+                                        clicked => {
+                                            if (selected-card-visible && !history-mutation-pending) {
+                                                pin-item-requested(selected-card-action-index);
+                                            }
                                         }
                                     }
                                 }
-                            }
-
-                            copy-button := Rectangle {
-                                x: parent.width - 50px;
-                                y: (parent.height - self.height) / 2;
-                                width: 44px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: copy-touch.pressed
-                                    ? #f5f5f5
-                                    : copy-touch.has-hover ? #303030 : #242424;
-                                border-width: 1px;
-                                border-color: #4a4a4a;
-                                Text {
-                                    text: "复制";
-                                    color: copy-touch.pressed ? #080808 : #f5f5f5;
-                                    font-size: 12px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                copy-touch := TouchArea {
-                                    enabled: card.copy_enabled;
-                                    clicked => {
-                                        if (card.copy_enabled) { copy-item-requested(index); }
+                                Rectangle {
+                                    width: 82px;
+                                    height: 44px;
+                                    border-radius: 12px;
+                                    background: #eeecf2;
+                                    border-width: 1px;
+                                    border-color: #ddd9e5;
+                                    Text {
+                                        text: "删除";
+                                        color: selected-card-visible ? #77727f : #aaa5b2;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        enabled: selected-card-visible && !history-mutation-pending;
+                                        clicked => {
+                                            if (selected-card-visible && !history-mutation-pending) {
+                                                delete-item-requested(selected-card-action-index);
+                                            }
+                                        }
                                     }
                                 }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                         }
                     }
-                }
-
-                // metadata 模式只把 bounded window cards 放入普通 Flickable，canvas 高度来自 Rust prefix-sum。
-                geometry-history-list := Flickable {
-                    visible: geometry-mode;
-                    // 与 legacy ListView 互斥分配伸展空间，避免两者在隐藏状态下同时占位。
-                    vertical-stretch: geometry-mode ? 1 : 0;
-                    min-height: geometry-mode ? 0px : 0px;
-                    preferred-height: geometry-mode ? 0px : 0px;
-                    max-height: geometry-mode ? 100000px : 0px;
-                    // 显式绑定内容高度，避免动态 Rectangle 的 min-height 仍为零导致 viewport-y 被锁在顶部。
-                    viewport-height: geometry-content-height;
-                    changed viewport-y => {
-                        if (geometry-mode && !geometry-events-suppressed) {
-                            history-viewport-y = self.viewport-y;
-                            let token = geometry-origin-token;
-                            geometry-origin-token = "";
-                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, token);
-                        }
-                    }
-                    changed height => {
-                        if (geometry-mode && !geometry-events-suppressed) {
-                            history-viewport-changed(self.viewport-y, self.height, geometry-content-height, "");
-                        }
-                    }
-                    Rectangle {
-                        width: parent.width;
-                        height: geometry-content-height;
-                        for card[index] in window-cards: HistoryCard {
-                            x: 0px;
-                            // 绝对定位父容器不会使用 preferred-height，必须显式声明行高，
-                            // 否则 HistoryCard delegate 的实际高度为零而完全不可见。
-                            y: window-offsets[index];
-                            height: card.is_image ? 186px : 106px;
-                            width: parent.width;
-                            card: card;
-                            card-index: index;
-                            selected: window-start + index == selected-index;
-                            mutation-pending: history-mutation-pending;
-                            // Rust 侧把 bounded local index 解析为当前 WindowCommit 的绝对身份。
-                            card-selected(index) => { card-selection-requested(index); }
-                            card-copied(index) => { copy-item-requested(index); }
-                            card-pinned(index) => { pin-item-requested(index); }
-                            card-deleted(index) => { delete-item-requested(index); }
-                        }
-                    }
-                }
-
-                // 分页状态区始终占据固定高度，加载/失败切换不能改变列表可见高度。
-                Rectangle {
-                    height: 32px;
-                    border-radius: 6px;
-                    background: history-retry-required
-                        ? retry-touch.has-hover ? #242424 : #141414
-                        : transparent;
-
-                    Text {
-                        text: history-retry-required
-                            ? "加载失败，点击重试"
-                            : history-next-page-loading ? "正在加载更多…" : "";
-                        color: history-retry-required ? #d99b6c : #8c8c8c;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-
-                    retry-touch := TouchArea {
-                        enabled: history-retry-required;
-                        clicked => {
-                            if (history-retry-required) {
-                                retry-history-page-requested();
-                            }
-                        }
-                    }
-                }
-
-                if pin-error-visible: Text {
-                    text: "收藏更新失败，请重试";
-                    color: #d99b6c;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if delete-error-visible: Text {
-                    text: "删除失败，请重试";
-                    color: #d99b6c;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if search-status == "loading": Text {
-                    text: "搜索中…";
-                    color: #8c8c8c;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if cards.length == 0 && search-status == "idle": Text {
-                    text: "复制一段文本，最新内容会出现在这里";
-                    color: #666666;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if cards.length == 0 && search-status == "empty": Text {
-                    text: "没有匹配的剪贴内容";
-                    color: #666666;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if search-status == "error": Text {
-                    text: "搜索暂不可用，请稍后重试";
-                    color: #d99b6c;
-                    font-size: 13px;
-                    horizontal-alignment: center;
-                }
-
-                if startup-status != "": Text {
-                    text: startup-status;
-                    color: #d99b6c;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: #2a2a2a;
-                }
-
-                Text {
-                    text: "↑↓ 选择    Esc 关闭";
-                    color: #8c8c8c;
-                    font-size: 12px;
                 }
             }
         }

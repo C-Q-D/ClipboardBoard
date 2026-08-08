@@ -2,8 +2,6 @@
 // 视觉层使用灰色、浅紫和轻量玻璃材质；窗口边框、标题栏、拖拽和缩放仍交给 Windows。
 // 卡片只接收受限摘要、来源和相对时间，不把完整剪贴板正文放进 UI 模型。
 
-import { LineEdit } from "std-widgets.slint";
-
 // ClipboardCard 是 UI 卡片的最小展示 DTO，只允许摘要、来源和相对时间进入组件树。
 export struct ClipboardCard {
     // 已按领域规则截断的预览文本，不是完整剪贴板正文。
@@ -73,14 +71,16 @@ component HistoryCard inherits Rectangle {
         height: card.is_image ? 176px : 96px;
         background: selected
             ? #ebe6ff
-            : card-touch.has-hover ? #f6f4fa : #ffffffb8;
-        border-width: selected ? 2px : 1px;
+            : card-touch.has-hover ? #f6f4fa : transparent;
+        // 普通历史记录是列表行，不再把每一行绘制成嵌套面板；选中行才保留边界。
+        border-width: selected ? 1px : 0px;
         border-color: selected ? #7868d6 : #dedce7;
-        border-radius: 14px;
+        border-radius: selected ? 12px : 0px;
         clip: true;
 
         // 顶部高光是轻量玻璃表面的边缘，而不是第二个窗口边框。
         Rectangle {
+            visible: selected;
             x: 1px;
             y: 1px;
             width: parent.width - 2px;
@@ -309,8 +309,12 @@ export component AppWindow inherits Window {
 
     // 原生窗口使用足够宽的 split view 展示列表和预览；标题栏仍由 Windows 提供。
     title: "ClipboardBoard";
-    width: 960px;
-    height: 720px;
+    // 只指定初始尺寸；实际客户区必须跟随 Windows 缩放，否则窄窗口会按固定宽度溢出。
+    preferred-width: 960px;
+    preferred-height: 720px;
+    // 左右内容区的最小可读宽度，避免继续缩放时把预览和操作栏挤出窗口。
+    min-width: 760px;
+    min-height: 500px;
     background: #e9e8ee;
 
     // Rust 侧通过 ModelRc 提供摘要卡片，禁止在这里绑定完整正文或图片原图。
@@ -459,6 +463,12 @@ export component AppWindow inherits Window {
 
     // 面板级 FocusScope 捕获 Esc、上下键和 Enter，避免子控件改变既有键盘契约。
     panel-focus := FocusScope {
+        // 把初始布局尺寸声明在根内容项上，Winit 首次显示时才能读取它；外层
+        // min-width/min-height 约束仍允许窗口自由调整大小。
+        width: 100%;
+        height: 100%;
+        preferred-width: 960px;
+        preferred-height: 720px;
         // 捕获阶段先于搜索框等内部控件执行，确保 Esc 和选择键不会因子控件消费而失效。
         capture-key-pressed(event) => {
             if (event.text == Key.Escape) {
@@ -500,44 +510,50 @@ export component AppWindow inherits Window {
             }
 
             VerticalLayout {
-                x: 24px;
-                y: 20px;
-                width: parent.width - 48px;
-                height: parent.height - 40px;
-                spacing: 12px;
+                // 客户区只使用一套外边距，避免窗口、pane 和内容分别重复内缩。
+                x: 18px;
+                y: 16px;
+                width: parent.width - 36px;
+                height: parent.height - 30px;
+                spacing: 10px;
 
-                // 顶部身份区保持克制，不重复 Windows 标题栏的信息。
+                // 顶部身份区只承担当前工作区说明，不再模拟第二个标题栏。
                 HorizontalLayout {
-                    height: 26px;
+                    height: 22px;
                     Text {
                         text: "剪贴板";
                         color: #292732;
-                        font-size: 20px;
+                        font-size: 15px;
                         font-weight: 600;
                         vertical-alignment: center;
                     }
                     Text {
                         text: "按时间排列的本地记录";
                         color: #8b8795;
-                        font-size: 12px;
+                        font-size: 11px;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
                     Text {
                         text: "Esc 关闭";
+                        width: 52px;
                         color: #9a96a5;
-                        font-size: 12px;
+                        font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        overflow: clip;
                     }
                 }
 
-                // 搜索区域使用标准 LineEdit，并以浅色玻璃表面承载焦点环和输入内容。
+                // 搜索区域只保留一个浅色表面；基础 TextInput 不再带入 Fluent 的深色背景。
                 Rectangle {
+                    // 保持搜索区覆盖既有键盘契约使用的顶部点击带（y=90）。
                     height: 44px;
                     background: #ffffffd9;
-                    border-width: 1px;
-                    border-color: #ffffff;
-                    border-radius: 14px;
+                    border-width: search-input.has-focus ? 2px : 1px;
+                    border-color: search-input.has-focus ? #8675dc : #ffffff;
+                    border-radius: 12px;
+                    forward-focus: search-input;
 
                     // 用几何圆环表达搜索入口，避免依赖当前系统字体是否包含特殊符号。
                     Rectangle {
@@ -550,30 +566,35 @@ export component AppWindow inherits Window {
                         border-color: #777381;
                         background: transparent;
                     }
-                    // LineEdit 使用标准文本输入控件；防抖和结果代次由 Rust reducer 统一管理。
-                    search-input := LineEdit {
-                        x: 44px;
-                        y: 3px;
-                        width: parent.width - 96px;
-                        height: 38px;
-                        font-size: 13px;
-                        placeholder-text: "搜索剪贴内容…";
-                        text: search-text;
-                        edited(text) => {
-                            search-text-changed(text);
-                        }
-                    }
-                    // Fluent LineEdit 的占位文字由主题控制；此提示层保证浅色玻璃表面上始终可读。
+                    // 占位文字属于搜索表面的一部分，不再与输入控件各自绘制一份。
                     Text {
                         visible: search-text == "";
-                        x: 72px;
+                        x: 54px;
                         y: 0px;
-                        width: parent.width - 132px;
+                        width: parent.width - 112px;
                         height: parent.height;
                         text: "搜索剪贴内容…";
                         color: #9a96a5;
                         font-size: 13px;
                         vertical-alignment: center;
+                    }
+                    // TextInput 只负责编辑和输入法，背景、占位提示和焦点边界由外层统一绘制。
+                    search-input := TextInput {
+                        x: 54px;
+                        y: 1px;
+                        width: parent.width - 112px;
+                        height: parent.height - 2px;
+                        font-size: 13px;
+                        color: #373441;
+                        selection-background-color: #8c7be3;
+                        selection-foreground-color: #ffffff;
+                        horizontal-alignment: left;
+                        vertical-alignment: center;
+                        single-line: true;
+                        text: search-text;
+                        edited => {
+                            search-text-changed(search-input.text);
+                        }
                     }
                     Text {
                         x: parent.width - 48px;
@@ -793,12 +814,42 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 height: 38px;
                                 spacing: 8px;
-                                clear-all-input := LineEdit {
+                                // 清空确认输入也使用相同的单层表面，避免确认区重新引入深色 Fluent 输入框。
+                                Rectangle {
                                     horizontal-stretch: 1;
-                                    placeholder-text: "输入“清空全部”";
-                                    text: clear-all-confirmation-text;
-                                    edited(text) => {
-                                        clear-all-confirmation-text-changed(text);
+                                    height: 38px;
+                                    background: #f8f7fb;
+                                    border-width: 1px;
+                                    border-color: clear-all-input.has-focus ? #8675dc : #dedbe6;
+                                    border-radius: 9px;
+                                    forward-focus: clear-all-input;
+                                    // 占位文字先绘制，确保空状态也不会遮挡 TextInput 的点击焦点。
+                                    Text {
+                                        visible: clear-all-confirmation-text == "";
+                                        x: 12px;
+                                        y: 0px;
+                                        width: parent.width - 24px;
+                                        height: parent.height;
+                                        text: "输入“清空全部”";
+                                        color: #9a96a5;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    clear-all-input := TextInput {
+                                        x: 12px;
+                                        y: 1px;
+                                        width: parent.width - 24px;
+                                        height: parent.height - 2px;
+                                        font-size: 12px;
+                                        color: #373441;
+                                        selection-background-color: #8c7be3;
+                                        selection-foreground-color: #ffffff;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        text: clear-all-confirmation-text;
+                                        edited => {
+                                            clear-all-confirmation-text-changed(clear-all-input.text);
+                                        }
                                     }
                                 }
                                 Rectangle {
@@ -851,27 +902,35 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // 主内容是一个语义明确的 split view；左侧是历史，右侧是选中内容的 inspector。
-                HorizontalLayout {
+                // 主内容只保留一个共享工作区；左右是两个内容区域，中间只有一条分隔线。
+                Rectangle {
                     vertical-stretch: 1;
-                    spacing: 16px;
+                    background: #ffffffb0;
+                    border-width: 1px;
+                    border-color: #ffffffd2;
+                    border-radius: 18px;
+                    clip: true;
 
-                    // 左侧列表 pane 使用半透明玻璃表面，但重复项本身保持平面列表语言。
-                    Rectangle {
-                        preferred-width: 512px;
-                        min-width: 512px;
-                        max-width: 512px;
-                        background: #ffffff99;
-                        border-width: 1px;
-                        border-color: #ffffffcc;
-                        border-radius: 18px;
+                    HorizontalLayout {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        spacing: 0px;
 
-                        VerticalLayout {
-                            x: 16px;
-                            y: 16px;
-                            width: parent.width - 32px;
-                            height: parent.height - 32px;
-                            spacing: 12px;
+                        // 左侧是列表区域，不再额外绘制一层带圆角的 pane。
+                        Rectangle {
+                            preferred-width: 480px;
+                            min-width: 360px;
+                            max-width: 480px;
+                            background: transparent;
+
+                            VerticalLayout {
+                                x: 20px;
+                                y: 18px;
+                                width: parent.width - 40px;
+                                height: parent.height - 36px;
+                                spacing: 10px;
 
                             HorizontalLayout {
                                 height: 32px;
@@ -989,7 +1048,10 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 height: 30px;
                                 border-radius: 10px;
-                                background: history-retry-required ? #fff1ee : #ffffff5c;
+                                // 空闲时只保留布局槽，不绘制没有语义的白色横条。
+                                background: history-retry-required
+                                    ? #fff1ee
+                                    : history-next-page-loading ? #ffffff5c : transparent;
                                 Text {
                                     text: history-retry-required
                                         ? "加载失败，点击重试"
@@ -1008,24 +1070,27 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                            }
                         }
-                    }
 
-                    // 右侧 inspector 是 split view 的第二个语义 pane，不是包在窗口里的第二个窗口。
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        min-width: 320px;
-                        background: #ffffffb8;
-                        border-width: 1px;
-                        border-color: #ffffffcc;
-                        border-radius: 18px;
+                        // 分栏只使用一条细分隔线，避免左右 pane 之间出现第二个白色面板。
+                        Rectangle {
+                            width: 1px;
+                            background: #dedbe5;
+                        }
 
-                        VerticalLayout {
-                            x: 24px;
-                            y: 20px;
-                            width: parent.width - 48px;
-                            height: parent.height - 40px;
-                            spacing: 16px;
+                        // 右侧只承载预览内容和动作，不再使用独立的外层 pane。
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            min-width: 300px;
+                            background: transparent;
+
+                            VerticalLayout {
+                                x: 20px;
+                                y: 18px;
+                                width: parent.width - 40px;
+                                height: parent.height - 36px;
+                                spacing: 14px;
 
                             HorizontalLayout {
                                 height: 32px;
@@ -1057,10 +1122,10 @@ export component AppWindow inherits Window {
                                 clip: true;
 
                                 if !selected-card-visible: VerticalLayout {
-                                    x: 28px;
-                                    y: 28px;
-                                    width: parent.width - 56px;
-                                    height: parent.height - 56px;
+                                    x: 20px;
+                                    y: 20px;
+                                    width: parent.width - 40px;
+                                    height: parent.height - 40px;
                                     Text {
                                         text: "从左侧选择一条剪贴内容";
                                         color: #716d7b;
@@ -1079,10 +1144,10 @@ export component AppWindow inherits Window {
 
                                 if selected-card-visible: Text {
                                     visible: !selected-card-is-image;
-                                    x: 26px;
-                                    y: 24px;
-                                    width: parent.width - 52px;
-                                    height: parent.height - 84px;
+                                    x: 20px;
+                                    y: 20px;
+                                    width: parent.width - 40px;
+                                    height: parent.height - 74px;
                                     text: selected-card-preview;
                                     color: #302d38;
                                     font-size: 16px;
@@ -1091,10 +1156,10 @@ export component AppWindow inherits Window {
                                 }
 
                                 if selected-card-visible && selected-card-is-image: Rectangle {
-                                    x: 26px;
-                                    y: 24px;
-                                    width: parent.width - 52px;
-                                    height: parent.height - 78px;
+                                    x: 20px;
+                                    y: 20px;
+                                    width: parent.width - 40px;
+                                    height: parent.height - 68px;
                                     background: #ecebf1;
                                     border-width: 1px;
                                     border-color: #dfdde7;
@@ -1122,9 +1187,9 @@ export component AppWindow inherits Window {
                                 }
 
                                 if selected-card-visible: HorizontalLayout {
-                                    x: 26px;
+                                    x: 20px;
                                     y: parent.height - 42px;
-                                    width: parent.width - 52px;
+                                    width: parent.width - 40px;
                                     height: 20px;
                                     Text {
                                         text: selected-card-is-image
@@ -1227,4 +1292,5 @@ export component AppWindow inherits Window {
             }
         }
     }
+}
 }

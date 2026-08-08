@@ -522,6 +522,8 @@ export component AppWindow inherits Window {
                 // 顶部身份区只承担当前工作区说明，不再模拟第二个标题栏。
                 HorizontalLayout {
                     height: 22px;
+                    // 主标题和副标题保持清晰呼吸感，避免中文字形直接相连。
+                    spacing: 8px;
                     Text {
                         text: "剪贴板";
                         color: #292732;

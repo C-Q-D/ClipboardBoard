@@ -1213,7 +1213,9 @@ export component AppWindow inherits Window {
                                 height: 44px;
                                 spacing: 8px;
                                 Rectangle {
-                                    width: 118px;
+                                    // 默认窗口的右侧内容区只有约 260px，动作按钮必须允许在该宽度内收缩。
+                                    preferred-width: 118px;
+                                    min-width: 94px;
                                     height: 44px;
                                     border-radius: 12px;
                                     background: selected-card-visible && selected-card-copy-enabled
@@ -1239,7 +1241,8 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Rectangle {
-                                    width: 82px;
+                                    preferred-width: 82px;
+                                    min-width: 68px;
                                     height: 44px;
                                     border-radius: 12px;
                                     background: #eeecf2;
@@ -1262,7 +1265,8 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Rectangle {
-                                    width: 82px;
+                                    preferred-width: 82px;
+                                    min-width: 68px;
                                     height: 44px;
                                     border-radius: 12px;
                                     background: #eeecf2;

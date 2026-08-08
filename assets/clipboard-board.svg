@@ -1,7 +1,20 @@
-<!-- ClipboardBoard 图标源：黑色底板、白色剪贴板和蓝色卡扣，保持与黑底白字界面一致。 -->
+<!-- ClipboardBoard 图标源：Quiet Stack 叠层剪贴板；用于 Windows 窗口和托盘的多尺寸资源。 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <rect width="256" height="256" rx="48" fill="#121212"/>
-  <path d="M72 56h112c13.255 0 24 10.745 24 24v112c0 13.255-10.745 24-24 24H72c-13.255 0-24-10.745-24-24V80c0-13.255 10.745-24 24-24Z" fill="#121212" stroke="#f5f5f5" stroke-width="16"/>
-  <path d="M96 48c0-13.255 10.745-24 24-24h16c13.255 0 24 10.745 24 24v32H96V48Z" fill="#4ebeff" stroke="#f5f5f5" stroke-width="12"/>
-  <path d="M88 112h80M88 144h80M88 176h48" stroke="#f5f5f5" stroke-width="12" stroke-linecap="round"/>
+  <rect width="256" height="256" rx="56" fill="#2c2a32"/>
+
+  <!-- 后方纸片用两层填充形状表达剪贴板历史，避免在小尺寸下依赖细线。 -->
+  <rect x="42" y="57" width="139" height="153" rx="29" fill="#8f8b9b"/>
+  <rect x="55" y="43" width="143" height="158" rx="30" fill="#c8c5d1"/>
+
+  <!-- 前景剪贴板使用高明度填充，保持窗口、任务栏和托盘中的轮廓识别度。 -->
+  <rect x="69" y="59" width="129" height="159" rx="31" fill="#f7f5fa"/>
+
+  <!-- 紫色卡扣是唯一强调色，与应用界面的紫色操作色保持一致。 -->
+  <rect x="101" y="28" width="65" height="48" rx="19" fill="#8776dc"/>
+  <rect x="118" y="43" width="31" height="12" rx="6" fill="#5f559c"/>
+
+  <!-- 抽象内容块只提供大尺寸层次，不放置文字或平台专属符号。 -->
+  <rect x="94" y="105" width="78" height="11" rx="5.5" fill="#d9d5e5"/>
+  <rect x="94" y="130" width="62" height="11" rx="5.5" fill="#d9d5e5"/>
+  <rect x="94" y="155" width="72" height="11" rx="5.5" fill="#d9d5e5"/>
 </svg>

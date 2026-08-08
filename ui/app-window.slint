@@ -59,16 +59,16 @@ component HistoryCard inherits Rectangle {
     // 卡片删除按钮被点击时发出索引。
     callback card-deleted(index: int);
 
-    // 固定行高必须与 Rust history_geometry 保持一致，避免虚拟列表和滚动坐标漂移。
-    preferred-height: card.is_image ? 186px : 106px;
+    // 固定行高必须与 Rust history_geometry 保持一致，避免窗口化滚动坐标漂移。
+    preferred-height: card.is_image ? 92px : 78px;
     min-height: self.preferred-height;
     max-height: self.preferred-height;
     background: transparent;
 
     card-surface := Rectangle {
-        // 行高和内容面高度之间保留 10px 空白，使列表边界清楚但不堆叠卡片。
+        // 行高和内容面高度之间保留 8px 空白，在紧凑密度下区分相邻记录。
         width: parent.width;
-        height: card.is_image ? 176px : 96px;
+        height: card.is_image ? 84px : 70px;
         background: selected
             ? #ebe6ff
             : card-touch.has-hover ? #f6f4fa : transparent;
@@ -92,23 +92,23 @@ component HistoryCard inherits Rectangle {
         VerticalLayout {
             visible: !card.is_image;
             x: 18px;
-            y: 14px;
+            y: 10px;
             width: parent.width - 154px;
-            height: parent.height - 28px;
-            spacing: 8px;
+            height: parent.height - 20px;
+            spacing: 4px;
 
             Text {
                 text: card.preview;
-                height: 46px;
+                height: 30px;
                 vertical-stretch: 0;
                 color: #292732;
-                font-size: 15px;
+                font-size: 13px;
                 wrap: word-wrap;
                 overflow: clip;
             }
             HorizontalLayout {
-                height: 18px;
-                spacing: 8px;
+                height: 16px;
+                spacing: 6px;
                 Text {
                     text: card.source;
                     color: #706d79;
@@ -127,9 +127,9 @@ component HistoryCard inherits Rectangle {
         // 图片卡片把缩略图和尺寸摘要作为主内容，不在图片上覆盖长文本。
         if card.is_image: Rectangle {
             x: 18px;
-            y: 14px;
-            width: parent.width - 164px;
-            height: 104px;
+            y: 16px;
+            width: 52px;
+            height: 52px;
             background: #e4e4eb;
             border-width: 1px;
             border-color: #d6d4df;
@@ -155,20 +155,22 @@ component HistoryCard inherits Rectangle {
             }
         }
         if card.is_image: Text {
-            x: 18px;
-            y: 127px;
-            width: parent.width - 164px;
+            x: 82px;
+            y: 20px;
+            width: parent.width - 236px;
             text: "图片  " + card.image_width + " × " + card.image_height;
             color: #4f4c59;
             font-size: 12px;
+            overflow: clip;
         }
         if card.is_image: Text {
-            x: 18px;
-            y: 148px;
-            width: parent.width - 164px;
+            x: 82px;
+            y: 43px;
+            width: parent.width - 236px;
             text: card.source + "  ·  " + card.relative_time;
             color: #8c8895;
             font-size: 12px;
+            overflow: clip;
         }
 
         // 选择区域不覆盖右侧动作区，保证空白区域不会伪造选择事件。
@@ -982,7 +984,7 @@ export component AppWindow inherits Window {
                                 }
                                 for card[index] in legacy-cards: Rectangle {
                                     // 外层代理声明固定高度，防止组件内部布局信息改变 ListView 行高。
-                                    height: card.is_image ? 186px : 106px;
+                                    height: card.is_image ? 92px : 78px;
                                     background: transparent;
                                     HistoryCard {
                                         width: parent.width;
@@ -1029,7 +1031,7 @@ export component AppWindow inherits Window {
                                         x: 0px;
                                         // 绝对定位父容器不会使用 preferred-height，必须显式声明行高。
                                         y: window-offsets[index];
-                                        height: card.is_image ? 186px : 106px;
+                                        height: card.is_image ? 92px : 78px;
                                         width: parent.width;
                                         card: card;
                                         card-index: index;
